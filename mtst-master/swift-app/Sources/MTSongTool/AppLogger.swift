@@ -2,12 +2,12 @@ import Foundation
 
 // MARK: - AppLogger
 
-/// Writes timestamped log lines to /Volumes/MTEng0/Claude Apps/mt-song-tool/logs/mtst-YYYY-MM-DD.log
+/// Writes timestamped log lines to /Volumes/MTEng0/claude-apps/mt-song-tool/logs/mtst-YYYY-MM-DD.log
 /// Also mirrors output to NSLog for Xcode console visibility.
 final class AppLogger {
     static let shared = AppLogger()
 
-    private let logDir = URL(fileURLWithPath: "/Volumes/MTEng0/Claude Apps/mt-song-tool/logs")
+    private let logDir = URL(fileURLWithPath: "/Volumes/MTEng0/claude-apps/mt-song-tool/logs")
     private let queue = DispatchQueue(label: "com.multitracks.mtst.logger", qos: .utility)
     private var fileHandle: FileHandle?
 

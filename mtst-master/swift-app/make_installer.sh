@@ -5,7 +5,7 @@
 # Prerequisite: run make_swift_app.sh first so the .app bundle exists.
 #
 # Usage:
-#   bash ~/Documents/"MT Song Tool"/dawtool-master/swift-app/make_installer.sh
+#   bash ~/Documents/"MT Song Tool"/mtst-master/swift-app/make_installer.sh
 #
 # Output: ~/Desktop/MT Song Tool v{VERSION}.zip
 #   containing:

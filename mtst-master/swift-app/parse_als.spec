@@ -10,7 +10,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['../parse_als.py'],
-    pathex=['/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master'],
+    pathex=['/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

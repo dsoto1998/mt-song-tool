@@ -30,7 +30,7 @@
 **Build**
 
 ```bash
-bash ~/Documents/"Claude Apps"/"MT Song Tool"/dawtool-master/swift-app/make_swift_app.sh
+bash ~/Documents/"Claude Apps"/"MT Song Tool"/mtst-master/swift-app/make_swift_app.sh
 ```
 
 This compiles the Python parser via PyInstaller, builds the Swift app in release mode, assembles the `.app` bundle, and produces a versioned `.pkg` + `.zip` in `Versions/`.

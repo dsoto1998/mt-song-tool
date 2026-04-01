@@ -2,7 +2,7 @@
 
 **Current version:** v1.1.0
 **Platform:** macOS 13+, Swift/SwiftUI, Swift Package Manager
-**Project root:** `/Volumes/MTEng0/Claude Apps/mt-song-tool/`
+**Project root:** `/Volumes/MTEng0/claude-apps/mt-song-tool/`
 
 ---
 
@@ -22,7 +22,7 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 
 ---
 
-## Swift Sources (`dawtool-master/swift-app/Sources/MTSongTool/`)
+## Swift Sources (`mtst-master/swift-app/Sources/MTSongTool/`)
 
 - `App.swift` — @main, window setup
 - `ContentView.swift` — root view, all state, layout, copy blocking
@@ -45,7 +45,7 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 - `BackOfficeService.swift` — BackOffice login, song metadata fetch, .als + data upload
 - `UploadView.swift` — Upload tab UI (NR + BackOffice cards)
 
-Other key files: `parse_als.py` (Python parser), `make_swift_app.sh` (one-command build), `build_parser.sh` (PyInstaller step) — all in `dawtool-master/`.
+Other key files: `parse_als.py` (Python parser), `make_swift_app.sh` (one-command build), `build_parser.sh` (PyInstaller step) — all in `mtst-master/`.
 
 ---
 
@@ -78,11 +78,11 @@ Per-stem waveform playback complete: Canvas-based `WaveformSeekView` with 500-pe
 ## How to Build
 
 ```bash
-bash "/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master/swift-app/make_swift_app.sh"
+bash "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/swift-app/make_swift_app.sh"
 ```
 
 **What it does (4 steps):**
-1. Runs `build_parser.sh` — compiles `parse_als.py` into a standalone binary via PyInstaller (venv at `dawtool-master/venv/`). Installs `lxml` and `hexdump` into the venv first.
+1. Runs `build_parser.sh` — compiles `parse_als.py` into a standalone binary via PyInstaller (venv at `mtst-master/venv/`). Installs `lxml` and `hexdump` into the venv first.
 2. Runs `swift build -c release`
 3. Assembles `/Applications/MT Song Tool.app` (Swift binary + parser binary + fonts + icon + bundled FFmpeg)
 4. Produces a `.pkg` installer, wraps it with `Release Notes.md` in a versioned `.zip` at `Versions/MT Song Tool vX.X.X.zip`
@@ -97,7 +97,7 @@ bash "/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master/swift-app/make_swi
 
 ```python
 import gzip, sys
-sys.path.insert(0, "/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master")
+sys.path.insert(0, "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master")
 from parse_als import _get_tempo_events, _check_tempo_ramps  # import any function directly
 
 with gzip.open("/path/to/file.als", "rb") as f:
@@ -208,7 +208,7 @@ Central helper called whenever any new `.als` is loaded. Resets parser result, e
 | `mtst_nr_volume` | String | `"Pitching"` | NR share volume name |
 
 ### `ParserService.swift`
-- Looks for bundled binary at `MacOS/parse_als_dir/parse_als` first. Dev fallback: `/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master/venv/bin/python3` + `parse_als.py --server`.
+- Looks for bundled binary at `MacOS/parse_als_dir/parse_als` first. Dev fallback: `/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/venv/bin/python3` + `parse_als.py --server`.
 - "Parser not available" = binary crashed before `{"ready": true}` — usually a missing PyInstaller hidden import (`hexdump`). Test binary from Terminal to see crash output.
 
 ### `CredentialStore.swift`

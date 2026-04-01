@@ -56,7 +56,7 @@ class ParserProcess {
         }
 
         // 2. Dev fallback
-        let root = "/Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master"
+        let root = "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master"
         return (
             executable: "\(root)/venv/bin/python3",
             args: ["\(root)/parse_als.py", "--server"],

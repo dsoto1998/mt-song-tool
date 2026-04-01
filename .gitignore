@@ -15,17 +15,17 @@ logs/
 AudioConverter/
 
 # Python build artifacts
-dawtool-master/build/
-dawtool-master/dist/
-dawtool-master/__pycache__/
-dawtool-master/**/__pycache__/
+mtst-master/build/
+mtst-master/dist/
+mtst-master/__pycache__/
+mtst-master/**/__pycache__/
 **/*.pyc
 
 # Python venv (rebuilt by build_parser.sh)
-dawtool-master/venv/
+mtst-master/venv/
 
 # Swift build artifacts
-dawtool-master/swift-app/.build/
+mtst-master/swift-app/.build/
 
 # Test files
 test-ableton-files/

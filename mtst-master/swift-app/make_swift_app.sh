@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds a portable MT Song Tool.app with the parser bundled inside.
 # Run from Terminal:
-#   bash ~/Documents/"Claude Apps"/"MT Song Tool"/dawtool-master/swift-app/make_swift_app.sh
+#   bash ~/Documents/"Claude Apps"/"MT Song Tool"/mtst-master/swift-app/make_swift_app.sh
 
 set -e
 cd "$(dirname "$0")"
@@ -189,7 +189,7 @@ rm -rf "$PKG_STAGING" "$PKG_SCRIPTS"
 # Wrap the .pkg + Release Notes in a versioned folder inside a zip
 RELEASE_FOLDER="$APP_NAME v$VERSION"
 ZIP_STAGING="/tmp/mtst_zip_staging"
-VERSIONS_DIR="/Volumes/MTEng0/Claude Apps/mt-song-tool/Versions"
+VERSIONS_DIR="/Volumes/MTEng0/claude-apps/mt-song-tool/Versions"
 ZIP_OUT="$VERSIONS_DIR/$RELEASE_FOLDER.zip"
 RELEASE_NOTES="$DAWTOOL_ROOT/../Release Notes.md"
 

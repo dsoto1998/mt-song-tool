@@ -29,7 +29,7 @@ missing module named multiprocessing.get_context - imported by multiprocessing (
 missing module named multiprocessing.TimeoutError - imported by multiprocessing (top-level), multiprocessing.pool (top-level)
 missing module named multiprocessing.set_start_method - imported by multiprocessing (top-level), multiprocessing.spawn (top-level)
 missing module named multiprocessing.get_start_method - imported by multiprocessing (top-level), multiprocessing.spawn (top-level)
-missing module named pyimod02_importers - imported by /Volumes/MTEng0/Claude Apps/mt-song-tool/dawtool-master/venv/lib/python3.14/site-packages/PyInstaller/hooks/rthooks/pyi_rth_pkgutil.py (delayed)
+missing module named pyimod02_importers - imported by /Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/venv/lib/python3.14/site-packages/PyInstaller/hooks/rthooks/pyi_rth_pkgutil.py (delayed)
 missing module named htmlentitydefs - imported by lxml.html.soupparser (optional)
 missing module named BeautifulSoup - imported by lxml.html.soupparser (optional)
 missing module named bs4 - imported by lxml.html.soupparser (optional)

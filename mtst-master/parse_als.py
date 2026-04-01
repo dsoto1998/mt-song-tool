@@ -29,7 +29,7 @@ except Exception:
     _ET.SubElement = _lxml_ET.SubElement
     _ET.ParseError = _lxml_ET.XMLSyntaxError
 
-# Add dawtool-master to path (works both standalone and from app bundle)
+# Add mtst-master to path (works both standalone and from app bundle)
 _here = os.path.dirname(os.path.abspath(__file__))
 dawtool_root = os.environ.get("DAWTOOL_PATH", _here)
 sys.path.insert(0, dawtool_root)
