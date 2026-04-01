@@ -1,0 +1,3 @@
+#!/bin/bash
+cd ~/Documents/dawtool-master
+~/Documents/dawtool-master/venv/bin/python3 dawtool_app.py

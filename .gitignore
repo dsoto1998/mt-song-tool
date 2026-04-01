@@ -1,0 +1,31 @@
+# macOS resource forks
+._*
+.DS_Store
+
+# Claude Code session data
+.claude/
+
+# Build output / release zips
+Versions/
+
+# Runtime logs
+logs/
+
+# FFmpeg binaries (large — bundled separately at build time)
+AudioConverter/
+
+# Python build artifacts
+dawtool-master/build/
+dawtool-master/dist/
+dawtool-master/__pycache__/
+dawtool-master/**/__pycache__/
+**/*.pyc
+
+# Python venv (rebuilt by build_parser.sh)
+dawtool-master/venv/
+
+# Swift build artifacts
+dawtool-master/swift-app/.build/
+
+# Test files
+test-ableton-files/

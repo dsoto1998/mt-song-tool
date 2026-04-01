@@ -1,0 +1,7 @@
+#!/bin/bash
+# Runs automatically after the .pkg installs the app.
+# Strip quarantine flag and fix file permissions.
+xattr -cr "/Applications/MT Song Tool.app" 2>/dev/null
+chmod -R a+r "/Applications/MT Song Tool.app/Contents/Resources/" 2>/dev/null
+chmod -R a+rx "/Applications/MT Song Tool.app/Contents/MacOS/" 2>/dev/null
+exit 0

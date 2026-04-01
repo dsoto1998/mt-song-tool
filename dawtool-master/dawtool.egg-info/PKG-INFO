@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: dawtool
+Version: 0.0.1
+Author: Mark Mossberg
+Requires-Python: >=3.7
+License-File: LICENSE
+Requires-Dist: pytest
+Requires-Dist: hexdump
+Requires-Dist: scipy
+Dynamic: author
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
