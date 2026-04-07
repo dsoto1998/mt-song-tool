@@ -1,6 +1,6 @@
 # MT Song Tool (MTST) — Claude Code Context
 
-**Current version:** v1.2.1
+**Current version:** v1.2.3
 **Platform:** macOS 13+, Swift/SwiftUI, Swift Package Manager
 **Project root:** `/Volumes/MTEng0/claude-apps/mt-song-tool/`
 

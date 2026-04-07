@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.2.1"
+VERSION="1.2.3"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
 DAWTOOL_ROOT="$(cd .. && pwd)"
