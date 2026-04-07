@@ -1,5 +1,6 @@
 <p align="center">
-<img width="400" alt="MTST - QA Tab" src="https://github.com/user-attachments/assets/89179054-1647-4349-904c-2408d36bb3ac" />
+<img width="500" src="https://github.com/user-attachments/assets/2920f29e-df79-4bb6-a151-a61f2e076d21" />
+<img width="500" src="https://github.com/user-attachments/assets/9d60aa31-e278-40fc-95ea-c617743d92ad" />
 </p>
 
 **MT Song Tool**
@@ -14,7 +15,6 @@
 - **Song Data panel** — Auto-populates Song Key, Time Signature, BPM, and Preview Start/End from the session. All fields are copyable.
 - **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback.
 - **Session validation** — Checks loop bracket vs. audio clip alignment, incomplete bars, and tempo ramp usage.
-- **Upload pipeline** — Copies stems to the Nolan Ryan SMB share and uploads `.als` + metadata to BackOffice. Credential storage via Keychain.
 
 <p align="center">
 <img width="400" alt="MTST - Upload Tab" src="https://github.com/user-attachments/assets/d62721ad-6a0d-441e-ad25-041220858694" />
