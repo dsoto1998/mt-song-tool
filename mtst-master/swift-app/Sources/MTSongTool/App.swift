@@ -142,7 +142,12 @@ struct WindowDragArea: NSViewRepresentable {
         }
 
         override func mouseDragged(with event: NSEvent) {
-            if let down = pendingDragEvent {
+            guard let down = pendingDragEvent else { return }
+            let start = down.locationInWindow
+            let now = event.locationInWindow
+            let dx = now.x - start.x
+            let dy = now.y - start.y
+            if dx * dx + dy * dy >= 16 {   // 4px radius
                 pendingDragEvent = nil
                 window?.performDrag(with: down)
             }
