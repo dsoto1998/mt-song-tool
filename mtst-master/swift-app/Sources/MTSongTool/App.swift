@@ -144,7 +144,7 @@ struct WindowDragArea: NSViewRepresentable {
                 // event.locationInWindow uses window base coords (y=0 at bottom).
                 // The drag strip is the top 12px of the window.
                 let winH = w.contentView?.bounds.height ?? w.frame.height
-                if event.locationInWindow.y >= winH - 12 {
+                if event.locationInWindow.y >= winH - 20 {
                     self.fitToScreen()
                     return nil
                 }
