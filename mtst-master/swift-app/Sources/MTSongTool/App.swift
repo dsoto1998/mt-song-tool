@@ -180,18 +180,27 @@ struct WindowDragArea: NSViewRepresentable {
             pendingDragEvent = nil
         }
 
+        private var savedFrame: NSRect?
+
         private func fitToScreen() {
             guard let window = window,
                   let screen = window.screen ?? NSScreen.main else { return }
             let visibleFrame = screen.visibleFrame
             let currentFrame = window.frame
-            let newFrame = NSRect(
-                x: currentFrame.minX,
-                y: visibleFrame.minY,
-                width: currentFrame.width,
-                height: visibleFrame.height
-            )
-            window.setFrame(newFrame, display: true, animate: true)
+            // If already at full screen height, restore saved frame
+            if let saved = savedFrame, abs(currentFrame.height - visibleFrame.height) < 2 {
+                savedFrame = nil
+                window.setFrame(saved, display: true, animate: true)
+            } else {
+                savedFrame = currentFrame
+                let newFrame = NSRect(
+                    x: currentFrame.minX,
+                    y: visibleFrame.minY,
+                    width: currentFrame.width,
+                    height: visibleFrame.height
+                )
+                window.setFrame(newFrame, display: true, animate: true)
+            }
         }
     }
 }
