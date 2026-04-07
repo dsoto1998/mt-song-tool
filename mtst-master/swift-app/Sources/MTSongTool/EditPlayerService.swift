@@ -2,22 +2,69 @@ import AVFoundation
 import Accelerate
 import Combine
 
+// MARK: - AudioSegment
+
+/// One independently-positioned piece of a stem's audio. `sessionStart` is absolute session time.
+struct AudioSegment: Identifiable {
+    var id: UUID = UUID()
+    var sourceStart: Double     // seconds in the original file
+    var sourceEnd: Double       // seconds in the original file
+    var sessionStart: Double    // when this segment plays in the session timeline
+    var sessionEnd: Double { sessionStart + (sourceEnd - sourceStart) }
+}
+
 // MARK: - StemState
 
 struct StemState {
     var isMuted: Bool = false
     var isSoloed: Bool = false
     var gain: Float = 1.0          // live monitoring gain (non-destructive)
-    var peakDB: Float = -96.0      // updated by installTap at ~10 Hz
-    var peaks: [Float] = []        // 500-point waveform data
-    var offset: Double = 0.0       // nudge offset in seconds (+ = silence prepend, - = trim start)
-    var trimIn: Double = 0.0       // trim in-point (seconds from original start)
-    var trimOut: Double? = nil     // trim out-point (nil = use full file end)
-    var cuts: [Double] = []        // cut positions within the stem (seconds from original start)
+    var peaks: [Float] = []        // 2000-point waveform data
+    var duration: Double = 0.0     // audio file duration in seconds
+    var offset: Double = 0.0       // legacy nudge offset (used when segments is empty)
+    var trimIn: Double = 0.0       // legacy trim in-point
+    var trimOut: Double? = nil     // legacy trim out-point
+    var cuts: [Double] = []        // legacy cut positions
+    var segments: [AudioSegment] = []   // multi-segment model; populated after peaks load
 
     var hasEdits: Bool {
         gain != 1.0 || offset != 0.0 || trimIn != 0.0 ||
         trimOut != nil || !cuts.isEmpty
+    }
+
+    // MARK: Segment mutations
+
+    mutating func initSegments(duration: Double) {
+        segments = [AudioSegment(sourceStart: 0, sourceEnd: duration, sessionStart: 0)]
+    }
+
+    /// Splits the segment containing `sessionTime` at that point (no-op if time is at a boundary).
+    mutating func splitSegment(atSession time: Double) {
+        guard let idx = segments.firstIndex(where: {
+            $0.sessionStart < time - 0.001 && $0.sessionEnd > time + 0.001
+        }) else { return }
+        let seg = segments[idx]
+        let intoSeg = time - seg.sessionStart
+        let splitSrc = seg.sourceStart + intoSeg
+        let first  = AudioSegment(sourceStart: seg.sourceStart, sourceEnd: splitSrc,  sessionStart: seg.sessionStart)
+        let second = AudioSegment(sourceStart: splitSrc,        sourceEnd: seg.sourceEnd, sessionStart: time)
+        segments.remove(at: idx)
+        segments.insert(contentsOf: [first, second], at: idx)
+    }
+
+    /// Silences (removes) the audio between `lo` and `hi` in session time, leaving a gap.
+    mutating func deleteRegion(lo: Double, hi: Double) {
+        splitSegment(atSession: lo)
+        splitSegment(atSession: hi)
+        segments.removeAll { $0.sessionStart >= lo - 0.001 && $0.sessionStart < hi - 0.001 }
+    }
+
+    /// Moves the audio region [lo, hi] so it starts at `newStart`, leaving a gap at the source.
+    mutating func moveRegion(lo: Double, hi: Double, to newStart: Double) {
+        splitSegment(atSession: lo)
+        splitSegment(atSession: hi)
+        guard let idx = segments.firstIndex(where: { abs($0.sessionStart - lo) < 0.01 }) else { return }
+        segments[idx].sessionStart = max(0, newStart)
     }
 }
 
@@ -29,6 +76,7 @@ class EditPlayerService: ObservableObject {
     @Published var currentTime: Double = 0
     @Published var stemStates: [URL: StemState] = [:]
     @Published var masterPeakDB: Float = -96.0
+    @Published var meterLevels: [URL: Float] = [:]   // per-stem peak dBFS — updated at ~43 Hz, separate from stemStates
     @Published var totalDuration: Double = 0
     /// Published whenever playback (re)starts — EditView observes this to re-anchor the metronome.
     @Published var playAnchor: PlayAnchor? = nil
@@ -67,6 +115,7 @@ class EditPlayerService: ObservableObject {
 
         stemURLs = urls
         stemStates = [:]
+        meterLevels = [:]
         totalDuration = 0
 
         for url in urls {
@@ -89,6 +138,8 @@ class EditPlayerService: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     state.peaks = peaks
+                    state.duration = dur
+                    state.initSegments(duration: dur)
                     self.stemStates[url] = state
                     if dur > self.totalDuration { self.totalDuration = dur }
                 }
@@ -103,6 +154,7 @@ class EditPlayerService: ObservableObject {
     }
 
     private func teardownNodes() {
+        engine.mainMixerNode.removeTap(onBus: 0)
         for (_, player) in playerNodes { engine.detach(player) }
         for (_, mixer) in stemMixers { engine.detach(mixer) }
         playerNodes = [:]
@@ -165,24 +217,73 @@ class EditPlayerService: ObservableObject {
 
             guard let audioFile = try? AVAudioFile(forReading: url) else { continue }
             let sampleRate = audioFile.processingFormat.sampleRate
+            let format = audioFile.processingFormat
 
-            if state.offset > 0 && sessionTime < state.offset {
-                // Stem starts after the current session position — delay relative to anchor
-                let delay = state.offset - sessionTime
-                let when = AVAudioTime(hostTime: anchorHostTime + ticksForSeconds(delay))
-                player.scheduleSegment(audioFile, startingFrame: 0,
-                                       frameCount: AVAudioFrameCount(audioFile.length),
-                                       at: when)
+            if !state.segments.isEmpty {
+                // Multi-segment path: schedule each segment with silence in gaps.
+                let sorted = state.segments
+                    .filter { $0.sessionEnd > sessionTime + 0.001 }
+                    .sorted { $0.sessionStart < $1.sessionStart }
+
+                var cursor = sessionTime
+                var isFirst = true
+
+                for segment in sorted {
+                    let gapDuration = max(0, segment.sessionStart - cursor)
+
+                    if gapDuration > 0.001 {
+                        let frames = AVAudioFrameCount(gapDuration * sampleRate)
+                        if let silentBuf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) {
+                            silentBuf.frameLength = frames
+                            if let ch = silentBuf.floatChannelData {
+                                for c in 0..<Int(format.channelCount) {
+                                    memset(ch[c], 0, Int(frames) * MemoryLayout<Float>.size)
+                                }
+                            }
+                            if isFirst {
+                                player.scheduleBuffer(silentBuf, at: AVAudioTime(hostTime: anchorHostTime))
+                                isFirst = false
+                            } else {
+                                player.scheduleBuffer(silentBuf, at: nil)
+                            }
+                        }
+                        cursor = segment.sessionStart
+                    }
+
+                    let intoSeg   = max(0, sessionTime - segment.sessionStart)
+                    let srcStart  = segment.sourceStart + intoSeg
+                    let startFrame = AVAudioFramePosition(srcStart * sampleRate)
+                    let frameCount = AVAudioFrameCount((segment.sourceEnd - srcStart) * sampleRate)
+                    guard frameCount > 0 else { cursor = segment.sessionEnd; continue }
+
+                    if isFirst {
+                        player.scheduleSegment(audioFile, startingFrame: startFrame,
+                                               frameCount: frameCount,
+                                               at: AVAudioTime(hostTime: anchorHostTime))
+                        isFirst = false
+                    } else {
+                        player.scheduleSegment(audioFile, startingFrame: startFrame,
+                                               frameCount: frameCount, at: nil)
+                    }
+                    cursor = segment.sessionEnd
+                }
             } else {
-                // Stem is already underway at sessionTime — seek into it
-                let fileStart = max(0, sessionTime - state.offset)
-                let startFrame = AVAudioFramePosition(fileStart * sampleRate)
-                let totalFrames = audioFile.length - startFrame
-                guard totalFrames > 0 else { continue }
-                let when = AVAudioTime(hostTime: anchorHostTime)
-                player.scheduleSegment(audioFile, startingFrame: startFrame,
-                                       frameCount: AVAudioFrameCount(totalFrames),
-                                       at: when)
+                // Legacy path (segments not yet populated)
+                if state.offset > 0 && sessionTime < state.offset {
+                    let delay = state.offset - sessionTime
+                    let when = AVAudioTime(hostTime: anchorHostTime + ticksForSeconds(delay))
+                    player.scheduleSegment(audioFile, startingFrame: 0,
+                                           frameCount: AVAudioFrameCount(audioFile.length),
+                                           at: when)
+                } else {
+                    let fileStart = max(0, sessionTime - state.offset)
+                    let startFrame = AVAudioFramePosition(fileStart * sampleRate)
+                    let totalFrames = audioFile.length - startFrame
+                    guard totalFrames > 0 else { continue }
+                    player.scheduleSegment(audioFile, startingFrame: startFrame,
+                                           frameCount: AVAudioFrameCount(totalFrames),
+                                           at: AVAudioTime(hostTime: anchorHostTime))
+                }
             }
         }
 
@@ -287,10 +388,29 @@ class EditPlayerService: ObservableObject {
         stemStates[url]?.cuts.removeAll { abs($0 - time) < 0.01 }
     }
 
+    func deleteRegion(_ url: URL, lo: Double, hi: Double) {
+        stemStates[url]?.deleteRegion(lo: lo, hi: hi)
+    }
+
+    func moveRegion(_ url: URL, lo: Double, hi: Double, to newStart: Double) {
+        stemStates[url]?.moveRegion(lo: lo, hi: hi, to: newStart)
+    }
+
+    /// Shifts all segments of the given stem by `delta` seconds.
+    func shiftAllSegments(_ url: URL, delta: Double) {
+        guard var state = stemStates[url] else { return }
+        for i in state.segments.indices {
+            state.segments[i].sessionStart = max(0, state.segments[i].sessionStart + delta)
+        }
+        stemStates[url] = state
+    }
+
     var hasAnyEdits: Bool {
         stemStates.values.contains {
             $0.gain != 1.0 || $0.offset != 0.0 || $0.trimIn != 0.0 ||
-            $0.trimOut != nil || !$0.cuts.isEmpty
+            $0.trimOut != nil || !$0.cuts.isEmpty ||
+            ($0.segments.count > 1) ||
+            ($0.segments.first.map { $0.sessionStart != 0 } ?? false)
         }
     }
 
@@ -324,7 +444,7 @@ class EditPlayerService: ObservableObject {
                 peak = max(peak, channelPeak)
             }
             let db = peak > 0 ? 20 * log10(peak) : -96.0
-            Task { @MainActor [weak self] in self?.stemStates[url]?.peakDB = db }
+            Task { @MainActor [weak self] in self?.meterLevels[url] = db }
         }
         tapInstalled[url] = true
     }

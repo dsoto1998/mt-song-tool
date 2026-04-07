@@ -23,12 +23,14 @@ struct Marker: Identifiable {
     var timeEnd: String = ""
     var text: String
     var alsId: String = ""   // Ableton XML locator Id — used for write-back
+    var offBeat: Bool = false  // true if locator does not land on beat 1 of a bar
 }
 
 struct TimeSig: Identifiable {
     let id = UUID()
     var time: String
     var sig: String
+    var beat: Double?   // beat position from parser; used for metronome grid alignment
 }
 
 // MARK: - Persistent parser process (stays alive for instant parsing)
@@ -277,11 +279,11 @@ class ParserService: ObservableObject {
         let fileName = json["file"] as? String ?? ""
         let bpm = json["bpm"] as? Double
 
-        let markersRaw = json["markers"] as? [[String: String]] ?? []
-        let markers = markersRaw.map { Marker(time: $0["time"] ?? "", timeEnd: $0["time_end"] ?? "", text: $0["text"] ?? "", alsId: $0["als_id"] ?? "") }
+        let markersRaw = json["markers"] as? [[String: Any]] ?? []
+        let markers = markersRaw.map { Marker(time: $0["time"] as? String ?? "", timeEnd: $0["time_end"] as? String ?? "", text: $0["text"] as? String ?? "", alsId: $0["als_id"] as? String ?? "", offBeat: $0["off_beat"] as? Bool ?? false) }
 
-        let tsRaw = json["time_signatures"] as? [[String: String]] ?? []
-        let timeSigs = tsRaw.map { TimeSig(time: $0["time"] ?? "", sig: $0["sig"] ?? "") }
+        let tsRaw = json["time_signatures"] as? [[String: Any]] ?? []
+        let timeSigs = tsRaw.map { TimeSig(time: $0["time"] as? String ?? "", sig: $0["sig"] as? String ?? "", beat: $0["beat"] as? Double) }
 
         let warnings = json["warnings"] as? [String] ?? []
         let expectedDuration = json["expected_duration"] as? Double

@@ -98,6 +98,7 @@ struct PickerPopoverContent: View {
     @Binding var dismissedViaEnter: Bool
     var onEnterOut: (() -> Void)? = nil
     var onTabOut: (() -> Void)? = nil
+    var suggestions: [StemSuggestion] = []
     @State private var searchText: String = ""
     @State private var highlightedIndex: Int = -1
     @State private var scrollTarget: Int? = nil
@@ -175,6 +176,31 @@ struct PickerPopoverContent: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
+                        // Suggestions section — hidden when user is searching
+                        if !suggestions.isEmpty && searchText.isEmpty {
+                            Text("SUGGESTIONS")
+                                .font(.lato(size: 9, weight: .semibold))
+                                .foregroundColor(.fgDim)
+                                .padding(.horizontal, 10)
+                                .padding(.top, 6)
+                                .padding(.bottom, 1)
+
+                            ForEach(suggestions, id: \.name) { sug in
+                                SuggestionPickerRow(
+                                    suggestion: sug,
+                                    isSelected: selection == sug.name
+                                ) {
+                                    selection = sug.name
+                                    isPresented = false
+                                }
+                            }
+
+                            Divider()
+                                .background(Color.border)
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 10)
+                        }
+
                         ForEach(Array(filteredOptions.enumerated()), id: \.element) { index, option in
                             PickerOptionRow(
                                 option: option,
@@ -198,7 +224,7 @@ struct PickerPopoverContent: View {
                 }
             }
         }
-        .frame(width: 160, height: min(CGFloat(options.count) * 28 + 34, 260))
+        .frame(width: 180, height: min(CGFloat(options.count) * 28 + 34 + (suggestions.isEmpty || !searchText.isEmpty ? 0 : CGFloat(suggestions.count) * 28 + 32), 300))
         .onAppear {
             searchText = ""
             if let idx = filteredOptions.firstIndex(of: selection) {
@@ -263,6 +289,48 @@ struct PickerSearchField: NSViewRepresentable {
 
     class SearchNSTextField: NSTextField {
         weak var coordinator: Coordinator?
+    }
+}
+
+// MARK: - Suggestion picker row (star + name + confidence %)
+private struct SuggestionPickerRow: View {
+    let suggestion: StemSuggestion
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: suggestion.isTaken ? {} : action) {
+            HStack(spacing: 6) {
+                Image(systemName: suggestion.isTaken ? "xmark.circle" : "star.fill")
+                    .font(.system(size: 8))
+                    .foregroundColor(suggestion.isTaken ? .fgDim : .accent)
+                Text(suggestion.name)
+                    .font(.lato(size: 12))
+                    .foregroundColor(suggestion.isTaken ? .fgDim : (isSelected ? .accent : (isHovered ? .fgBright : .fgMid)))
+                    .strikethrough(suggestion.isTaken, color: .fgDim)
+                Spacer()
+                if suggestion.isTaken {
+                    Text("taken")
+                        .font(.lato(size: 10))
+                        .foregroundColor(.fgDim)
+                } else {
+                    Text("\(Int(suggestion.confidence * 100))%")
+                        .font(.lato(size: 10))
+                        .foregroundColor(.fgDim)
+                        .monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .contentShape(Rectangle())
+            .background((!suggestion.isTaken && isHovered) ? Color.bgCardHov : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .onHover { h in
+            isHovered = h
+            if h && !suggestion.isTaken { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
     }
 }
 

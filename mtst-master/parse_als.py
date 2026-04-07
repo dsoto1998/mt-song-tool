@@ -131,7 +131,8 @@ def parse_time_signatures(proj):
                                 real_time = 0.0
                             else:
                                 real_time = proj._calc_beat_real_time(beat)
-                            results.append((real_time, num, denom))
+                            effective_beat = 0.0 if beat < 0 else beat
+                            results.append((real_time, num, denom, effective_beat))
                         except Exception:
                             pass
 
@@ -143,7 +144,7 @@ def parse_time_signatures(proj):
         key = (round(entry[0], 3), entry[1], entry[2])
         if key not in seen:
             seen.add(key)
-            deduped.append(entry)
+            deduped.append(entry)  # (real_time, num, denom, beat)
 
     # Fallback: if envelope parsing produced nothing (e.g. a session with a single
     # unchanging time signature that Ableton stores statically rather than as an
@@ -155,7 +156,7 @@ def parse_time_signatures(proj):
             den_m = re.search(r'<Denominator\s+Value="(\d+)"', raw)
             ts_num = int(num_m.group(1)) if num_m else 4
             ts_den = int(den_m.group(1)) if den_m else 4
-            deduped.append((0.0, ts_num, ts_den))
+            deduped.append((0.0, ts_num, ts_den, 0.0))
         except Exception:
             pass
 
@@ -189,7 +190,7 @@ def _extract_locator_data(path):
                 result.append((loc_id, float(time_m.group(1)), raw_name))
         # Sort by beat time so indices match dawtool's time-sorted marker list
         result.sort(key=lambda x: x[1])
-        return [(r[0], r[2]) for r in result]  # list of (id, name_raw)
+        return result  # list of (id, beat, name_raw)
     except Exception:
         return []
 
@@ -754,14 +755,15 @@ def parse_file(path):
             proj = load_project(path, fh, theoretical=False)
             proj.parse()
 
-        locator_data = _extract_locator_data(path)  # list of (id, name_raw)
+        locator_data = _extract_locator_data(path)  # list of (id, beat, name_raw)
         markers = [
             {"time": fmt_time(m.time),
              "time_end": "",  # filled in below
              # Use the raw name from XML so leading/trailing spaces are preserved
              # (dawtool strips them, which would hide extra-space locator errors).
-             "text": locator_data[i][1] if i < len(locator_data) else m.text,
-             "als_id": locator_data[i][0] if i < len(locator_data) else ""}
+             "text": locator_data[i][2] if i < len(locator_data) else m.text,
+             "als_id": locator_data[i][0] if i < len(locator_data) else "",
+             "off_beat": False}  # updated below after ts_events are computed
             for i, m in enumerate(proj.markers)
         ]
         time_sigs = parse_time_signatures(proj)
@@ -780,6 +782,11 @@ def parse_file(path):
             ts_beat_events = _ts_events_from_content(proj.contents)
             incomplete = _check_incomplete_bars(ts_beat_events, proj._calc_beat_real_time)
             validation["warnings"].extend(incomplete)
+            # Off-beat locator check: every locator should land on beat 1 of a bar.
+            for i in range(len(markers)):
+                if i < len(locator_data):
+                    beat = locator_data[i][1]
+                    markers[i]["off_beat"] = not _is_on_barline(beat, ts_beat_events)
         except Exception:
             pass
 
@@ -849,10 +856,16 @@ def parse_file(path):
                 pass
 
         # Tempo automation events for metronome beat scheduling in Swift.
-        # Filter out the phantom sentinel event (beat < 0).
+        # The phantom sentinel (beat < 0) is Ableton's initial BPM anchor. Filter it out,
+        # but if no real event exists at beat 0, inject one so Swift's beatToTime() has
+        # the correct origin BPM (without it every beat maps to a large negative time).
         try:
             raw_tempo_events = _get_tempo_events(proj.contents)
-            tempo_events = [[beat, bpm_val] for beat, bpm_val in raw_tempo_events if beat >= 0]
+            phantom_events = [(b, v) for b, v in raw_tempo_events if b < 0]
+            real_events = [[b, v] for b, v in raw_tempo_events if b >= 0]
+            if phantom_events and (not real_events or real_events[0][0] > 0):
+                real_events.insert(0, [0.0, phantom_events[-1][1]])
+            tempo_events = real_events
         except Exception:
             tempo_events = []
 
@@ -863,8 +876,8 @@ def parse_file(path):
             "bpm": bpm,
             "markers": markers,
             "time_signatures": [
-                {"time": fmt_time(t), "sig": f"{n}/{d}"}
-                for t, n, d in time_sigs
+                {"time": fmt_time(t), "sig": f"{n}/{d}", "beat": b}
+                for t, n, d, b in time_sigs
             ],
             "warnings": validation["warnings"],
             "session_info": validation["session_info"],

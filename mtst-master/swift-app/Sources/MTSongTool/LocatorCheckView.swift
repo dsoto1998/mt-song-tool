@@ -235,6 +235,7 @@ struct LocatorRowView: View {
     @State private var copiedEnd = false
     @State private var copyEndHover = false
     @State private var playHover = false
+    @State private var pencilHover = false
 
     private var isInvalid: Bool { !LocatorValidator.isValid(marker.text, mtCompleteMode: mtCompleteMode) }
     private var isBlank: Bool { marker.text.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -341,19 +342,27 @@ struct LocatorRowView: View {
             }
             .frame(width: 12)
 
-            // NAME — blank badge, or tappable text with rename picker
-            if isBlank {
-                HStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
-                        .foregroundColor(.orange)
-                    Text("Fix In Session")
-                        .font(.lato(size: 11, weight: .semibold))
-                        .foregroundColor(.orange)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                HStack(spacing: 4) {
+            // NAME — tappable with rename picker; blank rows show "No Name" placeholder
+            HStack(spacing: 4) {
+                if isBlank {
+                    HStack(spacing: 3) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.red)
+                        Text("No Name")
+                            .font(.lato(size: 11, weight: .semibold))
+                            .foregroundColor(.red)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .popover(isPresented: $pickerOpen, arrowEdge: .bottom) {
+                        PickerPopoverContent(
+                            options: pickerOptions,
+                            selection: $pickerSelection,
+                            isPresented: $pickerOpen,
+                            dismissedViaEnter: $dismissedViaEnter
+                        )
+                    }
+                } else {
                     Text(marker.text)
                         .font(.lato(size: 12))
                         .foregroundColor(isInvalid ? Color.red : .fgBright)
@@ -366,29 +375,47 @@ struct LocatorRowView: View {
                                 dismissedViaEnter: $dismissedViaEnter
                             )
                         }
-                    if isHovering {
-                        Button {
-                            pickerSelection = marker.text
-                            pickerOpen = true
-                        } label: {
-                            Image(systemName: "pencil")
-                                .font(.system(size: 9, weight: .medium))
-                                .foregroundColor(isInvalid ? Color.red.opacity(0.6) : .fgDim)
-                        }
-                        .buttonStyle(.plain)
-                        .transition(.opacity)
-                    }
-                    Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .onTapGesture(count: 2) {
-                    pickerSelection = marker.text
-                    pickerOpen = true
-                }
-                .onChange(of: pickerOpen) { isOpen in
-                    if !isOpen && !pickerSelection.isEmpty && pickerSelection != marker.text {
-                        onFix(pickerSelection)
+                if marker.offBeat {
+                    HStack(spacing: 3) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.red)
+                        Text("Not On Beat 1")
+                            .font(.lato(size: 11, weight: .semibold))
+                            .foregroundColor(.red)
                     }
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                if isHovering || isBlank {
+                    Button {
+                        pickerSelection = marker.text
+                        pickerOpen = true
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(pencilHover ? .accent : (isInvalid ? Color.red.opacity(0.7) : .fgMid))
+                            .frame(width: 20, height: 20)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(pencilHover ? Color.accent.opacity(0.15) : Color.clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
+                    .transition(.opacity)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .simultaneousGesture(TapGesture(count: 2).onEnded {
+                pickerSelection = marker.text
+                pickerOpen = true
+            })
+            .onChange(of: pickerOpen) { isOpen in
+                if !isOpen && !pickerSelection.isEmpty && pickerSelection != marker.text {
+                    onFix(pickerSelection)
                 }
             }
 
@@ -441,6 +468,8 @@ struct LocatorRowView: View {
     private var rowBackground: some View {
         Group {
             if isInvalid {
+                isHovering ? Color.redBgHov : Color.redBg
+            } else if marker.offBeat {
                 isHovering ? Color.redBgHov : Color.redBg
             } else {
                 isHovering ? Color.bgCardHov : Color.clear

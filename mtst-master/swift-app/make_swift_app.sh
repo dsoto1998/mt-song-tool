@@ -6,14 +6,13 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.1.0"
+VERSION="1.2.1"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
-APPS_DIR="/Applications"
 DAWTOOL_ROOT="$(cd .. && pwd)"
 
 # ── Step 1: Build the Python parser into a standalone binary ─────────────────
-echo "==> Step 1/3: Building parser binary (PyInstaller)…"
+echo "==> Step 1/4: Building parser binary (PyInstaller)…"
 bash build_parser.sh
 
 PARSER_DIR="dist/parse_als"
@@ -24,7 +23,7 @@ fi
 
 # ── Step 2: Build the Swift app ──────────────────────────────────────────────
 echo ""
-echo "==> Step 2/3: Building Swift app (release)…"
+echo "==> Step 2/4: Building Swift app (release)…"
 swift build -c release 2>&1
 
 SWIFT_BIN=".build/release/MTSongTool"
@@ -35,7 +34,7 @@ fi
 
 # ── Step 3: Assemble the .app bundle ────────────────────────────────────────
 echo ""
-echo "==> Step 3/3: Creating .app bundle…"
+echo "==> Step 3/4: Creating .app bundle…"
 
 APP_BUNDLE="/tmp/mtst_app_build/$APP_NAME.app"
 CONTENTS="$APP_BUNDLE/Contents"
@@ -151,7 +150,9 @@ echo ""
 # ── Step 4: Build the .pkg installer ─────────────────────────────────────────
 echo "==> Step 4/4: Building .pkg installer…"
 
-PKG_OUT="$HOME/Desktop/$APP_NAME $VERSION.pkg"
+VERSIONS_DIR="/Volumes/MTEng0/claude-apps/mt-song-tool/Versions"
+mkdir -p "$VERSIONS_DIR"
+PKG_OUT="$VERSIONS_DIR/$APP_NAME $VERSION.pkg"
 PKG_STAGING="/tmp/mtst_pkg_staging"
 PKG_SCRIPTS="/tmp/mtst_pkg_scripts"
 
@@ -189,11 +190,8 @@ rm -rf "$PKG_STAGING" "$PKG_SCRIPTS"
 # Wrap the .pkg + Release Notes in a versioned folder inside a zip
 RELEASE_FOLDER="$APP_NAME v$VERSION"
 ZIP_STAGING="/tmp/mtst_zip_staging"
-VERSIONS_DIR="/Volumes/MTEng0/claude-apps/mt-song-tool/Versions"
 ZIP_OUT="$VERSIONS_DIR/$RELEASE_FOLDER.zip"
 RELEASE_NOTES="$DAWTOOL_ROOT/../Release Notes.md"
-
-mkdir -p "$VERSIONS_DIR"
 rm -rf "$ZIP_STAGING"
 mkdir -p "$ZIP_STAGING/$RELEASE_FOLDER"
 mv "$PKG_OUT" "$ZIP_STAGING/$RELEASE_FOLDER/"

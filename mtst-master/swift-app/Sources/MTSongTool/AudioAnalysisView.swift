@@ -113,7 +113,6 @@ struct AudioAnalysisView: View {
             } else if let err = analyzer.errorMessage {
                 errorView(message: err)
             } else if !analyzer.results.isEmpty {
-                collapseToggleView
                 if !isMinimized {
                     ScrollView(.vertical, showsIndicators: true) {
                         resultsListView
@@ -121,6 +120,7 @@ struct AudioAnalysisView: View {
                     .frame(height: scrollAreaHeight)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
+                collapseToggleView
             } else {
                 dropZoneView
             }
@@ -259,6 +259,9 @@ struct AudioAnalysisView: View {
                     )
             }
             .buttonStyle(.plain)
+            .onHover { h in
+                if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+            }
             Spacer()
         }
         .frame(height: 18)
@@ -474,6 +477,7 @@ struct AudioFileRow: View {
     @State private var dismissedViaEnter = false
     @State private var isHovering = false
     @State private var playHover = false
+    @State private var pencilHover = false
     @State private var isScrubbing = false
     @State private var scrubValue: Double = 0
 
@@ -517,7 +521,8 @@ struct AudioFileRow: View {
                                 isPresented: $pickerOpen,
                                 dismissedViaEnter: $dismissedViaEnter,
                                 onEnterOut: nil,
-                                onTabOut: nil
+                                onTabOut: nil,
+                                suggestions: result.suggestedNames
                             )
                         }
                     if isHovering && onRename != nil {
@@ -526,20 +531,27 @@ struct AudioFileRow: View {
                             pickerOpen = true
                         } label: {
                             Image(systemName: "pencil")
-                                .font(.system(size: 9, weight: .medium))
-                                .foregroundColor(.fgDim)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(pencilHover ? .accent : .fgMid)
+                                .frame(width: 20, height: 20)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(pencilHover ? Color.accent.opacity(0.15) : Color.clear)
+                                )
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle())
+                        .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
                         .transition(.opacity)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .onTapGesture(count: 2) {
+                .simultaneousGesture(TapGesture(count: 2).onEnded {
                     if onRename != nil {
                         renameSelection = stemName
                         pickerOpen = true
                     }
-                }
+                })
                 .onChange(of: pickerOpen) { isOpen in
                     if isOpen {
                         stemPlayer.stop()
@@ -548,7 +560,7 @@ struct AudioFileRow: View {
                     }
                 }
 
-                // Badges: audio status + validation issues
+                // Badges: audio status + validation issues + inline suggestion chip
                 HStack(spacing: 4) {
                     if result.isClean {
                         StatusBadge(label: "OK", color: .green)
@@ -560,6 +572,31 @@ struct AudioFileRow: View {
                         }
                         ForEach(result.issues, id: \.self) { issue in
                             StatusBadge(label: issue, color: issueColor(issue))
+                        }
+                    }
+                    // High-confidence suggestion chip — quick-accept with one click
+                    if let top = result.suggestedNames.first(where: { !$0.isTaken }), top.confidence >= 0.80, onRename != nil {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 7, weight: .semibold))
+                                .foregroundColor(.fgDim)
+                            Text(top.name)
+                                .font(.lato(size: 10, weight: .medium))
+                                .foregroundColor(.fgMid)
+                            Button {
+                                onRename?(top.name)
+                            } label: {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(.accent)
+                                    .padding(.horizontal, 3)
+                                    .padding(.vertical, 2)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 3)
+                                            .fill(Color.accent.opacity(0.12))
+                                    )
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -717,6 +754,7 @@ struct AudioFileRow: View {
         case "Too Short":       return .red
         case "Too Long":        return .red
         case "Duplicate":       return .red
+        case "Gap in Sequence": return .red
         case "Special Chars":   return .orange
         case "Wrong Caps":      return .orange
         case "Extra Space":     return .orange

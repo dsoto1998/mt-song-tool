@@ -18,6 +18,7 @@ struct BeatInfo {
     let beat: Int       // 1-based within bar
     let isDownbeat: Bool
     var isSubdivisionTick: Bool = false   // true for eighth-note "and" positions
+    var isSecondaryAccent: Bool = false   // true for group-downbeat beats (e.g. beat 4 in 6/8, beat 3 in 4/4)
 }
 
 // MARK: - MetronomeService
@@ -34,7 +35,7 @@ class MetronomeService: ObservableObject {
     @Published var isMuted: Bool = false
 
     // Beat schedule computed from the parsed tempo map + time signatures
-    private var beatSchedule: [BeatInfo] = []
+    @Published var beatSchedule: [BeatInfo] = []
 
     // Audio engine — own engine used for QA tab; edit engine used for Edit tab (sample-accurate)
     private let ownEngine = AVAudioEngine()
@@ -42,6 +43,7 @@ class MetronomeService: ObservableObject {
     private let gainNode = AVAudioMixerNode()
     private var clickBuffer: AVAudioPCMBuffer?            // downbeat: full volume
     private var downbeatBuffer: AVAudioPCMBuffer?         // same as clickBuffer
+    private var mediumAccentBuffer: AVAudioPCMBuffer?     // scaled to 75% for secondary group accents (e.g. beat 4 in 6/8)
     private var subdivisionBuffer: AVAudioPCMBuffer?      // scaled to 60% for off-beat quarter notes
     private var subdivisionTickBuffer: AVAudioPCMBuffer?  // scaled to 35% for eighth-note ticks
     private var loadedBufferFormat: AVAudioFormat?        // set by loadSounds(); used for engine connections
@@ -119,13 +121,14 @@ class MetronomeService: ObservableObject {
         for i in 0..<Int(frameCount) {
             let t = Double(i) / sampleRate
             let env = exp(-t / 0.006)   // ~6 ms decay
-            data[i] = Float(env * sin(2 * .pi * 880 * t)) * 2.0  // +6 dB headroom; volume applied via gainNode
+            data[i] = Float(env * sin(2 * .pi * 880 * t)) * 4.0  // +12 dB headroom; volume applied via gainNode
         }
 
         clickBuffer           = buffer
         downbeatBuffer        = buffer
         subdivisionBuffer     = applyVolume(0.6,  to: buffer) ?? buffer
         subdivisionTickBuffer = applyVolume(0.35, to: buffer) ?? buffer
+        mediumAccentBuffer    = applyVolume(0.75, to: buffer) ?? buffer
         loadedBufferFormat    = buffer.format
         gainNode.outputVolume = isMuted ? 0 : volume   // real-time volume control
         Log("loadSounds — 880 Hz beep, volume=\(String(format: "%.2f", volume))", "Metronome")
@@ -150,21 +153,43 @@ class MetronomeService: ObservableObject {
         Log("buildSchedule — tempoEvents=\(tempoEvents.count) timeSigs=\(timeSigs.count) totalDuration=\(String(format: "%.2f", totalDuration))s staticBPM=\(staticBPM.map { String($0) } ?? "nil")", "Metronome")
         guard totalDuration > 0 else { beatSchedule = []; Log("buildSchedule — skipped: totalDuration=0", "Metronome"); return }
 
-        var parsedTimeSigs: [(time: Double, num: Int, den: Int)] = []
+        var parsedTimeSigs: [(beat: Double, num: Int, den: Int)] = []
         for ts in timeSigs {
-            guard let secs = timeSigTimeToSeconds(ts.time),
-                  let (num, den) = parseTimeSigString(ts.sig) else { continue }
-            parsedTimeSigs.append((secs, num, den))
+            guard let (num, den) = parseTimeSigString(ts.sig) else { continue }
+            let beatPos = ts.beat ?? {
+                // Fallback for legacy data without beat positions: convert time to approximate beat
+                guard let secs = timeSigTimeToSeconds(ts.time), secs > 0 else { return 0.0 }
+                return secs  // imprecise fallback; only used if parser doesn't send beat field
+            }()
+            parsedTimeSigs.append((beatPos, num, den))
         }
         if parsedTimeSigs.isEmpty { parsedTimeSigs = [(0.0, 4, 4)] }
-        parsedTimeSigs.sort { $0.time < $1.time }
+        parsedTimeSigs.sort { $0.beat < $1.beat }
 
         var effectiveTempoEvents = tempoEvents
         if effectiveTempoEvents.isEmpty, let bpm = staticBPM, bpm > 0 {
             Log("buildSchedule — no tempo events; using staticBPM=\(bpm)", "Metronome")
             effectiveTempoEvents = [TempoEvent(beat: 0, bpm: bpm)]
         }
-        let sortedTempo = effectiveTempoEvents.sorted { $0.beat < $1.beat }
+        // Stable sort preserving XML order for equal beat positions, then
+        // deduplicate step changes (two events at the same beat) by keeping only
+        // the last event — which is Ableton's "new BPM" for that position.
+        let sortedTempo: [TempoEvent] = {
+            let indexed = effectiveTempoEvents.enumerated().sorted {
+                $0.element.beat != $1.element.beat
+                    ? $0.element.beat < $1.element.beat
+                    : $0.offset < $1.offset
+            }
+            var result: [TempoEvent] = []
+            for (_, evt) in indexed {
+                if let last = result.last, last.beat == evt.beat {
+                    result[result.count - 1] = evt
+                } else {
+                    result.append(evt)
+                }
+            }
+            return result
+        }()
         if sortedTempo.isEmpty {
             Log("buildSchedule — no tempo events and no staticBPM, beatSchedule empty", "Metronome")
             beatSchedule = []
@@ -190,49 +215,105 @@ class MetronomeService: ObservableObject {
             return accTime
         }
 
-        func timeSigAt(_ t: Double) -> (num: Int, den: Int) {
+        func timeSigAt(beat: Double) -> (num: Int, den: Int) {
             var current = parsedTimeSigs[0]
             for ts in parsedTimeSigs {
-                if ts.time <= t { current = ts } else { break }
+                if ts.beat <= beat { current = ts } else { break }
             }
             return (current.num, current.den)
         }
 
-        let step: Double = subdivision == .eighths ? 0.5 : 1.0
         var result: [BeatInfo] = []
         var beatNumber = 0.0
         var bar = 1
         var beatInBar = 1
-        var isOnQuarterBeat = true   // alternates for eighths mode
+        // isOnQuarterBeat alternates only for /4 time sigs in 8th's subdivision mode
+        var isOnQuarterBeat = true
+        var prevTs = (num: parsedTimeSigs[0].num, den: parsedTimeSigs[0].den)
+        // Cache secondary accent positions so we don't recompute them on every beat
+        var cachedSecAccentBeats: Set<Int> = secondaryAccentBeats(num: parsedTimeSigs[0].num, den: parsedTimeSigs[0].den)
 
         while true {
             let realTime = beatToTime(beatNumber)
             if realTime > totalDuration + 1.0 { break }
 
-            let isSubTick = !isOnQuarterBeat
-            let ts = timeSigAt(realTime)
+            let ts = timeSigAt(beat: beatNumber)
+
+            // Reset beatInBar and accent cache on time signature change.
+            if ts.num != prevTs.num || ts.den != prevTs.den {
+                beatInBar = 1
+                isOnQuarterBeat = true
+                prevTs = (ts.num, ts.den)
+                cachedSecAccentBeats = secondaryAccentBeats(num: ts.num, den: ts.den)
+            }
+
+            // For /8 time sigs the natural pulse IS the eighth note — no subdivision ticks.
+            // For /4 time sigs in 8th's mode, odd steps are subdivision ticks.
+            let currentStep: Double = ts.den == 8 ? 0.5 : (subdivision == .eighths ? 0.5 : 1.0)
+            let isSubTick = ts.den != 8 && !isOnQuarterBeat
+
             let isDownbeat = !isSubTick && beatInBar == 1
+            let isSecAcc   = !isSubTick && !isDownbeat && cachedSecAccentBeats.contains(beatInBar)
             result.append(BeatInfo(
                 timeSeconds: realTime,
                 bar: bar,
                 beat: beatInBar,
                 isDownbeat: isDownbeat,
-                isSubdivisionTick: isSubTick
+                isSubdivisionTick: isSubTick,
+                isSecondaryAccent: isSecAcc
             ))
 
             if !isSubTick {
                 beatInBar += 1
-                if beatInBar > ts.num {
+                // stepsPerBar must use the real-beat step (not the subdivision step) because
+                // beatInBar only increments on non-tick beats.
+                // For /8: real beat = 0.5 (eighth note). For /4: real beat = 1.0 (quarter note),
+                // even in 8ths mode where currentStep=0.5 and half the steps are subdivision ticks.
+                let realBeatStep: Double = ts.den == 8 ? 0.5 : 1.0
+                let stepsPerBar = max(1, Int(round(Double(ts.num) * 4.0 / (Double(ts.den) * realBeatStep))))
+                if beatInBar > stepsPerBar {
                     beatInBar = 1
                     bar += 1
                 }
             }
-            beatNumber += step
-            if subdivision == .eighths { isOnQuarterBeat.toggle() }
+            beatNumber += currentStep
+            if ts.den != 8 && subdivision == .eighths { isOnQuarterBeat.toggle() }
         }
 
         beatSchedule = result
         Log("buildSchedule — built \(result.count) beats", "Metronome")
+    }
+
+    /// Returns the set of 1-based beat positions within a bar that should receive a secondary accent.
+    /// Groups are in denominator-note units (e.g. eighth notes for /8, quarter notes for /4).
+    private func secondaryAccentBeats(num: Int, den: Int) -> Set<Int> {
+        let groups: [Int]
+        switch (num, den) {
+        case (4, 4):  groups = [2, 2]
+        case (5, 4):  groups = [3, 2]
+        case (6, 4):  groups = [3, 3]
+        case (7, 4):  groups = [2, 2, 3]
+        case (9, 4):  groups = [3, 3, 3]
+        case (10, 4): groups = [3, 3, 2, 2]
+        case (11, 4): groups = [3, 3, 3, 2]
+        case (12, 4): groups = [3, 3, 3, 3]
+        case (13, 4): groups = [3, 3, 3, 2, 2]
+        case (6, 8):  groups = [3, 3]
+        case (7, 8):  groups = [2, 2, 3]
+        case (9, 8):  groups = [3, 3, 3]
+        case (10, 8): groups = [3, 3, 2, 2]
+        case (11, 8): groups = [3, 3, 3, 2]
+        case (12, 8): groups = [3, 3, 3, 3]
+        case (13, 8): groups = [3, 3, 3, 2, 2]
+        default:      return []   // 2/4, 3/4, 3/8 — no secondary accent
+        }
+        var positions = Set<Int>()
+        var cum = 0
+        for (i, g) in groups.enumerated() {
+            if i > 0 { positions.insert(cum + 1) }
+            cum += g
+        }
+        return positions
     }
 
     // MARK: - Playback Control
@@ -313,8 +394,9 @@ class MetronomeService: ObservableObject {
     /// When rescheduling mid-playback, pass the original anchor pair plus `filterFrom: currentTime`
     /// so beat host-times stay at their original positions (no timing drift).
     private func scheduleAllBeats(anchorHostTime: UInt64, startSessionTime: Double, filterFrom: Double? = nil) {
-        guard let downbeatBuf  = downbeatBuffer ?? clickBuffer,
-              let subdivBuf    = subdivisionBuffer ?? clickBuffer,
+        guard let downbeatBuf    = downbeatBuffer ?? clickBuffer,
+              let mediumAccBuf  = mediumAccentBuffer ?? subdivisionBuffer ?? clickBuffer,
+              let subdivBuf     = subdivisionBuffer ?? clickBuffer,
               let subdivTickBuf = subdivisionTickBuffer ?? clickBuffer else {
             Log("scheduleAllBeats — aborted: buffers not loaded", "Metronome")
             return
@@ -339,8 +421,12 @@ class MetronomeService: ObservableObject {
             let buf: AVAudioPCMBuffer
             if beatInfo.isSubdivisionTick {
                 buf = subdivTickBuf
+            } else if beatInfo.isDownbeat {
+                buf = downbeatBuf
+            } else if beatInfo.isSecondaryAccent {
+                buf = mediumAccBuf
             } else {
-                buf = beatInfo.isDownbeat ? downbeatBuf : subdivBuf
+                buf = subdivBuf
             }
             playerNode.scheduleBuffer(buf, at: when, options: [], completionHandler: nil)
             scheduled += 1
@@ -447,6 +533,7 @@ class MetronomeService: ObservableObject {
 struct MetronomeView: View {
     @ObservedObject var metronome: MetronomeService
     @State private var showPopover = false
+    @State private var hovered = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -460,34 +547,61 @@ struct MetronomeView: View {
                     .frame(minWidth: 52, alignment: .trailing)
             }
 
-            // Metronome icon button — left-click mutes/unmutes, right-click opens settings
-            Button {
-                metronome.toggleMute()
-            } label: {
-                Image(systemName: "metronome")
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundColor(metronome.isPlaying && !metronome.isMuted ? Color.accent : Color.fgMid)
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .overlay(RightClickOverlay { showPopover.toggle() })
-            .popover(isPresented: $showPopover, arrowEdge: .top) {
-                MetronomePopoverView(metronome: metronome)
-            }
+            // Metronome icon — left-click mutes/unmutes, right-click opens settings
+            Image(systemName: "metronome")
+                .font(.system(size: 14, weight: .regular))
+                .foregroundColor(
+                    hovered ? Color.fgBright :
+                    (metronome.isPlaying && !metronome.isMuted ? Color.accent : Color.fgMid)
+                )
+                .animation(.easeOut(duration: 0.12), value: hovered)
+                .frame(width: 36, height: 36)
+                .overlay(ClickOverlay(
+                    onLeftClick: { metronome.toggleMute() },
+                    onRightClick: { showPopover.toggle() },
+                    onHover: { hovered = $0 }
+                ))
+                .popover(isPresented: $showPopover, arrowEdge: .top) {
+                    MetronomePopoverView(metronome: metronome)
+                }
         }
     }
 }
 
-private struct RightClickOverlay: NSViewRepresentable {
-    let action: () -> Void
-    func makeNSView(context: Context) -> RightClickNSView { RightClickNSView(action: action) }
-    func updateNSView(_ nsView: RightClickNSView, context: Context) {}
+private struct ClickOverlay: NSViewRepresentable {
+    let onLeftClick: () -> Void
+    let onRightClick: () -> Void
+    let onHover: (Bool) -> Void
 
-    class RightClickNSView: NSView {
-        let action: () -> Void
-        init(action: @escaping () -> Void) { self.action = action; super.init(frame: .zero) }
+    func makeNSView(context: Context) -> ClickNSView {
+        ClickNSView(onLeftClick: onLeftClick, onRightClick: onRightClick, onHover: onHover)
+    }
+    func updateNSView(_ nsView: ClickNSView, context: Context) {
+        nsView.onLeftClick = onLeftClick
+        nsView.onRightClick = onRightClick
+        nsView.onHover = onHover
+    }
+
+    class ClickNSView: NSView {
+        var onLeftClick: () -> Void
+        var onRightClick: () -> Void
+        var onHover: (Bool) -> Void
+        init(onLeftClick: @escaping () -> Void, onRightClick: @escaping () -> Void, onHover: @escaping (Bool) -> Void) {
+            self.onLeftClick = onLeftClick
+            self.onRightClick = onRightClick
+            self.onHover = onHover
+            super.init(frame: .zero)
+        }
         required init?(coder: NSCoder) { fatalError() }
-        override func rightMouseDown(with event: NSEvent) { action() }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach { removeTrackingArea($0) }
+            addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self))
+        }
+        override func mouseEntered(with event: NSEvent) { onHover(true); NSCursor.pointingHand.set() }
+        override func mouseExited(with event: NSEvent)  { onHover(false); NSCursor.arrow.set() }
+        override func mouseDown(with event: NSEvent) { onLeftClick() }
+        override func rightMouseDown(with event: NSEvent) { onRightClick() }
     }
 }
 

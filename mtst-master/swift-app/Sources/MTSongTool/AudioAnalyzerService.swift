@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Accelerate
 
 // MARK: - Models
 
@@ -17,6 +18,15 @@ enum AudioFileStatus {
     }
 }
 
+// MARK: - Suggestion types
+
+struct StemSuggestion: Equatable {
+    let name: String
+    let confidence: Float  // 0.0–1.0
+    var isTaken: Bool = false
+}
+
+
 struct AudioFileResult: Identifiable {
     let id = UUID()
     let filename: String
@@ -24,13 +34,17 @@ struct AudioFileResult: Identifiable {
     let issues: [String]   // e.g. ["Unknown Stem", "48kHz", "24-bit"]
     var waveformPeaks: [Float]  // 500 normalized (0–1) amplitude samples; empty for corrupted/empty files
     var duration: Double        // seconds; 0 for corrupted/silent files
+    var suggestedNames: [StemSuggestion]     // populated when "Check Stem Name" present
 
-    init(filename: String, status: AudioFileStatus, issues: [String], waveformPeaks: [Float] = [], duration: Double = 0) {
+    init(filename: String, status: AudioFileStatus, issues: [String],
+         waveformPeaks: [Float] = [], duration: Double = 0,
+         suggestedNames: [StemSuggestion] = []) {
         self.filename = filename
         self.status = status
         self.issues = issues
         self.waveformPeaks = waveformPeaks
         self.duration = duration
+        self.suggestedNames = suggestedNames
     }
 
     var isClean: Bool {
@@ -181,13 +195,29 @@ class AudioAnalyzerService: ObservableObject {
             DispatchQueue.main.async { self.progress = (0, total) }
 
             let expectedDur = self.expectedDuration
-            var results: [AudioFileResult] = []
+            var slots: [AudioFileResult?] = Array(repeating: nil, count: total)
+            let lock = NSLock()
+            var completedCount = 0
+            let concurrentQueue = DispatchQueue(label: "com.mtst.stemAnalysis", attributes: .concurrent)
+            let group = DispatchGroup()
+
             for (i, url) in wavFiles.enumerated() {
-                DispatchQueue.main.async { self.progress = (i + 1, total) }
-                results.append(Self.analyzeFile(url, approvedStems: Self.approvedStems, expectedDuration: expectedDur))
+                group.enter()
+                concurrentQueue.async { [weak self] in
+                    let result = Self.analyzeFile(url, approvedStems: Self.approvedStems, expectedDuration: expectedDur)
+                    lock.lock()
+                    slots[i] = result
+                    completedCount += 1
+                    let count = completedCount
+                    lock.unlock()
+                    DispatchQueue.main.async { self?.progress = (count, total) }
+                    group.leave()
+                }
             }
+            group.wait()
 
             // Post-pass: flag stems that share the same name (case-insensitive, no extension)
+            var results: [AudioFileResult] = slots.compactMap { $0 }
             var nameBuckets: [String: [Int]] = [:]
             for (i, result) in results.enumerated() {
                 let key = URL(fileURLWithPath: result.filename)
@@ -198,9 +228,17 @@ class AudioAnalyzerService: ObservableObject {
             if !dupIndices.isEmpty {
                 results = results.enumerated().map { i, r in
                     guard dupIndices.contains(i) else { return r }
-                    return AudioFileResult(filename: r.filename, status: r.status, issues: r.issues + ["Duplicate"], waveformPeaks: r.waveformPeaks, duration: r.duration)
+                    return AudioFileResult(filename: r.filename, status: r.status, issues: r.issues + ["Duplicate"],
+                                          waveformPeaks: r.waveformPeaks, duration: r.duration,
+                                          suggestedNames: r.suggestedNames)
                 }
             }
+
+            // Post-pass: flag numbered stems with gaps in their sequence (e.g. EG 1, EG 2, EG 4 → EG 3 missing)
+            results = Self.flagSequenceGaps(in: results)
+
+            // Post-pass: mark taken suggestions and append next available numbered variants
+            results = Self.refineSuggestions(in: results)
 
             DispatchQueue.main.async {
                 self.results = results
@@ -373,14 +411,11 @@ class AudioAnalyzerService: ObservableObject {
         }
 
         // --- Duration check ---
-        // Tolerance = 5 samples at the file's native sample rate.
-        // Measurement against real Ableton WAV exports shows a consistent ~2.63-sample offset
-        // between dawtool's beat→seconds calculation and the actual exported frame count.
-        // 5 samples (~0.113ms at 44.1kHz) absorbs that offset with ~2 samples of headroom.
+        // Tolerance = 10 samples at the file's native sample rate (~0.227ms at 44.1kHz).
         let sampleRate = file.fileFormat.sampleRate
         let fileDuration = Double(file.length) / sampleRate
         if let expected = expectedDuration {
-            let tolerance = 5.0 / sampleRate
+            let tolerance = 10.0 / sampleRate
             let diff = fileDuration - expected
             if diff > tolerance {
                 issues.append("Too Long")
@@ -439,12 +474,38 @@ class AudioAnalyzerService: ObservableObject {
             peaks = peaks.map { $0 / maxPeak }
         }
 
+        // Suggestions for invalid stem names.
+        // Wrong Caps: direct 1.0-confidence suggestion of the uppercased form.
+        // Extra Space / Special Chars: if normalizing produces a direct approved match, use it
+        //   at 1.0 confidence instead of running the full similarity engine (which can surface
+        //   unrelated stems via token overlap as fallbacks when the direct match is taken).
+        // Check Stem Name: full similarity engine.
+        var suggestedNames: [StemSuggestion] = []
+        if issues.contains("Wrong Caps") {
+            suggestedNames = [StemSuggestion(name: stemName.uppercased(), confidence: 1.0)]
+        } else if issues.contains("Extra Space") || issues.contains("Special Chars") {
+            let normalized = normalizeFilename(stemName)
+            if approvedStems.contains(normalized) {
+                suggestedNames = [StemSuggestion(name: normalized, confidence: 1.0)]
+            } else {
+                let containsLive = normalized.contains("LIVE")
+                suggestedNames = stringSuggestions(normalizedFilename: normalized, containsLiveWord: containsLive)
+                    .prefix(5).map { StemSuggestion(name: $0.0, confidence: $0.1) }
+            }
+        } else if issues.contains("Check Stem Name") {
+            let normalized = normalizeFilename(stemName)
+            let containsLive = normalized.contains("LIVE")
+            suggestedNames = stringSuggestions(normalizedFilename: normalized, containsLiveWord: containsLive)
+                .prefix(5).map { StemSuggestion(name: $0.0, confidence: $0.1) }
+        }
+
         return AudioFileResult(
             filename: name,
             status: hasAudio ? .ok : .silent,
             issues: issues,
             waveformPeaks: peaks,
-            duration: fileDuration
+            duration: fileDuration,
+            suggestedNames: suggestedNames
         )
     }
 
@@ -702,12 +763,49 @@ class AudioAnalyzerService: ObservableObject {
                 let dest   = workingFolder.appendingPathComponent(result.filename)
                 let state  = stemStates[source] ?? StemState()
 
+                let hasSegmentEdits = state.segments.count > 1 ||
+                    (state.segments.first.map { $0.sessionStart != 0 } ?? false)
                 let hasOffset  = state.offset != 0
                 let hasTrim    = state.trimIn != 0 || state.trimOut != nil
                 let hasCuts    = !state.cuts.isEmpty
                 let hasGain    = state.gain != 1.0
 
-                if !hasOffset && !hasTrim && !hasCuts && !hasGain {
+                if hasSegmentEdits {
+                    // Multi-segment bake-out: assemble pieces with silence gaps using FFmpeg filter_complex.
+                    // Segments sorted by session start; gaps between them become silence.
+                    let sorted = state.segments.sorted { $0.sessionStart < $1.sessionStart }
+                    var filterParts: [String] = []
+                    var concatInputs: [String] = []
+                    var pieceIdx = 0
+
+                    var cursor = 0.0
+                    for seg in sorted {
+                        let gapDur = seg.sessionStart - cursor
+                        if gapDur > 0.001 {
+                            filterParts.append("aevalsrc=0:d=\(String(format: "%.6f", gapDur))[g\(pieceIdx)]")
+                            concatInputs.append("[g\(pieceIdx)]")
+                            pieceIdx += 1
+                        }
+                        filterParts.append("[0:a]atrim=start=\(String(format: "%.6f", seg.sourceStart)):end=\(String(format: "%.6f", seg.sourceEnd)),asetpts=PTS-STARTPTS[s\(pieceIdx)]")
+                        concatInputs.append("[s\(pieceIdx)]")
+                        cursor = seg.sessionEnd
+                        pieceIdx += 1
+                    }
+
+                    let n = concatInputs.count
+                    let concatFilter = concatInputs.joined() + "concat=n=\(n):v=0:a=1[out]"
+                    filterParts.append(concatFilter)
+                    let filterComplex = filterParts.joined(separator: ";")
+
+                    var args: [String] = ["-hide_banner", "-loglevel", "error", "-y",
+                                          "-i", source.path,
+                                          "-filter_complex", filterComplex,
+                                          "-map", "[out]"]
+                    if hasGain { args += ["-af", "volume=\(state.gain)"] }
+                    args += ["-c:a", "pcm_s16le", "-ar", "44100", dest.path]
+                    let (success, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
+                    if !success { errors.append(result.filename + ": " + errMsg) }
+                } else if !hasOffset && !hasTrim && !hasCuts && !hasGain {
                     // No edits — copy as-is
                     do {
                         if FileManager.default.fileExists(atPath: dest.path) {
@@ -718,79 +816,57 @@ class AudioAnalyzerService: ObservableObject {
                         errors.append(result.filename + ": " + error.localizedDescription)
                     }
                     continue
-                }
-
-                // Build FFmpeg filter chain
-                var filters: [String] = []
-
-                if state.gain != 1.0 {
-                    filters.append("volume=\(state.gain)")
-                }
-
-                var args: [String] = ["-hide_banner", "-loglevel", "error", "-y"]
-
-                // Trim: -ss (start) / -to (end)
-                let trimStart = state.trimIn > 0 ? state.trimIn : 0.0
-                if trimStart > 0 { args += ["-ss", String(trimStart)] }
-                args += ["-i", source.path]
-                if let trimEnd = state.trimOut { args += ["-to", String(trimEnd)] }
-
-                // Offset (positive = prepend silence via adelay)
-                if state.offset > 0 {
-                    let ms = Int(state.offset * 1000)
-                    filters.append("adelay=\(ms)|\(ms)")
-                }
-
-                // Gain
-                if state.gain != 1.0 {
-                    filters.append("volume=\(state.gain)")
-                }
-
-                if !filters.isEmpty {
-                    // Remove duplicated volume if added above
-                    let uniqueFilters = Array(NSOrderedSet(array: filters)) as! [String]
-                    args += ["-af", uniqueFilters.joined(separator: ",")]
-                }
-
-                if hasCuts {
-                    // Split into segments at each cut point, applying fade-in to each segment
-                    var cutPoints = state.cuts.sorted()
-                    var segmentStart = trimStart
-                    var segmentIndex = 0
-                    var segmentURLs: [URL] = []
-
-                    for cutPoint in cutPoints + [state.trimOut ?? Double.infinity] {
-                        let baseName = URL(fileURLWithPath: result.filename).deletingPathExtension().lastPathComponent
-                        let segDest = workingFolder.appendingPathComponent(
-                            "\(baseName)_seg\(segmentIndex).wav"
-                        )
-                        var segArgs: [String] = ["-hide_banner", "-loglevel", "error", "-y",
-                                                 "-ss", String(segmentStart), "-i", source.path]
-                        if cutPoint != Double.infinity { segArgs += ["-to", String(cutPoint)] }
-
-                        var segFilters: [String] = []
-                        if autoFadeCuts && segmentIndex > 0 {
-                            segFilters.append("afade=t=in:st=0:d=0.01")
-                        }
-                        if state.gain != 1.0 { segFilters.append("volume=\(state.gain)") }
-                        if !segFilters.isEmpty { segArgs += ["-af", segFilters.joined(separator: ",")] }
-
-                        segArgs.append(segDest.path)
-                        _ = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: segArgs)
-                        segmentURLs.append(segDest)
-                        segmentStart = cutPoint
-                        segmentIndex += 1
-                    }
-
-                    // If single segment, just rename to final dest
-                    if segmentURLs.count == 1 {
-                        try? FileManager.default.moveItem(at: segmentURLs[0], to: dest)
-                    }
-                    // Multiple segments are left as _seg0, _seg1 etc. in the output folder
                 } else {
-                    args.append(dest.path)
-                    let (success, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
-                    if !success { errors.append(result.filename + ": " + errMsg) }
+                    // Legacy single-clip edits (offset / trim / cuts / gain)
+                    var filters: [String] = []
+                    var args: [String] = ["-hide_banner", "-loglevel", "error", "-y"]
+
+                    let trimStart = state.trimIn > 0 ? state.trimIn : 0.0
+                    if trimStart > 0 { args += ["-ss", String(trimStart)] }
+                    args += ["-i", source.path]
+                    if let trimEnd = state.trimOut { args += ["-to", String(trimEnd)] }
+
+                    if state.offset > 0 {
+                        let ms = Int(state.offset * 1000)
+                        filters.append("adelay=\(ms)|\(ms)")
+                    }
+                    if state.gain != 1.0 { filters.append("volume=\(state.gain)") }
+
+                    if !filters.isEmpty {
+                        let uniqueFilters = Array(NSOrderedSet(array: filters)) as! [String]
+                        args += ["-af", uniqueFilters.joined(separator: ",")]
+                    }
+
+                    if hasCuts {
+                        var cutPoints = state.cuts.sorted()
+                        var segmentStart = trimStart
+                        var segmentIndex = 0
+                        var segmentURLs: [URL] = []
+
+                        for cutPoint in cutPoints + [state.trimOut ?? Double.infinity] {
+                            let baseName = URL(fileURLWithPath: result.filename).deletingPathExtension().lastPathComponent
+                            let segDest = workingFolder.appendingPathComponent("\(baseName)_seg\(segmentIndex).wav")
+                            var segArgs: [String] = ["-hide_banner", "-loglevel", "error", "-y",
+                                                     "-ss", String(segmentStart), "-i", source.path]
+                            if cutPoint != Double.infinity { segArgs += ["-to", String(cutPoint)] }
+                            var segFilters: [String] = []
+                            if autoFadeCuts && segmentIndex > 0 { segFilters.append("afade=t=in:st=0:d=0.01") }
+                            if state.gain != 1.0 { segFilters.append("volume=\(state.gain)") }
+                            if !segFilters.isEmpty { segArgs += ["-af", segFilters.joined(separator: ",")] }
+                            segArgs.append(segDest.path)
+                            _ = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: segArgs)
+                            segmentURLs.append(segDest)
+                            segmentStart = cutPoint
+                            segmentIndex += 1
+                        }
+                        if segmentURLs.count == 1 {
+                            try? FileManager.default.moveItem(at: segmentURLs[0], to: dest)
+                        }
+                    } else {
+                        args.append(dest.path)
+                        let (success, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
+                        if !success { errors.append(result.filename + ": " + errMsg) }
+                    }
                 }
             }
 
@@ -832,4 +908,295 @@ class AudioAnalyzerService: ObservableObject {
         let msg = String(data: data, encoding: .utf8) ?? "Unknown FFmpeg error"
         return (false, msg.trimmingCharacters(in: .whitespacesAndNewlines))
     }
+
+    // MARK: - Stem Suggestion Engine
+
+    // Long-form or common alternate phrasings → abbreviated canonical form.
+    // Applied to the normalized filename before string matching so that e.g.
+    // "ELECTRIC GUITAR 1" scores perfectly against "EG 1".
+    private static let abbreviationExpansions: [(pattern: String, replacement: String)] = [
+        ("ELECTRIC GUITAR",    "EG"),
+        ("ACOUSTIC GUITAR",    "AG"),
+        ("BACKGROUND VOCALS",  "BGVS"),
+        ("BACKGROUND VOCAL",   "BGVS"),
+        ("BACKING VOCALS",     "BGVS"),
+        ("BACKING VOCAL",      "BGVS"),
+        ("BACKUP VOCALS",      "BGVS"),
+        ("BG VOCALS",          "BGVS"),
+        ("BG VOCAL",           "BGVS"),
+        ("BGV",                "BGVS"),
+        ("LEAD VOX",           "LEAD VOCAL"),
+        ("LEAD VX",            "LEAD VOCAL"),
+        ("VOX",                "VOCALS"),
+        ("BASS GUITAR",        "BASS"),
+        ("UPRIGHT",            "UPRIGHT BASS"),
+        ("DOUBLE BASS GTR",    "DOUBLE BASS"),
+        ("KEYBOARDS",          "KEYS"),
+        ("KEYBOARD",           "KEYS"),
+        ("DRUM KIT",           "DRUMS"),
+        ("DRUM SET",           "DRUMS"),
+        ("PERCUSSION",         "PERC"),
+        ("ELECTRIC GTR",       "EG"),
+        ("ACOUSTIC GTR",       "AG"),
+        ("ELEC GUITAR",        "EG"),
+        ("ACOU GUITAR",        "AG"),
+        ("ELEC GTR",           "EG"),
+        ("E GTR",              "EG"),
+        ("A GTR",              "AG"),
+        ("ELECTRIC BASS",      "BASS"),
+        ("ELEC BASS",          "BASS"),
+        ("ELECTRIC",           "EG"),
+        ("ACOUSTIC",           "AG"),
+    ]
+
+    // Patterns that expand to multiple candidate families.
+    // e.g. "GTR 1" → suggestions for both "EG 1" and "AG 1".
+    private static let multiExpansions: [(pattern: String, replacements: [String])] = [
+        ("GTR", ["EG", "AG"]),
+    ]
+
+    private static func applyAbbreviations(_ normalized: String) -> String {
+        var s = normalized
+        for (pattern, replacement) in abbreviationExpansions {
+            s = s.replacingOccurrences(of: pattern, with: replacement)
+        }
+        while s.contains("  ") { s = s.replacingOccurrences(of: "  ", with: " ") }
+        return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Token-level fuzzy expansion for typos in instrument words.
+    /// e.g. "ELECTR 1" → "EG 1", "ELECC 1" → "EG 1", "ACOUST 3" → "AG 3".
+    /// Tries 2-token windows then 1-token windows (longest-match-first).
+    /// Scores both full and prefix-truncated pattern, taking the min distance.
+    /// Threshold: max(1, min(phrase, pattern) / 3) — based on shorter length.
+    /// dist == 0 skipped (exact hits already handled by applyAbbreviations).
+    private static func fuzzyApplyAbbreviations(_ normalized: String) -> String {
+        let tokens = normalized.components(separatedBy: " ").filter { !$0.isEmpty }
+        guard tokens.count >= 1 else { return normalized }
+
+        for windowSize in stride(from: min(2, tokens.count), through: 1, by: -1) {
+            let phrase = tokens[0..<windowSize].joined(separator: " ")
+            let rest   = tokens[windowSize...].joined(separator: " ")
+            let phraseChars = Array(phrase)
+
+            var bestReplacement: String? = nil
+            var bestDist = Int.max
+            for (pattern, replacement) in abbreviationExpansions {
+                let patChars = Array(pattern)
+                let fullDist = levenshtein(phraseChars, patChars)
+                let truncDist = phraseChars.count < patChars.count
+                    ? levenshtein(phraseChars, Array(patChars.prefix(phraseChars.count)))
+                    : fullDist
+                let dist = min(fullDist, truncDist)
+                let threshold = max(1, min(phraseChars.count, patChars.count) / 3)
+                if dist > 0 && dist <= threshold && dist < bestDist {
+                    bestDist = dist
+                    bestReplacement = replacement
+                }
+            }
+
+            if let rep = bestReplacement {
+                let result = rest.isEmpty ? rep : "\(rep) \(rest)"
+                return applyAbbreviations(result)
+            }
+        }
+        return normalized
+    }
+
+    // MARK: Filename normalization
+
+    private static func normalizeFilename(_ filename: String) -> String {
+        var s = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+        s = s.uppercased()
+        let separators = CharacterSet(charactersIn: "-_.")
+        s = s.components(separatedBy: separators).joined(separator: " ")
+        let allowed = CharacterSet.letters.union(.decimalDigits).union(.init(charactersIn: " ()"))
+        s = String(s.unicodeScalars.map { allowed.contains($0) ? Character($0) : Character(" ") })
+        while s.contains("  ") { s = s.replacingOccurrences(of: "  ", with: " ") }
+        return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: String similarity
+
+    private static func levenshtein(_ a: [Character], _ b: [Character]) -> Int {
+        let n = a.count, m = b.count
+        if n == 0 { return m }
+        if m == 0 { return n }
+        var prev = Array(0...m)
+        var curr = [Int](repeating: 0, count: m + 1)
+        for i in 1...n {
+            curr[0] = i
+            for j in 1...m {
+                curr[j] = a[i-1] == b[j-1] ? prev[j-1] : min(prev[j-1]+1, prev[j]+1, curr[j-1]+1)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[m]
+    }
+
+    /// Returns (stemName, score) pairs for all approved stems with score ≥ 0.25.
+    /// Scores both the raw normalized filename and an abbreviation-expanded form,
+    /// taking the max — so "ELECTRIC GUITAR 1" scores perfectly against "EG 1".
+    /// (LIVE) variants excluded unless `containsLiveWord` is true.
+    private static func stringSuggestions(normalizedFilename: String, containsLiveWord: Bool) -> [(String, Float)] {
+        let expanded      = applyAbbreviations(normalizedFilename)
+        let fuzzyExpanded = fuzzyApplyAbbreviations(normalizedFilename)
+        var scored: [(String, Float)] = []
+
+        for query in Set([normalizedFilename, expanded, fuzzyExpanded]) {
+            let qChars  = Array(query)
+            let qTokens = Set(query.components(separatedBy: " ").filter { !$0.isEmpty })
+
+            for stem in approvedStems {
+                let isLiveVariant = stem.contains("(LIVE)")
+                if isLiveVariant && !containsLiveWord { continue }
+
+                let stemChars = Array(stem)
+                let maxLen = max(qChars.count, stemChars.count)
+                guard maxLen > 0 else { continue }
+
+                let dist = levenshtein(qChars, stemChars)
+                let levScore = 1.0 - Float(dist) / Float(maxLen)
+
+                let stemTokens = Set(stem.components(separatedBy: " "))
+                let overlap = qTokens.intersection(stemTokens).count
+                let tokenScore: Float = qTokens.isEmpty ? 0 : Float(overlap) / Float(max(qTokens.count, 1))
+                let tokenBonus: Float = (!qTokens.isEmpty && qTokens.isSubset(of: stemTokens)) ? 0.3 : 0
+                let prefixBonus: Float = stem.hasPrefix(query) && !query.isEmpty ? 0.2 : 0
+
+                let score = min(max(levScore, tokenScore + tokenBonus) + prefixBonus, 1.0)
+                if score >= 0.25 { scored.append((stem, score)) }
+            }
+        }
+
+        // Multi-expansions: ambiguous abbreviations that map to multiple families.
+        // e.g. "GTR 1" → score "EG 1" and "AG 1" as high-confidence candidates.
+        let tokens = normalizedFilename.components(separatedBy: " ").filter { !$0.isEmpty }
+        for (pattern, replacements) in multiExpansions {
+            guard let idx = tokens.firstIndex(of: pattern) else { continue }
+            let suffix = tokens[(idx + 1)...].joined(separator: " ")
+            for rep in replacements {
+                let candidate = suffix.isEmpty ? rep : "\(rep) \(suffix)"
+                let isLiveVariant = candidate.contains("(LIVE)")
+                if (!isLiveVariant || containsLiveWord) && approvedStems.contains(candidate) {
+                    scored.append((candidate, 0.95))
+                }
+            }
+        }
+
+        // Deduplicate: keep highest score per stem
+        var best: [String: Float] = [:]
+        for (stem, score) in scored { best[stem] = max(best[stem] ?? 0, score) }
+        return best.map { ($0.key, $0.value) }.sorted { $0.1 > $1.1 }
+    }
+
+    // MARK: - Post-scan: sequence gap detection
+
+    /// Flags numbered stems whose base group has gaps (e.g. EG 1, EG 2, EG 4 → EG 3 missing).
+    /// Only applies when a base has 2+ numbered stems and the numbers aren't 1…N consecutive.
+    static func flagSequenceGaps(in results: [AudioFileResult]) -> [AudioFileResult] {
+        // Build map: base name → [(index, number)]
+        // Matches trailing integer: "EG 1" → ("EG", 1), "BGVS FX 3" → ("BGVS FX", 3)
+        var groups: [String: [(index: Int, number: Int)]] = [:]
+        for (i, result) in results.enumerated() {
+            let stemName = URL(fileURLWithPath: result.filename)
+                .deletingPathExtension().lastPathComponent.uppercased()
+            // Only consider stems that are valid (approved) — skip unknowns/corrupted
+            guard Self.approvedStems.contains(stemName) else { continue }
+            // Split on last space to get base + trailing number
+            if let spaceRange = stemName.range(of: " ", options: .backwards),
+               let num = Int(stemName[stemName.index(after: spaceRange.lowerBound)...]) {
+                let base = String(stemName[..<spaceRange.lowerBound])
+                groups[base, default: []].append((index: i, number: num))
+            }
+        }
+
+        // Find which indices need the gap issue
+        var gapIndices = Set<Int>()
+        for (_, entries) in groups where entries.count >= 2 {
+            let nums = entries.map(\.number)
+            let maxNum = nums.max()!
+            let expected = Set(1...maxNum)
+            if Set(nums) != expected {
+                entries.forEach { gapIndices.insert($0.index) }
+            }
+        }
+
+        guard !gapIndices.isEmpty else { return results }
+        return results.enumerated().map { i, r in
+            guard gapIndices.contains(i) else { return r }
+            return AudioFileResult(filename: r.filename, status: r.status,
+                                   issues: r.issues + ["Gap in Sequence"],
+                                   waveformPeaks: r.waveformPeaks, duration: r.duration,
+                                   suggestedNames: r.suggestedNames)
+        }
+    }
+
+    // MARK: - Post-scan refinement
+
+    /// Second pass over all results: marks suggestions whose name is already taken
+    /// by a valid stem in the folder, and appends the next available numbered variant.
+    static func refineSuggestions(in results: [AudioFileResult]) -> [AudioFileResult] {
+        // A stem "takes" a name only when its filename IS already the correct name —
+        // i.e. it has no naming issues. Files with Wrong Caps / Extra Space / Special Chars /
+        // Check Stem Name are themselves candidates for rename and must not block their own
+        // target name from appearing as an available suggestion.
+        let namingIssues: Set<String> = ["Check Stem Name", "Wrong Caps", "Extra Space", "Special Chars"]
+        var takenNames = Set<String>()
+        for result in results {
+            guard result.issues.allSatisfy({ !namingIssues.contains($0) }) else { continue }
+            let name = URL(fileURLWithPath: result.filename)
+                .deletingPathExtension().lastPathComponent.uppercased()
+            takenNames.insert(name)
+        }
+
+        return results.map { result in
+            guard !result.suggestedNames.isEmpty else { return result }
+
+            var refined: [StemSuggestion] = []
+            var addedVariants = Set<String>()
+
+            for sug in result.suggestedNames {
+                let taken = takenNames.contains(sug.name)
+                refined.append(StemSuggestion(name: sug.name, confidence: sug.confidence, isTaken: taken))
+                if taken, let next = nextAvailable(for: sug.name, taken: takenNames),
+                   !addedVariants.contains(next) {
+                    refined.append(StemSuggestion(name: next, confidence: sug.confidence * 0.9, isTaken: false))
+                    addedVariants.insert(next)
+                }
+            }
+
+            // Non-taken first (by confidence), then taken
+            refined.sort {
+                if $0.isTaken != $1.isTaken { return !$0.isTaken }
+                return $0.confidence > $1.confidence
+            }
+
+            return AudioFileResult(filename: result.filename, status: result.status, issues: result.issues,
+                                   waveformPeaks: result.waveformPeaks, duration: result.duration,
+                                   suggestedNames: refined)
+        }
+    }
+
+    /// Finds the lowest available numbered variant of a stem name not in `taken`.
+    /// "EG 1" → tries "EG 2", "EG 3" … "EG" (no number) → tries "EG 1", "EG 2" …
+    private static func nextAvailable(for name: String, taken: Set<String>) -> String? {
+        let parts = name.components(separatedBy: " ")
+        let base: String
+        let startN: Int
+        if let last = parts.last, let n = Int(last) {
+            base   = parts.dropLast().joined(separator: " ")
+            startN = n + 1
+        } else {
+            base   = name
+            startN = 1
+        }
+        for n in startN...(startN + 15) {
+            let candidate = "\(base) \(n)"
+            if !taken.contains(candidate) && approvedStems.contains(candidate) { return candidate }
+        }
+        return nil
+    }
+
 }
+

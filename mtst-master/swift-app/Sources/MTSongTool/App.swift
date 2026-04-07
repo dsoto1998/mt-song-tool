@@ -22,6 +22,11 @@ struct MTSongToolApp: App {
                     LoginView(settings: userSettings)
                 }
             }
+            .overlay(alignment: .top) {
+                WindowDragArea()
+                    .frame(height: 6)
+                    .allowsHitTesting(true)
+            }
             .preferredColorScheme(userSettings.theme.colorScheme)
             .onAppear {
                 configureWindow()
@@ -82,7 +87,7 @@ struct MTSongToolApp: App {
             guard let window = NSApplication.shared.windows.first else { return }
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
-            window.isMovableByWindowBackground = true
+            window.isMovableByWindowBackground = false
             window.backgroundColor = NSColor(name: nil) { appearance in
                 let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                 return isDark
@@ -91,6 +96,19 @@ struct MTSongToolApp: App {
             }
             window.styleMask.insert(.fullSizeContentView)
             window.minSize = NSSize(width: 680, height: 580)
+        }
+    }
+}
+
+/// Transparent drag handle — forwards mouseDown to the window so dragging works
+/// only in this region (typically overlaid at the top of the window).
+struct WindowDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private class DragView: NSView {
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
         }
     }
 }

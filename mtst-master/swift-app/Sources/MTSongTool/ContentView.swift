@@ -14,6 +14,9 @@ struct ContentView: View {
     @State private var copiedSigs = false
     @State private var showSettings = false
     @State private var showLive12Alert = false
+    @State private var showOldVersionAlert = false
+    @State private var ableton11URL: URL? = nil
+    @State private var oldVersionAlsPath: String? = nil
     @State private var isConvertingToLive11 = false
     @State private var toastMessage: String = ""
     @State private var toastIsError: Bool = false
@@ -35,14 +38,13 @@ struct ContentView: View {
     @State private var hasPopulatedSongData = false
     @State private var stemCheckMinimized: Bool = false  // lifted so re-parses don't reset it
     @State private var songDataMinimized: Bool = false
+    @State private var locatorsSigMinimized: Bool = false
+
+
     @State private var isFileBarTargeted: Bool = false
     @State private var copiedBpm: Bool = false
     @State private var copiedPreviewStart: Bool = false
     @State private var copiedPreviewEnd: Bool = false
-
-    // Temporary fields for credential entry in settings popover
-    @State private var settingsNRPassword = ""
-    @State private var settingsNRVolume   = ""
 
     // Active app tab
     enum AppTab { case qa, edit }
@@ -61,11 +63,8 @@ struct ContentView: View {
             Color.bg.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                // Traffic-light spacer so content clears the title bar buttons
-                Color.clear.frame(height: 28)
-
-                headerView
-                    .padding(.bottom, 14)
+                topBar
+                    .padding(.bottom, 4)
 
                 // Persistent file bar — always above the scroll content once a file is loaded
                 if parser.result != nil {
@@ -82,87 +81,69 @@ struct ContentView: View {
                         .padding(.bottom, 10)
                 }
 
-                ScrollView(.vertical, showsIndicators: false) {
-                    if activeTab == .edit {
-                        EditView(
-                            editPlayer: editPlayer,
-                            metronome: metronome,
-                            stemURLs: audioAnalyzer.stemURLs,
-                            analyzer: audioAnalyzer,
-                            parsedResult: parser.result
-                        )
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 20)
-                    } else {
-                        VStack(spacing: 0) {
-                            // QA tab content (also shown before any file is loaded — drop zone)
-                            dropZoneOrResults
-                                .frame(minHeight: parser.result == nil ? 220 : nil)
+                if activeTab == .edit {
+                    // Edit tab manages its own internal scroll — must NOT be inside outer ScrollView
+                    // so that the floating global selection bar at the bottom works correctly.
+                    EditView(
+                        editPlayer: editPlayer,
+                        metronome: metronome,
+                        stemURLs: audioAnalyzer.stemURLs,
+                        analyzer: audioAnalyzer,
+                        parsedResult: parser.result
+                    )
+                    .padding(.horizontal, 20)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 0) {
+                        // QA tab content (also shown before any file is loaded — drop zone)
+                        // layoutPriority(0) — gets compressed first when space is tight
+                        dropZoneOrResults
+                            .frame(minHeight: parser.result == nil ? 220 : 0)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 12)
+
+                        // Song Data — persistent once an .als is loaded
+                        // layoutPriority(1) — protected from compression, natural height only
+                        if parser.result != nil {
+                            songDataView
                                 .padding(.horizontal, 20)
                                 .padding(.bottom, 12)
-
-                            // Song Data — persistent once an .als is loaded
-                            if parser.result != nil {
-                                songDataView
-                                    .padding(.horizontal, 20)
-                                    .padding(.bottom, 12)
-                            }
-
-                            // Audio analysis panel — shown after an .als is loaded, or always in Quick Check Mode
-                            if parser.result != nil || userSettings.quickCheckMode {
-                                VStack(alignment: .trailing, spacing: 8) {
-                                    AudioAnalysisView(
-                                        analyzer: audioAnalyzer,
-                                        stemPlayer: stemPlayer,
-                                        rehearsalMixOnly: rehearsalMixOnly,
-                                        expectedDuration: parser.result?.expectedDuration,
-                                        isMinimized: $stemCheckMinimized,
-                                        quickCheckMode: userSettings.quickCheckMode
-                                    )
-                                    .frame(maxWidth: .infinity)
-                                    // Clear All only shown here in Quick Check Mode without a loaded file
-                                    // (when a file is loaded, Clear All lives in the file bar)
-                                    if parser.result == nil {
-                                        Button("Clear All") { clearAll() }
-                                            .buttonStyle(SecondaryButtonStyle().hoverable())
-                                    }
-                                }
-                                .padding(.horizontal, 20)
-                                .padding(.bottom, 20)
-                            }
+                                .layoutPriority(1)
                         }
+
+                        // Audio analysis panel — shown after an .als is loaded, or always in Quick Check Mode
+                        // layoutPriority(1) — protected from compression, natural height only
+                        if parser.result != nil || userSettings.quickCheckMode {
+                            VStack(alignment: .trailing, spacing: 8) {
+                                AudioAnalysisView(
+                                    analyzer: audioAnalyzer,
+                                    stemPlayer: stemPlayer,
+                                    rehearsalMixOnly: rehearsalMixOnly,
+                                    expectedDuration: parser.result?.expectedDuration,
+                                    isMinimized: $stemCheckMinimized,
+                                    quickCheckMode: userSettings.quickCheckMode
+                                )
+                                .frame(maxWidth: .infinity)
+                                // Clear All only shown here in Quick Check Mode without a loaded file
+                                // (when a file is loaded, Clear All lives in the file bar)
+                                if parser.result == nil {
+                                    Button("Clear All") { clearAll() }
+                                        .buttonStyle(SecondaryButtonStyle().hoverable())
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .layoutPriority(1)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 20)
+                        }
+
+                        // Blank space always sinks to bottom
+                        Spacer(minLength: 0)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
 
-            // Metronome — top left (symmetric with settings top right)
-            VStack(spacing: 0) {
-                HStack {
-                    MetronomeView(metronome: metronome)
-                        .padding(.top, 34)
-                        .padding(.leading, 16)
-                    Spacer()
-                }
-                Spacer()
-            }
-
-            // Settings gear + Quick Check Mode toggle — top right
-            VStack(spacing: 0) {
-                HStack {
-                    Spacer()
-                    settingsButton
-                        .padding(.top, 34)
-                        .padding(.trailing, 16)
-                }
-                HStack(spacing: 6) {
-                    Spacer()
-                    mtCompleteToggle
-                    quickCheckToggle
-                        .padding(.trailing, 16)
-                }
-                .padding(.top, 4)
-                Spacer()
-            }
 
             // Live 11 conversion loading overlay
             if isConvertingToLive11 {
@@ -213,11 +194,21 @@ struct ContentView: View {
         }
         .frame(minWidth: 680, minHeight: 680)
         .onChange(of: parser.isLoading) { isLoading in
-            if !isLoading && parser.result?.liveMajorVersion == 12 {
-                showLive12Alert = true
+            if !isLoading, let version = parser.result?.liveMajorVersion {
+                if version == 12 { showLive12Alert = true }
+                else if version < 11 {
+                    oldVersionAlsPath = parser.alsPath
+                    ableton11URL = findAbleton11()
+                    clearAll()
+                    showOldVersionAlert = true
+                }
             }
             // Build metronome schedule whenever a parse completes (used by both QA + Edit tabs)
-            if !isLoading, let result = parser.result, result.liveMajorVersion != 12 {
+            // Skip for unsupported versions (Live 12 needs conversion; Live <11 needs re-save)
+            let parsedVersion = parser.result?.liveMajorVersion
+            let versionOK = parsedVersion == nil || parsedVersion == 11
+            if !isLoading, let result = parser.result, versionOK {
+                ableton11URL = findAbleton11()
                 Log("parse complete — tempoEvents=\(result.tempoEvents.count) timeSigs=\(result.timeSignatures.count) expectedDuration=\(result.expectedDuration.map { String(format: "%.2f", $0) } ?? "nil")", "ContentView")
                 metronome.buildSchedule(
                     tempoEvents: result.tempoEvents,
@@ -247,6 +238,14 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { clearAll() }
         } message: {
             Text("This .als is made for Ableton 12. Convert to Ableton 11?")
+        }
+        .alert("Old Ableton Version", isPresented: $showOldVersionAlert) {
+            if ableton11URL != nil {
+                Button("Open in Ableton 11") { openInAbleton11(path: oldVersionAlsPath) }
+            }
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("This session was saved in an older version of Ableton. Open it in Ableton 11 and save it before loading it in MT Song Tool.")
         }
     }
 
@@ -315,56 +314,6 @@ struct ContentView: View {
 
                 Divider()
 
-                // Nolan Ryan credentials
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Nolan Ryan (SMB)")
-                            .font(.lato(size: 11, weight: .semibold))
-                            .foregroundColor(.fgDim)
-                        Spacer()
-                        if CredentialStore.load(key: CredentialStore.nolanRyanPasswordKey) != nil {
-                            Text("✓ Saved")
-                                .font(.lato(size: 10))
-                                .foregroundColor(.green)
-                        }
-                    }
-                    SecureField("SMB Password", text: $settingsNRPassword)
-                        .font(.lato(size: 12))
-                        .textFieldStyle(.plain)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color.bgCard)
-                        .cornerRadius(5)
-                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.border, lineWidth: 1))
-                    HStack(spacing: 6) {
-                        TextField("Volume name", text: $settingsNRVolume)
-                            .font(.lato(size: 12))
-                            .textFieldStyle(.plain)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(Color.bgCard)
-                            .cornerRadius(5)
-                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.border, lineWidth: 1))
-                    }
-                    Text("Volume name in /Volumes/ (e.g. nolanryan)")
-                        .font(.lato(size: 9))
-                        .foregroundColor(.fgDim)
-                    Button("Save NR Credentials") {
-                        let p = settingsNRPassword
-                        guard !p.isEmpty else { return }
-                        CredentialStore.save(key: CredentialStore.nolanRyanPasswordKey, value: p)
-                        settingsNRPassword = ""
-                        let vol = settingsNRVolume.trimmingCharacters(in: .whitespaces)
-                        if !vol.isEmpty { userSettings.nolanRyanVolumeName = vol }
-                    }
-                    .font(.lato(size: 11))
-                    .buttonStyle(CompactSecondaryButtonStyle().hoverable())
-                    .disabled(settingsNRPassword.isEmpty)
-                    .frame(maxWidth: .infinity)
-                }
-
-                Divider()
-
                 // Edit tab settings
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Edit")
@@ -400,9 +349,6 @@ struct ContentView: View {
             .padding(14)
             .frame(width: 260)
         }
-        .onAppear {
-            settingsNRVolume = userSettings.nolanRyanVolumeName
-        }
     }
 
     // MARK: MT Complete Mode toggle
@@ -411,14 +357,16 @@ struct ContentView: View {
         Button {
             userSettings.mtCompleteMode.toggle()
         } label: {
+            let color: Color = userSettings.mtCompleteMode ? .accent : (mtCompleteHovered ? .fgBright : .fgDim)
             HStack(spacing: 5) {
                 Image(systemName: userSettings.mtCompleteMode ? "checkmark.square.fill" : "square")
                     .font(.system(size: 10))
-                    .foregroundColor(userSettings.mtCompleteMode ? .accent : .fgDim)
+                    .foregroundColor(color)
                 Text("MT Complete")
                     .font(.lato(size: 10, weight: userSettings.mtCompleteMode ? .semibold : .regular))
-                    .foregroundColor(userSettings.mtCompleteMode ? .accent : .fgDim)
+                    .foregroundColor(color)
             }
+            .contentShape(Rectangle())
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(
@@ -433,10 +381,11 @@ struct ContentView: View {
                     )
             )
             .animation(.easeOut(duration: 0.12), value: userSettings.mtCompleteMode)
+            .animation(.easeOut(duration: 0.12), value: mtCompleteHovered)
         }
         .buttonStyle(.plain)
         .onHover { h in
-            withAnimation(.easeOut(duration: 0.12)) { mtCompleteHovered = h }
+            mtCompleteHovered = h
             if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
         }
     }
@@ -447,14 +396,16 @@ struct ContentView: View {
         Button {
             userSettings.quickCheckMode.toggle()
         } label: {
+            let color: Color = userSettings.quickCheckMode ? .accent : (quickCheckHovered ? .fgBright : .fgDim)
             HStack(spacing: 5) {
                 Image(systemName: userSettings.quickCheckMode ? "checkmark.square.fill" : "square")
                     .font(.system(size: 10))
-                    .foregroundColor(userSettings.quickCheckMode ? .accent : .fgDim)
+                    .foregroundColor(color)
                 Text("Quick Check")
                     .font(.lato(size: 10, weight: userSettings.quickCheckMode ? .semibold : .regular))
-                    .foregroundColor(userSettings.quickCheckMode ? .accent : .fgDim)
+                    .foregroundColor(color)
             }
+            .contentShape(Rectangle())
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(
@@ -469,10 +420,11 @@ struct ContentView: View {
                     )
             )
             .animation(.easeOut(duration: 0.12), value: userSettings.quickCheckMode)
+            .animation(.easeOut(duration: 0.12), value: quickCheckHovered)
         }
         .buttonStyle(.plain)
         .onHover { h in
-            withAnimation(.easeOut(duration: 0.12)) { quickCheckHovered = h }
+            quickCheckHovered = h
             if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
         }
     }
@@ -503,17 +455,31 @@ struct ContentView: View {
     }
 
     // MARK: Header
-    private var headerView: some View {
-        VStack(spacing: 4) {
+    private var topBar: some View {
+        ZStack {
             Text("MTST")
-                .font(.horizon(size: 48))
+                .font(.horizon(size: 35))
                 .foregroundColor(.accent)
-
-            Text("MultiTracks Song Tool")
-                .font(.lato(size: 11, weight: .regular))
-                .foregroundColor(.fgDim)
-                .kerning(0.3)
+                .frame(maxWidth: .infinity)
+                .allowsHitTesting(false)
+            HStack(spacing: 0) {
+                MetronomeView(metronome: metronome)
+                    .padding(.leading, 16)
+                if ableton11URL != nil && parser.result != nil {
+                    Button("Open in Ableton Live 11") { openInAbleton11() }
+                        .buttonStyle(CompactSecondaryButtonStyle().hoverable())
+                        .padding(.leading, 8)
+                }
+                Spacer()
+                HStack(spacing: 10) {
+                    mtCompleteToggle
+                    quickCheckToggle
+                    settingsButton
+                }
+                .padding(.trailing, 16)
+            }
         }
+        .frame(height: 46)
     }
 
     // MARK: Main area — drop zone if no result, panels if we have one
@@ -608,6 +574,11 @@ struct ContentView: View {
         return result.markers.contains { !LocatorValidator.isValid($0.text, mtCompleteMode: userSettings.mtCompleteMode) }
     }
 
+    private var hasOffBeatLocators: Bool {
+        guard let result = parser.result else { return false }
+        return result.markers.contains { $0.offBeat }
+    }
+
     // Block until a stem scan has been completed (results must be present).
     // In Quick Check Mode stems are optional, so this is never a blocker.
     private var stemCheckRequired: Bool {
@@ -634,13 +605,20 @@ struct ContentView: View {
         parser.result?.liveMajorVersion == 12
     }
 
+    private var isOldSession: Bool {
+        if let v = parser.result?.liveMajorVersion { return v < 11 }
+        return false
+    }
+
     private var copyBlocked: Bool {
-        isLive12Session || hasInvalidLocators || hasSessionWarnings || stemCheckRequired || hasAudioIssues || hasDataMissing || hasMissingRequiredStems
+        isLive12Session || isOldSession || hasInvalidLocators || hasOffBeatLocators || hasSessionWarnings || stemCheckRequired || hasAudioIssues || hasDataMissing || hasMissingRequiredStems
     }
 
     private var copyBlockedReason: String {
         if isLive12Session { return "Convert to Live 11 first" }
+        if isOldSession { return "Re-save in Ableton 11 first" }
         if hasInvalidLocators { return "Fix invalid locators first" }
+        if hasOffBeatLocators { return "Fix off-beat locators first" }
         if hasSessionWarnings { return "Resolve session warnings first" }
         if hasMissingRequiredStems { return "Required stems missing" }
         if hasAudioIssues { return "Fix stem issues first" }
@@ -661,7 +639,7 @@ struct ContentView: View {
     // MARK: Results (two-panel split)
     private func resultsView(result: ParsedResult) -> some View {
         VStack(spacing: 12) {
-                // Two independent scrollable panels
+                // Two independent scrollable panels — always rendered so headers stay visible
                 HStack(alignment: .top, spacing: 20) {
                     // Locators panel
                     PanelView(
@@ -717,10 +695,9 @@ struct ContentView: View {
                             Text("#")
                                 .frame(width: 22, alignment: .trailing)
                             Text("TIME START")
-                                .frame(width: 84, alignment: .leading)
-                            Text("TIME SIG")
+                                .frame(width: 108, alignment: .leading)
+                            Text("TIME SIGNATURE")
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(width: 20, height: 1)
                         }
                         .font(.lato(size: 10, weight: .semibold))
                         .foregroundColor(.fgDim)
@@ -729,12 +706,48 @@ struct ContentView: View {
 
                         Divider().background(Color.border)
 
+                        let firstTempoChangeBeat = result.tempoEvents.first(where: { $0.beat > 0 })?.beat
+                        let firstTempoChangeTSIndex: Int? = firstTempoChangeBeat.flatMap { changeBeat in
+                            result.timeSignatures.firstIndex(where: { ($0.beat ?? -1) >= changeBeat })
+                        }
+
                         ForEach(Array(result.timeSignatures.enumerated()), id: \.element.id) { index, ts in
+                            if index == firstTempoChangeTSIndex {
+                                tsSigTempoChangeDivider
+                            }
                             RowView(number: index + 1, left: ts.time, right: ts.sig, copyDisabled: copyBlocked, onBlocked: copyBlockedToast)
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, minHeight: 250, maxHeight: 420)
+                .frame(maxWidth: .infinity, maxHeight: locatorsSigMinimized ? 38 : 2000)
+                .clipped()
+                .layoutPriority(1)
+
+                // Collapse toggle for Locators + Time Signatures
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) { locatorsSigMinimized.toggle() }
+                    } label: {
+                        Image(systemName: locatorsSigMinimized ? "chevron.down" : "chevron.up")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.fgDim)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule()
+                                    .fill(Color.fgDim.opacity(0.08))
+                                    .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { h in
+                        if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                    }
+                    Spacer()
+                }
+                .frame(height: 18)
+                .contentShape(Rectangle())
 
                 // MARK: Session warnings
                 if !result.warnings.isEmpty {
@@ -742,6 +755,24 @@ struct ContentView: View {
                 }
         }
         .onAppear { populateSongData(from: result) }
+    }
+
+    // MARK: Time signatures tempo-change divider
+    private var tsSigTempoChangeDivider: some View {
+        HStack(spacing: 6) {
+            Rectangle()
+                .fill(Color.accent.opacity(0.5))
+                .frame(height: 1)
+            Text("1st Tempo Change")
+                .font(.lato(size: 10, weight: .semibold))
+                .foregroundColor(.accent)
+                .fixedSize()
+            Rectangle()
+                .fill(Color.accent.opacity(0.5))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
     }
 
     // MARK: Session warnings panel
@@ -899,6 +930,31 @@ struct ContentView: View {
     }
 
     // MARK: Convert to Live 11 — write <name>_Live11.als alongside the original
+    private func findAbleton11() -> URL? {
+        let fm = FileManager.default
+        let searchDirs = [
+            URL(fileURLWithPath: "/Applications"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+        ]
+        for dir in searchDirs {
+            guard let contents = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { continue }
+            if let match = contents.first(where: { url in
+                let name = url.lastPathComponent
+                return name.hasPrefix("Ableton Live 11") && name.hasSuffix(".app")
+            }) { return match }
+        }
+        return nil
+    }
+
+    private func openInAbleton11(path: String? = nil) {
+        guard let appURL = ableton11URL,
+              let alsPath = path ?? parser.alsPath else { return }
+        let alsURL = URL(fileURLWithPath: alsPath)
+        NSWorkspace.shared.open([alsURL], withApplicationAt: appURL, configuration: .init()) { _, error in
+            if let error { DispatchQueue.main.async { self.showToastMessage(error.localizedDescription, isError: true) } }
+        }
+    }
+
     private func convertToLive11() {
         withAnimation(.easeOut(duration: 0.15)) { isConvertingToLive11 = true }
         parser.downgradeToLive11 { success, newPath, error in
@@ -920,6 +976,7 @@ struct ContentView: View {
         audioAnalyzer.reset()
         stemCheckMinimized = false
         songDataMinimized = false
+        locatorsSigMinimized = false
         userSettings.quickCheckMode = false
         userSettings.mtCompleteMode = false
         activeTab = .qa
@@ -948,29 +1005,6 @@ struct ContentView: View {
 
             Divider()
                 .background(Color.border)
-
-            // Collapse toggle — always shown (mirrors Stem Check's collapseToggleView)
-            HStack {
-                Spacer()
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { songDataMinimized.toggle() }
-                } label: {
-                    Image(systemName: songDataMinimized ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.fgDim)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule()
-                                .fill(Color.fgDim.opacity(0.08))
-                                .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
-                        )
-                }
-                .buttonStyle(.plain)
-                Spacer()
-            }
-            .frame(height: 18)
-            .contentShape(Rectangle())
 
             if !songDataMinimized {
 
@@ -1039,6 +1073,32 @@ struct ContentView: View {
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
+
+            // Collapse toggle — always shown at bottom
+            HStack {
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { songDataMinimized.toggle() }
+                } label: {
+                    Image(systemName: songDataMinimized ? "chevron.down" : "chevron.up")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.fgDim)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(Color.fgDim.opacity(0.08))
+                                .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                        )
+                }
+                .buttonStyle(.plain)
+                .onHover { h in
+                    if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                }
+                Spacer()
+            }
+            .frame(height: 18)
+            .contentShape(Rectangle())
         }
         .cardStyle()
     }

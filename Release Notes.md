@@ -1,4 +1,4 @@
-# MT Song Tool — v1.1.0
+# MT Song Tool — v1.2.1
 
 ## Features
 
@@ -20,6 +20,33 @@
 - .pkg installer wrapped in a versioned .zip for easy distribution
 
 ## Changelog
+
+### v1.2.1 — April 7, 2026
+
+#### Session Loading
+
+- **Old Ableton version detection** — Loading an `.als` saved in Ableton 10 or earlier now shows an alert explaining the file must be opened and re-saved in Ableton 11 before use in MT Song Tool. If Ableton 11 is installed, an "Open in Ableton 11" button appears in the alert to launch the file directly.
+
+### v1.2.0 — April 7, 2026
+
+#### Edit tab
+
+- **Waveform rendering overhaul** — Migrated all waveform, grid, and ruler rendering from SwiftUI Canvas to CAShapeLayers. Fixes coordinate scaling artifacts at high zoom on long sessions (Canvas GPU texture size limit ~16K px caused pixel positions to drift by 9+ seconds cumulatively on songs with multiple tempo changes). All rendering is now vector-based with no size limit.
+- **Drag-to-nudge** — Drag any clip to shift it in time. The top 18 px of each track row is the move zone; the waveform body is used for region selection. Shift-click to select multiple stems and drag one to move them all together.
+- **Region select / delete / move** — Option+drag on any waveform track draws a time-range selection (blue overlay). Delete key silences the selected region on all selected tracks, leaving a visible gap. Drag the selection in the time ruler to move that audio to a new position; a gap is left at the source. CMD+drag adds a selection on a second track without clearing the first.
+- **Global selection bar** — A 16 px strip pinned at the bottom of the Edit tab (outside the scroll area) always shows the current selection. Drag it to set the same time range across all stems simultaneously.
+- **Snap to grid** — Snap toggle in the Edit toolbar aligns clip drag and ruler selection to the nearest beat when on.
+
+#### Metronome
+
+- **Mute toggle fix** — Left-clicking the metronome icon was silently swallowed by the NSView overlay. Replaced with a plain Image + ClickOverlay so both left-click (mute/unmute) and right-click (settings popover) register correctly.
+- **Tempo step-change drift fix** — On sessions with multiple tempo changes, Swift's unstable sort could order equal-beat events incorrectly, causing beat times to drift by up to 9.1 seconds cumulatively on long sessions. Fixed with a stable sort by (beat, original_index) and deduplication that keeps the last event per beat position.
+- **Time signature change timing fix** — Time sig changes were detected one beat late due to sub-millisecond rounding differences between the parser's MM:SS:mmm output and the metronome's beat-to-time conversion. Parser now returns beat positions directly; matching is now integer-exact.
+
+#### Stem Check
+
+- **Smart stem name suggestions** — Stems flagged as "Check Stem Name" now show an inline suggestion chip for the best-matching approved name (≥80% confidence). Click the chip to rename with one click. The rename picker also shows a ranked suggestions section with confidence percentages. String similarity matches common abbreviations and separators (e.g. "eg-1" → EG 1, "lead voc" → LEAD VOX). Spectral analysis (FFT-based) categorizes unrecognized stems by frequency content to guide suggestions when the filename is a DAW default (e.g. "Track 01"). (LIVE) variants are only suggested when the filename contains "LIVE" or audio bleed detection exceeds threshold.
+- **Fix suggestions for Extra Space / Special Chars** — Stems flagged with "Extra Space" or "Special Chars" now also show a suggestion chip with the cleaned name. Previously these issues showed no suggestion.
 
 ### v1.1.0 — April 1, 2026
 

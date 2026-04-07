@@ -264,39 +264,41 @@ struct RowView: View {
                 .foregroundColor(isInvalid ? Color.red : .fgDim)
                 .frame(width: 22, alignment: .trailing)
 
-            Text(left)
-                .font(.lato(size: 12))
-                .foregroundColor(isInvalid ? Color.red : .accent)
-                .frame(width: 84, alignment: .leading)
+            // TIME + copy button inline, matching LocatorRowView pattern
+            HStack(spacing: 4) {
+                Text(left)
+                    .font(.lato(size: 12))
+                    .foregroundColor(isInvalid ? Color.red : .accent)
+                    .lineLimit(1)
+                Button {
+                    if copyDisabled { onBlocked?(); return }
+                    if copied { withAnimation(.easeOut(duration: 0.1)) { copied = false }; return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(left, forType: .string)
+                    withAnimation(.easeOut(duration: 0.1)) { copied = true }
+                } label: {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(copied ? Color.greenLight : (buttonHover ? .accent : .fgDim))
+                        .frame(width: 20, height: 20)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(buttonHover ? Color.accent.opacity(0.15) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onHover { h in
+                    withAnimation(.easeOut(duration: 0.12)) { buttonHover = h }
+                }
+            }
+            .frame(width: 108, alignment: .leading)
 
             Text(right)
                 .font(.lato(size: 12))
                 .foregroundColor(isInvalid ? Color.red : .fgBright)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Per-row copy button — always visible, glows on hover
-            Button {
-                if copyDisabled { onBlocked?(); return }
-                if copied { withAnimation(.easeOut(duration: 0.1)) { copied = false }; return }
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(left, forType: .string)
-                withAnimation(.easeOut(duration: 0.1)) { copied = true }
-            } label: {
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    .font(.lato(size: 10, weight: .medium))
-                    .foregroundColor(copied ? Color.greenLight : (buttonHover ? .accent : .fgDim))
-                    .frame(width: 20, height: 20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(buttonHover ? Color.accent.opacity(0.15) : Color.clear)
-                    )
-            }
-            .buttonStyle(.plain)
-            .contentShape(Rectangle())
-            .onHover { h in
-                withAnimation(.easeOut(duration: 0.12)) { buttonHover = h }
-            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
