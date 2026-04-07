@@ -130,12 +130,26 @@ struct WindowDragArea: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     private class DragView: NSView {
+        private var pendingDragEvent: NSEvent?
+
         override func mouseDown(with event: NSEvent) {
             if event.clickCount == 2 {
+                pendingDragEvent = nil
                 fitToScreen()
             } else {
-                window?.performDrag(with: event)
+                pendingDragEvent = event
             }
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            if let down = pendingDragEvent {
+                pendingDragEvent = nil
+                window?.performDrag(with: down)
+            }
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            pendingDragEvent = nil
         }
 
         private func fitToScreen() {
