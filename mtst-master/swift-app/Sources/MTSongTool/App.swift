@@ -131,14 +131,35 @@ struct WindowDragArea: NSViewRepresentable {
 
     private class DragView: NSView {
         private var pendingDragEvent: NSEvent?
+        private var eventMonitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil, eventMonitor == nil else { return }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                guard let self = self,
+                      let w = self.window,
+                      event.window === w,
+                      event.clickCount == 2 else { return event }
+                let loc = self.convert(event.locationInWindow, from: nil)
+                if self.bounds.contains(loc) {
+                    self.fitToScreen()
+                    return nil  // consume the event
+                }
+                return event
+            }
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            if newWindow == nil, let m = eventMonitor {
+                NSEvent.removeMonitor(m)
+                eventMonitor = nil
+            }
+        }
 
         override func mouseDown(with event: NSEvent) {
-            if event.clickCount == 2 {
-                pendingDragEvent = nil
-                fitToScreen()
-            } else {
-                pendingDragEvent = event
-            }
+            pendingDragEvent = event
         }
 
         override func mouseDragged(with event: NSEvent) {
