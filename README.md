@@ -5,7 +5,7 @@
 
 **MT Song Tool**
 
-- Internal macOS QA tool for MultiTracks.com Ableton Engineering. 
+- Internal macOS QA tool for MultiTracks.com Ableton Engineering.
 - Validates Ableton Live sessions and WAV stem packages before publishing.
 
 **Features**
@@ -13,9 +13,12 @@
 - **Locator validation** — Parses `.als` files and checks every section marker against the approved MultiTracks sections list. Invalid labels shown in red; auto-fix and inline rename write corrections back to disk.
 - **Time Signatures panel** — Extracts time signature changes from the Ableton automation envelope, including mid-song changes.
 - **Song Data panel** — Auto-populates Song Key, Time Signature, BPM, and Preview Start/End from the session. All fields are copyable.
-- **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback.
+- **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback with section highlight mode and loop-within-section support.
 - **Session validation** — Checks loop bracket vs. audio clip alignment, incomplete bars, and tempo ramp usage.
-
+- **Edit tab** — Multi-stem audio timeline with AVAudioEngine playback, per-stem gain control, VU metering, a click track metronome (with compound time signature support), region selection, and segment-level editing backed by FFmpeg.
+- **AudioShake tab** — AI-powered stem separation via the AudioShake API. Drop any mixed audio file, pick from 15 stem models (vocals, lead/backing vocals, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download the separated stems directly into the app.
+- **Quick Check Mode** — Removes the requirement to have both an `.als` and a stem folder loaded before proceeding. Stem issues still block copy/submit.
+- **MT Complete Mode** — Suppresses the NEXT SONG missing-marker warning and enables short-code locator labels for single-song (non-medley) sessions.
 
 **Requirements**
 
@@ -26,7 +29,7 @@
 **Build**
 
 ```bash
-bash ~/Documents/"Claude Apps"/"MT Song Tool"/mtst-master/swift-app/make_swift_app.sh
+bash "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/swift-app/make_swift_app.sh"
 ```
 
 This compiles the Python parser via PyInstaller, builds the Swift app in release mode, assembles the `.app` bundle, and produces a versioned `.pkg` + `.zip` in `Versions/`.
@@ -39,7 +42,9 @@ No sudo required for a standard admin install. If the existing bundle is root-ow
 |---|---|
 | UI | Swift / SwiftUI (macOS 13+) |
 | Parser | Python 3 + PyInstaller (bundled binary) |
+| Audio playback & editing | AVAudioEngine |
 | Audio conversion | FFmpeg (bundled binary + dylibs) |
+| Stem separation | AudioShake API |
 | Parser IPC | Persistent subprocess — stdin/stdout JSON |
 | Credentials | macOS Keychain |
 
@@ -47,5 +52,5 @@ The Python parser (`parse_als.py`) runs as a persistent server process. Swift se
 
 **Version**
 
-- Current release: **v1.0.6**
+- Current release: **v1.2.6**
 - See Release Notes.md for full changelog.
