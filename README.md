@@ -10,13 +10,13 @@
 
 **Features**
 
-- **Locator validation** — Parses `.als` files and checks every section marker against the approved MultiTracks sections list. Invalid labels shown in red; auto-fix and inline rename write corrections back to disk.
-- **Time Signatures panel** — Extracts time signature changes from the Ableton automation envelope, including mid-song changes.
-- **Song Data panel** — Auto-populates Song Key, Time Signature, BPM, and Preview Start/End from the session. All fields are copyable.
-- **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback with section highlight mode and loop-within-section support.
-- **Session validation** — Checks loop bracket vs. audio clip alignment, incomplete bars, and tempo ramp usage.
-- **Edit tab** — Multi-stem audio timeline with AVAudioEngine playback, per-stem gain control, VU metering, a click track metronome (with compound time signature support), region selection, and segment-level editing backed by FFmpeg.
 - **AudioShake tab** — AI-powered stem separation via the AudioShake API. Drop any mixed audio file, pick from 15 stem models (vocals, lead/backing vocals, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download the separated stems directly into the app.
+- **Edit tab** — Multi-stem audio timeline with AVAudioEngine playback, per-stem gain control, VU metering, a click track metronome (with compound time signature support), region selection, and segment-level editing backed by FFmpeg.
+- **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback with section highlight mode and loop-within-section support.
+- **Locator validation** — Parses `.als` files and checks every section marker against the approved MultiTracks sections list. Invalid labels shown in red; auto-fix and inline rename write corrections back to disk.
+- **Session validation** — Checks loop bracket vs. audio clip alignment, incomplete bars, and tempo ramp usage.
+- **Song Data panel** — Auto-populates Song Key, Time Signature, BPM, and Preview Start/End from the session. All fields are copyable.
+- **Time Signatures panel** — Extracts time signature changes from the Ableton automation envelope, including mid-song changes.
 - **Quick Check Mode** — Removes the requirement to have both an `.als` and a stem folder loaded before proceeding. Stem issues still block copy/submit.
 - **MT Complete Mode** — Suppresses the NEXT SONG missing-marker warning and enables short-code locator labels for single-song (non-medley) sessions.
 
