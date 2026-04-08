@@ -16,10 +16,6 @@
 - **Stem Check panel** — Batch-validates a folder of WAV stems for silence, stem name conformance (~200 approved names), audio format (44.1 kHz / 16-bit), and duration alignment with the loop bracket. Includes in-app audio conversion via bundled FFmpeg and per-stem waveform playback.
 - **Session validation** — Checks loop bracket vs. audio clip alignment, incomplete bars, and tempo ramp usage.
 
-<p align="center">
-<img width="400" alt="MTST - Upload Tab" src="https://github.com/user-attachments/assets/d62721ad-6a0d-441e-ad25-041220858694" />
-<img width="400" alt="MTST - Queue Tab" src="https://github.com/user-attachments/assets/34f9ca61-68a3-4d04-8444-7666d96bd470" />
-</p>
 
 **Requirements**
 
