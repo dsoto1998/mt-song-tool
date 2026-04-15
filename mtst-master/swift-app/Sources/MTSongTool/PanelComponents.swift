@@ -270,6 +270,7 @@ struct RowView: View {
                     .font(.lato(size: 12))
                     .foregroundColor(isInvalid ? Color.red : .accent)
                     .lineLimit(1)
+                Spacer(minLength: 0)
                 Button {
                     if copyDisabled { onBlocked?(); return }
                     if copied { withAnimation(.easeOut(duration: 0.1)) { copied = false }; return }

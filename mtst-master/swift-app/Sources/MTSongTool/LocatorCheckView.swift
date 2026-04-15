@@ -289,6 +289,7 @@ struct LocatorRowView: View {
                     .font(.lato(size: 12))
                     .foregroundColor(isInvalid ? Color.red : .accent)
                     .lineLimit(1)
+                Spacer(minLength: 0)
                 Button {
                     if copyDisabled { onBlocked?(); return }
                     if copied { withAnimation(.easeOut(duration: 0.1)) { copied = false }; return }
@@ -428,6 +429,11 @@ struct LocatorRowView: View {
             // TIME END + copy button — always renders at fixed width to keep rows aligned
             HStack(spacing: 4) {
                 if !marker.timeEnd.isEmpty {
+                    Text(marker.timeEnd)
+                        .font(.lato(size: 12))
+                        .foregroundColor(isInvalid ? Color.red.opacity(0.7) : .fgDim)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
                     Button {
                         if copyDisabled { onBlocked?(); return }
                         if copiedEnd { withAnimation(.easeOut(duration: 0.1)) { copiedEnd = false }; return }
@@ -447,13 +453,9 @@ struct LocatorRowView: View {
                     .buttonStyle(.plain)
                     .contentShape(Rectangle())
                     .onHover { h in withAnimation(.easeOut(duration: 0.12)) { copyEndHover = h } }
-                    Text(marker.timeEnd)
-                        .font(.lato(size: 12))
-                        .foregroundColor(isInvalid ? Color.red.opacity(0.7) : .fgDim)
-                        .lineLimit(1)
                 }
             }
-            .frame(width: 108, alignment: .trailing)
+            .frame(width: 108)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)

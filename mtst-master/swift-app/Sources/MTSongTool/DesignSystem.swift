@@ -62,16 +62,7 @@ extension Font {
         .custom("Horizon-Bold", size: size)
     }
     static func lato(size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        switch weight {
-        case .bold, .semibold:
-            return .custom("Lato-Bold", size: size)
-        case .black, .heavy:
-            return .custom("Lato-Black", size: size)
-        case .light, .thin, .ultraLight:
-            return .custom("Lato-Light", size: size)
-        default:
-            return .custom("Lato-Regular", size: size)
-        }
+        .system(size: size, weight: weight, design: .default)
     }
 }
 

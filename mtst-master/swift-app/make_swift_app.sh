@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.2.3"
+VERSION="1.3.3"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
 DAWTOOL_ROOT="$(cd .. && pwd)"
@@ -24,7 +24,7 @@ fi
 # ── Step 2: Build the Swift app ──────────────────────────────────────────────
 echo ""
 echo "==> Step 2/4: Building Swift app (release)…"
-swift build -c release 2>&1
+MACOSX_DEPLOYMENT_TARGET=13.0 swift build -c release 2>&1
 
 SWIFT_BIN=".build/release/MTSongTool"
 if [ ! -f "$SWIFT_BIN" ]; then
@@ -191,7 +191,10 @@ rm -rf "$PKG_STAGING" "$PKG_SCRIPTS"
 RELEASE_FOLDER="$APP_NAME v$VERSION"
 ZIP_STAGING="/tmp/mtst_zip_staging"
 ZIP_OUT="$VERSIONS_DIR/$RELEASE_FOLDER.zip"
+RELEASE_NOTES_SRC="$DAWTOOL_ROOT/swift-app/Sources/MTSongTool/Resources/Release Notes.md"
 RELEASE_NOTES="$DAWTOOL_ROOT/../Release Notes.md"
+# Keep root-level Release Notes in sync with the bundled source of truth
+[ -f "$RELEASE_NOTES_SRC" ] && cp "$RELEASE_NOTES_SRC" "$RELEASE_NOTES"
 rm -rf "$ZIP_STAGING"
 mkdir -p "$ZIP_STAGING/$RELEASE_FOLDER"
 mv "$PKG_OUT" "$ZIP_STAGING/$RELEASE_FOLDER/"

@@ -19,7 +19,7 @@ struct StemState {
     var isMuted: Bool = false
     var isSoloed: Bool = false
     var gain: Float = 1.0          // live monitoring gain (non-destructive)
-    var peaks: [Float] = []        // 2000-point waveform data
+    var peaks: [Float] = []        // waveform peaks — 1 per 512 samples (~86/sec at 44.1kHz)
     var duration: Double = 0.0     // audio file duration in seconds
     var offset: Double = 0.0       // legacy nudge offset (used when segments is empty)
     var trimIn: Double = 0.0       // legacy trim in-point
@@ -133,7 +133,7 @@ class EditPlayerService: ObservableObject {
             var state = StemState()
             // Extract peaks asynchronously
             Task.detached(priority: .userInitiated) { [weak self] in
-                let peaks = await Self.extractPeaks(from: url, count: 2000)
+                let peaks = await Self.extractPeaks(from: url)
                 let dur = await Self.fileDuration(url)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
@@ -403,6 +403,9 @@ class EditPlayerService: ObservableObject {
             state.segments[i].sessionStart = max(0, state.segments[i].sessionStart + delta)
         }
         stemStates[url] = state
+        // Grow totalDuration if this stem now ends past it — canvas extends automatically.
+        let maxEnd = state.segments.map { $0.sessionEnd }.max() ?? 0
+        if maxEnd > totalDuration { totalDuration = maxEnd }
     }
 
     var hasAnyEdits: Bool {
@@ -451,11 +454,11 @@ class EditPlayerService: ObservableObject {
 
     // MARK: - Peak Extraction
 
-    private static func extractPeaks(from url: URL, count: Int) async -> [Float] {
+    private static func extractPeaks(from url: URL) async -> [Float] {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 guard let file = try? AVAudioFile(forReading: url) else {
-                    continuation.resume(returning: Array(repeating: 0, count: count))
+                    continuation.resume(returning: [])
                     return
                 }
                 let frameCount = AVAudioFrameCount(file.length)
@@ -463,12 +466,16 @@ class EditPlayerService: ObservableObject {
                       let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frameCount),
                       (try? file.read(into: buffer)) != nil,
                       let channelData = buffer.floatChannelData else {
-                    continuation.resume(returning: Array(repeating: 0, count: count))
+                    continuation.resume(returning: [])
                     return
                 }
                 let frames = Int(buffer.frameLength)
                 let channels = Int(buffer.format.channelCount)
-                let step = max(1, frames / count)
+                // 512 samples/peak ≈ 11.6ms each at 44.1kHz — ~86 peaks/sec.
+                // Capped at 200K (covers ~38 min files). This is ~8× more detail than
+                // the old fixed-2000 approach for a typical 3-min stem.
+                let step = 512
+                let count = min(200_000, max(1, Int(ceil(Double(frames) / Double(step)))))
                 var peaks = [Float](repeating: 0, count: count)
                 for i in 0..<count {
                     let start = i * step

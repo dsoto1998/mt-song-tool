@@ -10,6 +10,8 @@ struct EditView: View {
     let stemURLs: [URL]
     @ObservedObject var analyzer: AudioAnalyzerService
     let parsedResult: ParsedResult?
+    var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
+    var mtCompleteMode: Bool = false
 
     @ObservedObject private var userSettings = UserSettings.shared
 
@@ -23,12 +25,15 @@ struct EditView: View {
     @State private var defaultRowHeight: CGFloat = 64
     @State private var hasFitZoom: Bool = false
     @State private var viewportWidth: CGFloat = 0
+    @State private var canvasRightPadding: Double = 0   // extra seconds grown when user scrolls near right edge
 
     // Commit state
     @State private var isCommitting: Bool = false
 
     @State private var commitError: String? = nil
     @State private var showCommitError: Bool = false
+    @State private var showLargeOffsetWarning: Bool = false
+    @State private var largeOffsetSeconds: Double = 0
 
     // MARK: - Computed helpers
 
@@ -47,6 +52,45 @@ struct EditView: View {
 
     private var playheadFraction: Double {
         editPlayer.totalDuration > 0 ? editPlayer.currentTime / editPlayer.totalDuration : 0
+    }
+
+    /// Duration of one bar at end of session — used to compute canvas padding.
+    private var lastBarSeconds: Double {
+        let db = metronome.beatSchedule.filter { $0.isDownbeat }
+        guard db.count >= 2 else { return 2.0 }
+        return max(0.25, db[db.count - 1].timeSeconds - db[db.count - 2].timeSeconds)
+    }
+
+    /// Build the beat schedule and extend it to cover the full canvas (audio + 10 empty bars).
+    /// Called whenever the session or stems change so the grid fills the entire scrollable area.
+    private func rebuildBeatSchedule() {
+        guard let result = parsedResult else { return }
+        let audioDur = result.expectedDuration ?? editPlayer.totalDuration
+        guard audioDur > 0 else { return }
+        // First pass: build up to audio end so lastBarSeconds is accurate.
+        metronome.buildSchedule(
+            tempoEvents: result.tempoEvents,
+            timeSigs: result.timeSignatures,
+            totalDuration: audioDur,
+            staticBPM: result.bpm
+        )
+        // Second pass: extend to cover the full canvas (10-bar tail + any scroll padding).
+        let extendedDur = canvasDuration
+        guard extendedDur > audioDur else { return }
+        metronome.buildSchedule(
+            tempoEvents: result.tempoEvents,
+            timeSigs: result.timeSignatures,
+            totalDuration: extendedDur,
+            staticBPM: result.bpm
+        )
+    }
+
+    /// Canvas width = totalDuration + 10 bars of empty space + any dynamic right padding grown from scrolling.
+    /// The 10-bar tail keeps end-of-session markers visible; canvasRightPadding grows as the user
+    /// scrolls or drags stems further right, giving effectively infinite rightward space.
+    private var canvasDuration: Double {
+        guard editPlayer.totalDuration > 0 else { return 0 }
+        return editPlayer.totalDuration + lastBarSeconds * 10 + canvasRightPadding
     }
 
     var body: some View {
@@ -92,14 +136,7 @@ struct EditView: View {
                 editPlayer.loadStems(stemURLs)
             }
             // Build metronome beat schedule from parsed session
-            if let result = parsedResult {
-                metronome.buildSchedule(
-                    tempoEvents: result.tempoEvents,
-                    timeSigs: result.timeSignatures,
-                    totalDuration: result.expectedDuration ?? editPlayer.totalDuration,
-                    staticBPM: result.bpm
-                )
-            }
+            rebuildBeatSchedule()
         }
         .onChange(of: editPlayer.playAnchor) { anchor in
             guard let anchor else { return }
@@ -112,11 +149,17 @@ struct EditView: View {
         // re-scans stems without leaving the tab), onAppear doesn't fire again, so loadStems
         // would never be called. This onChange handles that case.
         .onChange(of: editPlayer.totalDuration) { dur in
-            guard dur > 0, !hasFitZoom, viewportWidth > 0 else { return }
+            guard dur > 0 else { return }
+            // Rebuild so grid covers any new space created by dragging a stem right.
+            rebuildBeatSchedule()
+            guard !hasFitZoom, viewportWidth > 0 else { return }
             hasFitZoom = true
             let fitZoom = max(0.01, min(1.0, viewportWidth / (CGFloat(dur) * 80.0)))
             zoomScale = fitZoom
             zoomScaleAtGestureStart = fitZoom
+        }
+        .onChange(of: canvasRightPadding) { _ in
+            rebuildBeatSchedule()
         }
         .onChange(of: viewportWidth) { w in
             // GeometryReader fires after timelineView appears — if totalDuration is already
@@ -133,15 +176,9 @@ struct EditView: View {
             hasFitZoom = false
             zoomScale = 0.25
             zoomScaleAtGestureStart = 0.25
+            canvasRightPadding = 0
             editPlayer.loadStems(newURLs)
-            if let result = parsedResult {
-                metronome.buildSchedule(
-                    tempoEvents: result.tempoEvents,
-                    timeSigs: result.timeSignatures,
-                    totalDuration: result.expectedDuration ?? editPlayer.totalDuration,
-                    staticBPM: result.bpm
-                )
-            }
+            rebuildBeatSchedule()
         }
         .onDeleteRegion {
             guard !stemSelections.isEmpty else { return }
@@ -154,6 +191,15 @@ struct EditView: View {
             Button("OK") {}
         } message: {
             Text(commitError ?? "Unknown error")
+        }
+        .alert("Large Stem Offset", isPresented: $showLargeOffsetWarning) {
+            Button("Commit Anyway", role: .destructive) { performCommit() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let mins = Int(largeOffsetSeconds) / 60
+            let secs = Int(largeOffsetSeconds) % 60
+            let formatted = mins > 0 ? "\(mins)m \(secs)s" : "\(secs)s"
+            Text("One or more stems are offset by \(formatted). Committing will prepend that much silence to the output file. Are you sure?")
         }
     }
 
@@ -282,7 +328,7 @@ struct EditView: View {
                 // Left column: track headers — anchored, never scrolls horizontally
                 VStack(spacing: 0) {
                     Color.bgCard
-                        .frame(width: 200, height: 24)
+                        .frame(width: 200, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
                     Divider().foregroundColor(Color.border)
                     ForEach(sortedStemURLs, id: \.self) { url in
                         let state = editPlayer.stemStates[url] ?? StemState()
@@ -325,6 +371,10 @@ struct EditView: View {
                             },
                             onResizeRow: { newHeight in
                                 rowHeights[url] = max(40, newHeight)
+                            },
+                            analyzerResult: analyzer.results.first(where: { $0.filename == url.lastPathComponent }),
+                            onRename: { newName in
+                                analyzer.renameStem(oldFilename: url.lastPathComponent, newStemName: newName)
                             }
                         )
 
@@ -342,13 +392,14 @@ struct EditView: View {
                         stemStates: editPlayer.stemStates,
                         rowHeights: rowHeights,
                         defaultRowHeight: defaultRowHeight,
-                        totalDuration: editPlayer.totalDuration,
+                        totalDuration: canvasDuration,
                         zoomScale: $zoomScale,
                         zoomScaleAtGestureStart: $zoomScaleAtGestureStart,
                         editPlayer: editPlayer,
                         beatSchedule: metronome.beatSchedule,
                         isSnapEnabled: isSnapEnabled,
                         stemSelections: stemSelections,
+                        markers: parsedResult?.markers ?? [],
                         onSeek: { editPlayer.seek(to: $0) },
                         onOffsetChange: { url, newClipStart in
                             let currentFirst = editPlayer.stemStates[url]?.segments
@@ -377,7 +428,13 @@ struct EditView: View {
                         },
                         onAddStemSelection: { url, range in
                             if let range { stemSelections[url] = range } else { stemSelections.removeValue(forKey: url) }
-                        }
+                        },
+                        onApproachingRightEdge: {
+                            // Grow the canvas by ~20 bars so the grid continues beyond the current right edge.
+                            canvasRightPadding += lastBarSeconds * 20
+                        },
+                        onLocatorFix: onLocatorFix,
+                        mtCompleteMode: mtCompleteMode
                     )
 
                     // Name labels are rendered as CATextLayers inside waveformContainer (move with clip on drag)
@@ -385,7 +442,7 @@ struct EditView: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: sortedStemURLs.reduce(CGFloat(0)) {
                     $0 + (rowHeights[$1] ?? defaultRowHeight) + 1
-                } + 24)
+                } + WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
                 .background(GeometryReader { geo in
                     Color.clear
                         .onAppear { viewportWidth = geo.size.width }
@@ -445,7 +502,7 @@ struct EditView: View {
     /// Lives outside the NSScrollView so horizontal scroll doesn't carry them away.
     private var waveformNameOverlay: some View {
         VStack(spacing: 0) {
-            Color.clear.frame(height: 24)  // ruler height spacer
+            Color.clear.frame(height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
             ForEach(sortedStemURLs, id: \.self) { url in
                 let h = rowHeights[url] ?? defaultRowHeight
                 Color.clear
@@ -468,6 +525,20 @@ struct EditView: View {
     // MARK: - Commit
 
     private func commitChanges() {
+        // Warn if any stem has been dragged more than 30 seconds right — commit will
+        // prepend that much silence to the output file.
+        let maxOffset = editPlayer.stemStates.values
+            .compactMap { $0.segments.min(by: { $0.sessionStart < $1.sessionStart })?.sessionStart }
+            .max() ?? 0
+        if maxOffset > 30 {
+            largeOffsetSeconds = maxOffset
+            showLargeOffsetWarning = true
+            return
+        }
+        performCommit()
+    }
+
+    private func performCommit() {
         isCommitting = true
         editPlayer.stop()
         metronome.stop()
@@ -501,12 +572,21 @@ struct EditTrackSidebar: View {
     let onGainChange: (Float) -> Void
     let onSelect: () -> Void
     let onResizeRow: (CGFloat) -> Void
+    var analyzerResult: AudioFileResult? = nil
+    var onRename: ((String) -> Void)? = nil
 
     @State private var resizeStartHeight: CGFloat? = nil
     @State private var isEditingGain = false
     @State private var gainEditText = ""
+    @State private var renamePicker = false
+    @State private var renameSelection = ""
+    @State private var renameDismissedViaEnter = false
+    @State private var pencilHover = false
 
     var stemName: String { url.deletingPathExtension().lastPathComponent }
+
+    private var hasNamingIssue: Bool { !(analyzerResult?.issues.isEmpty ?? true) }
+    private static let sortedApprovedStems: [String] = AudioAnalyzerService.approvedStems.sorted()
 
     private func linearToDb(_ v: Float) -> Float { v > 0 ? 20 * log10(v) : -96 }
     private func dbToLinear(_ db: Float) -> Float { pow(10, db / 20) }
@@ -520,24 +600,61 @@ struct EditTrackSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            // Row header — tap to select
-            Button {
-                onSelect()
-            } label: {
-                HStack(spacing: 4) {
-                    if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(Color.accent)
+            // Row header — tap to select; double-click name to rename
+            HStack(spacing: 4) {
+                Button { onSelect() } label: {
+                    HStack(spacing: 4) {
+                        if isSelected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(Color.accent)
+                        }
+                        Text(stemName)
+                            .font(.lato(size: 11, weight: .medium))
+                            .foregroundColor(hasNamingIssue ? Color.red : Color.fgBright)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .popover(isPresented: $renamePicker, arrowEdge: .trailing) {
+                                PickerPopoverContent(
+                                    options: Self.sortedApprovedStems,
+                                    selection: $renameSelection,
+                                    isPresented: $renamePicker,
+                                    dismissedViaEnter: $renameDismissedViaEnter,
+                                    suggestions: analyzerResult?.suggestedNames ?? []
+                                )
+                            }
                     }
-                    Text(stemName)
-                        .font(.lato(size: 11, weight: .medium))
-                        .foregroundColor(Color.fgBright)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                }
+                .buttonStyle(.plain)
+                .simultaneousGesture(TapGesture(count: 2).onEnded {
+                    if onRename != nil {
+                        renameSelection = stemName
+                        renamePicker = true
+                    }
+                })
+                .onChange(of: renamePicker) { isOpen in
+                    if !isOpen && !renameSelection.isEmpty && renameSelection != stemName {
+                        onRename?(renameSelection)
+                    }
+                }
+
+                if onRename != nil {
+                    Button {
+                        renameSelection = stemName
+                        renamePicker = true
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(pencilHover ? .accent : (hasNamingIssue ? Color.red.opacity(0.7) : .fgMid))
+                            .frame(width: 16, height: 16)
+                            .background(RoundedRectangle(cornerRadius: 3)
+                                .fill(pencilHover ? Color.accent.opacity(0.15) : Color.clear))
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
                 }
             }
-            .buttonStyle(.plain)
 
             HStack(spacing: 6) {
                 // Mute
@@ -856,6 +973,7 @@ struct WaveformScrollHost: NSViewRepresentable {
     let beatSchedule: [BeatInfo]
     let isSnapEnabled: Bool
     let stemSelections: [URL: Range<Double>]   // per-stem region selections
+    let markers: [Marker]                       // locators from QA tab — displayed as section flags
 
     let onSeek: (Double) -> Void
     let onOffsetChange: (URL, Double) -> Void
@@ -864,8 +982,28 @@ struct WaveformScrollHost: NSViewRepresentable {
     let onSelectionChange: (Range<Double>?) -> Void  // ruler-based: applies globally
     let onSetStemSelection: (URL, Range<Double>?) -> Void  // canvas no-CMD: replace all
     let onAddStemSelection: (URL, Range<Double>?) -> Void  // canvas CMD: update this stem
+    let onApproachingRightEdge: () -> Void           // called when scroll nears the right edge — grow canvas
+    var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
+    var mtCompleteMode: Bool = false
 
-    private let rulerHeight: CGFloat = 24
+    // 24px bar-number ruler + 20px locator lane
+    static let rulerLaneHeight: CGFloat = 24
+    static let locatorLaneHeight: CGFloat = 20
+    private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight
+
+    // MARK: - Time helper
+    private static func markerSeconds(_ time: String) -> Double? {
+        let parts = time.split(separator: ":")
+        if parts.count == 3,
+           let m = Double(parts[0]), let s = Double(parts[1]), let ms = Double(parts[2]) {
+            return m * 60 + s + ms / 1000
+        }
+        if parts.count == 2,
+           let m = Double(parts[0]), let s = Double(parts[1]) {
+            return m * 60 + s
+        }
+        return nil
+    }
 
     // MARK: Coordinator
 
@@ -882,6 +1020,7 @@ struct WaveformScrollHost: NSViewRepresentable {
         var gridBeatLayer: CAShapeLayer?
         var gridSubdivLayer: CAShapeLayer?
         var rulerBarNumberLayer: CALayer?   // container for bar number CATextLayers
+        var locatorLineLayer: CAShapeLayer? // vertical lines through tracks at each locator
         var waveformContainer: CALayer?    // container for per-stem waveform + outline layers
         var lastContentVersion: Int = -1
 
@@ -918,6 +1057,20 @@ struct WaveformScrollHost: NSViewRepresentable {
             default: break
             }
         }
+
+        /// Grow the canvas when the user scrolls within one viewport of the right edge.
+        /// Self-regulating: once the canvas grows, the condition clears automatically.
+        @objc func handleLiveScroll(_ notification: Notification) {
+            guard let sv = notification.object as? NSScrollView,
+                  let docView = sv.documentView else { return }
+            let rightEdge = sv.documentVisibleRect.maxX
+            let contentWidth = docView.frame.width
+            let viewportWidth = sv.bounds.width
+            guard contentWidth - rightEdge < viewportWidth else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.parent.onApproachingRightEdge()
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -951,6 +1104,8 @@ struct WaveformScrollHost: NSViewRepresentable {
                 h.combine(seg.sourceEnd)
             }
         }
+        h.combine(markers.count)
+        for m in markers { h.combine(m.time); h.combine(m.text) }
         return h.finalize()
     }
 
@@ -1010,9 +1165,18 @@ struct WaveformScrollHost: NSViewRepresentable {
 
         // CALayer ruler bar numbers — container layer holds one CATextLayer per downbeat
         let rulerBarNumbers = CALayer()
-        rulerBarNumbers.frame = CGRect(x: 0, y: 0, width: documentSize.width, height: 24)
+        rulerBarNumbers.frame = CGRect(x: 0, y: 0, width: documentSize.width, height: WaveformScrollHost.rulerLaneHeight)
         rulerBarNumbers.zPosition = 5
         hv.layer?.addSublayer(rulerBarNumbers)
+
+        // CALayer locator vertical lines — subtle dividers through track area at each locator
+        let locatorLines = CAShapeLayer()
+        locatorLines.strokeColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        locatorLines.lineWidth = 1
+        locatorLines.fillColor = nil
+        locatorLines.frame = CGRect(x: 0, y: WaveformScrollHost.rulerLaneHeight, width: documentSize.width, height: documentSize.height - WaveformScrollHost.rulerLaneHeight)
+        locatorLines.zPosition = 1
+        hv.layer?.addSublayer(locatorLines)
 
         // CALayer waveform container — per-stem waveform fills + segment outlines
         let waveformContainer = CALayer()
@@ -1040,7 +1204,16 @@ struct WaveformScrollHost: NSViewRepresentable {
         context.coordinator.gridBeatLayer = gridBeat
         context.coordinator.gridSubdivLayer = gridSubdiv
         context.coordinator.rulerBarNumberLayer = rulerBarNumbers
+        context.coordinator.locatorLineLayer = locatorLines
         context.coordinator.waveformContainer = waveformContainer
+
+        // Observe live scroll to grow the canvas when the user approaches the right edge.
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.handleLiveScroll(_:)),
+            name: NSScrollView.didLiveScrollNotification,
+            object: sv
+        )
         return sv
     }
 
@@ -1105,15 +1278,27 @@ struct WaveformScrollHost: NSViewRepresentable {
                 context.coordinator.gridSubdivLayer?.path = subdivPath
                 CATransaction.commit()
 
-                // Rebuild ruler bar number text layers
+                // Rebuild ruler bar number text layers — stride-spaced so labels don't crowd
                 if let rulerContainer = context.coordinator.rulerBarNumberLayer {
-                    rulerContainer.frame = CGRect(x: 0, y: 0, width: ds.width, height: rulerHeight)
+                    rulerContainer.frame = CGRect(x: 0, y: 0, width: ds.width, height: WaveformScrollHost.rulerLaneHeight)
                     rulerContainer.sublayers?.forEach { $0.removeFromSuperlayer() }
 
-                    let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                     let textColor = NSColor(Color.fgMid)
+                    let downbeats = beatSchedule.filter { $0.isDownbeat }
 
-                    for beat in beatSchedule where beat.isDownbeat {
+                    // Compute pixels between consecutive downbeats, then choose a stride so
+                    // labels are at least 40px apart (prevents cramming at low zoom).
+                    let minLabelSpacingPx: CGFloat = 40
+                    let avgBarPx: CGFloat = {
+                        guard downbeats.count > 1 else { return ds.width }
+                        let xs = downbeats.map { CGFloat($0.timeSeconds / totalDuration) * ds.width }
+                        let diffs = zip(xs, xs.dropFirst()).map { $1 - $0 }
+                        return diffs.reduce(0, +) / CGFloat(diffs.count)
+                    }()
+                    let stride = max(1, Int(ceil(minLabelSpacingPx / avgBarPx)))
+
+                    for beat in downbeats {
+                        guard (beat.bar - 1) % stride == 0 else { continue }
                         let x = CGFloat(beat.timeSeconds / totalDuration) * ds.width
                         let tl = CATextLayer()
                         tl.string = "\(beat.bar)"
@@ -1125,6 +1310,27 @@ struct WaveformScrollHost: NSViewRepresentable {
                         tl.frame = CGRect(x: x + 3, y: 4, width: 40, height: 14)
                         rulerContainer.addSublayer(tl)
                     }
+                }
+
+                // Vertical marker lines through track area — positions match EditLocatorLane (SwiftUI)
+                let markerPositions: [(x: CGFloat, label: String)] = markers.compactMap { m in
+                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty,
+                          let secs = WaveformScrollHost.markerSeconds(m.time) else { return nil }
+                    return (CGFloat(secs / totalDuration) * ds.width, m.text)
+                }.sorted { $0.x < $1.x }
+                if let lineLayer = context.coordinator.locatorLineLayer {
+                    let trackAreaH = ds.height - WaveformScrollHost.rulerLaneHeight
+                    lineLayer.frame = CGRect(x: 0, y: WaveformScrollHost.rulerLaneHeight,
+                                            width: ds.width, height: trackAreaH)
+                    let linePath = CGMutablePath()
+                    for pos in markerPositions {
+                        linePath.move(to: CGPoint(x: pos.x, y: 0))
+                        linePath.addLine(to: CGPoint(x: pos.x, y: trackAreaH))
+                    }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    lineLayer.path = linePath
+                    CATransaction.commit()
                 }
             }
 
@@ -1164,16 +1370,21 @@ struct WaveformScrollHost: NSViewRepresentable {
                             guard pkEnd > pkStart else { continue }
                             let sub = Array(state.peaks[pkStart..<pkEnd])
                             let count = sub.count
-
-                            for i in 0..<count {
-                                let x = segX + CGFloat(i) / CGFloat(count) * segW
-                                let amp = CGFloat(sub[i]) * mid * 0.9
+                            // Cap to ~1 peak per display point — full detail when zoomed in,
+                            // avoids bloated paths when the segment is small on screen.
+                            let renderCount = max(1, min(count, Int(segW * 2)))
+                            func subPeak(_ i: Int) -> Float {
+                                renderCount < count ? sub[Int(Float(i) / Float(renderCount) * Float(count))] : sub[i]
+                            }
+                            for i in 0..<renderCount {
+                                let x = segX + CGFloat(i) / CGFloat(renderCount) * segW
+                                let amp = CGFloat(subPeak(i)) * mid * 0.9
                                 if i == 0 { fillPath.move(to: CGPoint(x: x, y: mid - amp)) }
                                 else { fillPath.addLine(to: CGPoint(x: x, y: mid - amp)) }
                             }
-                            for i in stride(from: count - 1, through: 0, by: -1) {
-                                let x = segX + CGFloat(i) / CGFloat(count) * segW
-                                let amp = CGFloat(sub[i]) * mid * 0.9
+                            for i in stride(from: renderCount - 1, through: 0, by: -1) {
+                                let x = segX + CGFloat(i) / CGFloat(renderCount) * segW
+                                let amp = CGFloat(subPeak(i)) * mid * 0.9
                                 fillPath.addLine(to: CGPoint(x: x, y: mid + amp))
                             }
                             fillPath.closeSubpath()
@@ -1214,15 +1425,19 @@ struct WaveformScrollHost: NSViewRepresentable {
                         let stemDur = state.duration > 0 ? state.duration : effectiveDur
                         let stemW = totalW * CGFloat(min(stemDur, effectiveDur) / effectiveDur)
                         let count = state.peaks.count
-                        for i in 0..<count {
-                            let x = CGFloat(i) / CGFloat(count) * stemW
-                            let amp = CGFloat(state.peaks[i]) * mid * 0.9
+                        let renderCount = max(1, min(count, Int(stemW * 2)))
+                        func stemPeak(_ i: Int) -> Float {
+                            renderCount < count ? state.peaks[Int(Float(i) / Float(renderCount) * Float(count))] : state.peaks[i]
+                        }
+                        for i in 0..<renderCount {
+                            let x = CGFloat(i) / CGFloat(renderCount) * stemW
+                            let amp = CGFloat(stemPeak(i)) * mid * 0.9
                             if i == 0 { fillPath.move(to: CGPoint(x: x, y: mid - amp)) }
                             else { fillPath.addLine(to: CGPoint(x: x, y: mid - amp)) }
                         }
-                        for i in stride(from: count - 1, through: 0, by: -1) {
-                            let x = CGFloat(i) / CGFloat(count) * stemW
-                            let amp = CGFloat(state.peaks[i]) * mid * 0.9
+                        for i in stride(from: renderCount - 1, through: 0, by: -1) {
+                            let x = CGFloat(i) / CGFloat(renderCount) * stemW
+                            let amp = CGFloat(stemPeak(i)) * mid * 0.9
                             fillPath.addLine(to: CGPoint(x: x, y: mid + amp))
                         }
                         fillPath.closeSubpath()
@@ -1306,7 +1521,6 @@ struct WaveformScrollHost: NSViewRepresentable {
     // MARK: Content builder
 
     private func waveformContent() -> some View {
-        let tracksH = stemURLs.reduce(CGFloat(0)) { $0 + (rowHeights[$1] ?? defaultRowHeight) + 1 }
         return ZStack(alignment: .topLeading) {
             // Grid is now rendered via CAShapeLayers (see updateNSView) — no Canvas size limits.
 
@@ -1337,6 +1551,14 @@ struct WaveformScrollHost: NSViewRepresentable {
                         }
                     }
                 )
+                // Locator lane — SwiftUI chips with double-click rename support
+                EditLocatorLane(
+                    markers: markers,
+                    totalDuration: totalDuration,
+                    mtCompleteMode: mtCompleteMode,
+                    onFix: onLocatorFix
+                )
+                .frame(height: WaveformScrollHost.locatorLaneHeight)
                 ForEach(stemURLs, id: \.self) { url in
                     let state = stemStates[url] ?? StemState()
                     let height = rowHeights[url] ?? defaultRowHeight
@@ -1648,6 +1870,150 @@ extension View {
         self.onHover { hovering in
             if hovering { cursor.set() } else { NSCursor.arrow.set() }
         }
+    }
+}
+
+// MARK: - Edit Tab Locator Lane
+
+/// SwiftUI locator lane rendered above the track area. Replaces the old CALayer version,
+/// adding per-chip double-click rename (same picker as the QA tab LocatorCheckView).
+struct EditLocatorLane: View {
+    let markers: [Marker]
+    let totalDuration: Double
+    let mtCompleteMode: Bool
+    let onFix: ([(Marker, String)]) -> Void
+
+    private func markerSeconds(_ time: String) -> Double? {
+        let parts = time.split(separator: ":")
+        if parts.count == 3,
+           let m = Double(parts[0]), let s = Double(parts[1]), let ms = Double(parts[2]) {
+            return m * 60 + s + ms / 1000
+        }
+        if parts.count == 2,
+           let m = Double(parts[0]), let s = Double(parts[1]) {
+            return m * 60 + s
+        }
+        return nil
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                // Transparent base that anchors the ZStack to the full lane width
+                Color.clear.frame(width: geo.size.width, height: WaveformScrollHost.locatorLaneHeight)
+
+                let width = geo.size.width
+                let sorted: [(Marker, CGFloat)] = markers.compactMap { m in
+                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty,
+                          totalDuration > 0,
+                          let secs = markerSeconds(m.time) else { return nil }
+                    return (m, CGFloat(secs / totalDuration) * width)
+                }.sorted { $0.1 < $1.1 }
+
+                ForEach(Array(sorted.enumerated()), id: \.element.0.id) { i, pair in
+                    let (marker, x) = pair
+                    let nextX = i + 1 < sorted.count ? sorted[i + 1].1 : width
+                    let chipW = max(0, nextX - x)
+                    EditLocatorChip(
+                        marker: marker,
+                        chipWidth: chipW,
+                        mtCompleteMode: mtCompleteMode,
+                        onFix: { newName in onFix([(marker, newName)]) }
+                    )
+                    .frame(width: chipW, height: WaveformScrollHost.locatorLaneHeight)
+                    .offset(x: x, y: 0)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Per-locator chip (Edit tab)
+
+struct EditLocatorChip: View {
+    let marker: Marker
+    let chipWidth: CGFloat
+    let mtCompleteMode: Bool
+    let onFix: (String) -> Void
+
+    @State private var pickerOpen = false
+    @State private var pickerSelection = ""
+    @State private var dismissedViaEnter = false
+    @State private var isHovering = false
+    @State private var pencilHover = false
+
+    private var isInvalid: Bool {
+        !LocatorValidator.isValid(marker.text, mtCompleteMode: mtCompleteMode)
+    }
+
+    private var pickerOptions: [String] {
+        mtCompleteMode
+            ? LocatorValidator.sortedSections
+            : LocatorValidator.sortedSections.filter { !LocatorValidator.shortCodes.contains($0) }
+    }
+
+    var body: some View {
+        let bgColor: Color = isInvalid ? Color.red.opacity(0.28) : Color(white: 0.12).opacity(0.88)
+        let textColor: Color = isInvalid ? Color.red : Color.white.opacity(0.85)
+
+        bgColor
+            .overlay(alignment: .leading) {
+                // Left-edge accent line
+                (isInvalid ? Color.red.opacity(0.6) : Color.white.opacity(0.35))
+                    .frame(width: 1)
+            }
+            .overlay(alignment: .leading) {
+                if chipWidth >= 8 {
+                    HStack(spacing: 2) {
+                        Text(chipWidth >= 28 ? "▶ \(marker.text)" : "▶")
+                            .font(.lato(size: 9, weight: .bold))
+                            .foregroundColor(textColor)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        if isHovering && chipWidth >= 44 {
+                            Button {
+                                pickerSelection = marker.text
+                                pickerOpen = true
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundColor(pencilHover ? .accent : textColor.opacity(0.7))
+                                    .frame(width: 14, height: 14)
+                                    .background(RoundedRectangle(cornerRadius: 3)
+                                        .fill(pencilHover ? Color.accent.opacity(0.25) : Color.clear))
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Rectangle())
+                            .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
+                            .transition(.opacity)
+                        }
+                    }
+                    .padding(.leading, 5)
+                    .padding(.trailing, 4)
+                }
+            }
+            .popover(isPresented: $pickerOpen, arrowEdge: .bottom) {
+                PickerPopoverContent(
+                    options: pickerOptions,
+                    selection: $pickerSelection,
+                    isPresented: $pickerOpen,
+                    dismissedViaEnter: $dismissedViaEnter
+                )
+            }
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture(count: 2).onEnded {
+                pickerSelection = marker.text
+                pickerOpen = true
+            })
+            .onChange(of: pickerOpen) { isOpen in
+                if !isOpen && !pickerSelection.isEmpty && pickerSelection != marker.text {
+                    onFix(pickerSelection)
+                }
+            }
+            .onHover { h in
+                withAnimation(.easeOut(duration: 0.08)) { isHovering = h }
+                if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+            }
     }
 }
 

@@ -8,6 +8,7 @@ struct ContentView: View {
     @StateObject private var audioAnalyzer = AudioAnalyzerService()
     @StateObject private var stemPlayer = StemPlayerService()
     @StateObject private var editPlayer = EditPlayerService()
+    @StateObject private var audioShakePlayer = StemPlayerService()
     @StateObject private var metronome = MetronomeService()
     @ObservedObject private var userSettings = UserSettings.shared
     @State private var copiedMarkers = false
@@ -47,8 +48,11 @@ struct ContentView: View {
     @State private var copiedPreviewEnd: Bool = false
 
     // Active app tab
-    enum AppTab { case qa, edit }
+    enum AppTab { case qa, edit, audioshake }
     @State private var activeTab: AppTab = .qa
+
+    // AudioShake settings entry
+    @State private var audioShakeKeyInput: String = ""
 
     // Focus tracking for Song Data + MTID tab order
     enum SongDataFocus: Hashable {
@@ -73,15 +77,16 @@ struct ContentView: View {
                         .padding(.bottom, 10)
                 }
 
-                // Tab switcher — shown once any content is loaded
-                let hasContent = parser.result != nil || !audioAnalyzer.results.isEmpty
-                if hasContent {
-                    tabSwitcher
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 10)
-                }
+                // Tab switcher — always visible
+                tabSwitcher
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 10)
 
-                if activeTab == .edit {
+                if activeTab == .audioshake {
+                    AudioShakeView(player: audioShakePlayer)
+                        .padding(.horizontal, 20)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if activeTab == .edit {
                     // Edit tab manages its own internal scroll — must NOT be inside outer ScrollView
                     // so that the floating global selection bar at the bottom works correctly.
                     EditView(
@@ -89,7 +94,9 @@ struct ContentView: View {
                         metronome: metronome,
                         stemURLs: audioAnalyzer.stemURLs,
                         analyzer: audioAnalyzer,
-                        parsedResult: parser.result
+                        parsedResult: parser.result,
+                        onLocatorFix: { fixes in applyLocatorFixes(fixes) },
+                        mtCompleteMode: userSettings.mtCompleteMode
                     )
                     .padding(.horizontal, 20)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -329,6 +336,61 @@ struct ContentView: View {
 
                 Divider()
 
+                // AudioShake API key
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 4) {
+                        Text("AudioShake")
+                            .font(.lato(size: 11, weight: .semibold))
+                            .foregroundColor(.fgMid)
+                        Image(systemName: "lock.fill")
+                            .font(.lato(size: 9))
+                            .foregroundColor(.fgDim)
+                    }
+                    if userSettings.hasAudioShakeKey {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.lato(size: 11))
+                                .foregroundColor(.green)
+                            Text("API key saved to Keychain")
+                                .font(.lato(size: 11))
+                                .foregroundColor(.fgBright)
+                            Spacer()
+                            Button("Remove") {
+                                CredentialStore.delete(key: CredentialStore.audioShakeAPIKeyKey)
+                                userSettings.hasAudioShakeKey = false
+                                audioShakeKeyInput = ""
+                            }
+                            .font(.lato(size: 10))
+                            .foregroundColor(.red)
+                            .buttonStyle(.plain)
+                            .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
+                        }
+                    } else {
+                        HStack(spacing: 6) {
+                            SecureField("Paste API key…", text: $audioShakeKeyInput)
+                                .font(.lato(size: 11))
+                                .textFieldStyle(.roundedBorder)
+                            Button("Save") {
+                                let trimmed = audioShakeKeyInput.trimmingCharacters(in: .whitespaces)
+                                guard !trimmed.isEmpty else { return }
+                                CredentialStore.save(key: CredentialStore.audioShakeAPIKeyKey, value: trimmed)
+                                userSettings.hasAudioShakeKey = true
+                                audioShakeKeyInput = ""
+                            }
+                            .font(.lato(size: 11, weight: .semibold))
+                            .foregroundColor(.accent)
+                            .buttonStyle(.plain)
+                            .disabled(audioShakeKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                            .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
+                        }
+                        Text("Stored encrypted in macOS Keychain")
+                            .font(.lato(size: 10))
+                            .foregroundColor(.fgDim)
+                    }
+                }
+
+                Divider()
+
                 // Name + Log Out
                 HStack {
                     Text(userSettings.fullName)
@@ -434,6 +496,7 @@ struct ContentView: View {
         HStack(spacing: 0) {
             tabButton(label: "QA", tab: .qa)
             tabButton(label: "Edit", tab: .edit)
+            tabButton(label: "AudioShake", tab: .audioshake)
             Spacer()
         }
     }
@@ -443,6 +506,7 @@ struct ContentView: View {
         return Button(label) {
             if tab != .qa { stemPlayer.stop() }
             if tab != .edit { editPlayer.stop() }
+            if tab != .audioshake { audioShakePlayer.stop() }
             activeTab = tab
         }
             .font(.lato(size: 12, weight: isActive ? .semibold : .regular))

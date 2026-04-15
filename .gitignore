@@ -27,5 +27,8 @@ mtst-master/venv/
 # Swift build artifacts
 mtst-master/swift-app/.build/
 
+# PyInstaller _internal libs (large ML deps — rebuilt by build_parser.sh)
+mtst-master/swift-app/dist/parse_als/_internal/
+
 # Test files
 test-ableton-files/

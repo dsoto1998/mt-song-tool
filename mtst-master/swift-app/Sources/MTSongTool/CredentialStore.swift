@@ -9,8 +9,9 @@ import Security
 /// Keychain and deleted.
 struct CredentialStore {
 
-    static let backOfficePasswordKey = "mtst.backoffice.password"
-    static let nolanRyanPasswordKey  = "mtst.nolanryan.password"
+    static let backOfficePasswordKey  = "mtst.backoffice.password"
+    static let nolanRyanPasswordKey   = "mtst.nolanryan.password"
+    static let audioShakeAPIKeyKey    = "mtst.audioshake.apikey"
 
     private static let udPrefix = "mtst_cred_"
 

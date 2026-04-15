@@ -1,4 +1,4 @@
-# MT Song Tool — v1.2.3
+# MT Song Tool — v1.3.3
 
 ## Features
 
@@ -10,6 +10,7 @@
 - **Stem Check panel** — Batch-validates `.wav` stems for silence, name conformance (~200 approved names), and audio format (44.1 kHz / 16-bit); smart name suggestions with confidence percentages; Fix Names and Fix Format (FFmpeg) buttons
 - **Stem audio preview** — Inline per-stem playback with waveform seek view; click to seek, drag to scrub
 - **Locator section preview** — Play ORIGINAL SONG from any locator's start time directly from the Locators panel
+- **AudioShake tab** — AI-powered stem separation via the AudioShake API; drop any mixed audio file, select from 15 stem models (vocals, lead/backing, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download separated stems with inline playback
 - **Edit tab** — Multi-stem timeline with transport (play/pause/stop), pinch-to-zoom, drag-to-nudge, region select/delete/move, cut/split, trim, per-stem gain and peak metering, mute/solo, and FFmpeg bake-out
 - **Metronome** — Tempo-synced click track with mute toggle, subdivision modes (quarter/eighth), and real-time volume control
 - **Live 12 detection** — Loading a Live 12 session prompts conversion to Live 11 before QA; old Ableton (v10 and earlier) sessions show an alert with an "Open in Ableton 11" option
@@ -21,6 +22,64 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.3.3 — April 15, 2026
+
+- General bug fixes
+
+### v1.3.2 — April 11, 2026
+
+#### Edit Tab
+
+- **Export Stems — click track normalization** — When exporting stems, the generated click track preview is padded or trimmed to match the duration of the other stems. Real stems export at their natural edited length; the click track adjusts to match via FFmpeg.
+- **Build Session bug fixes** — Fixed three issues: (1) locators were not re-seeded into the Build Session panel when a new `.als` was loaded while the panel was already expanded; (2) COUNT OFF and ENDING locator requirements were incorrectly enforced when loading a pre-made `.als` (now only required for blank-slate sessions); (3) stem length mismatch tolerance raised to 10 ms and downgraded to a warning to accommodate generated click track previews.
+
+#### AudioShake
+
+- **Static waveform before playback** — Each separated stem row now shows a 24 px waveform visualization as soon as peaks load, before the stem is played. Previously the waveform only appeared during active playback.
+
+### v1.3.1 — April 10, 2026
+
+#### Edit Tab
+
+- **Interactive tempo lane** — The tempo automation lane in the Edit tab is now fully interactive. Drag a breakpoint vertically to change its BPM (hold Shift for 0.01 BPM fine control). Tap empty space to insert a new tempo event, snapped to the nearest beat when snap is on. Click × on any non-zero breakpoint to delete it.
+- **Locators lock to beats** — Locator chips in the Edit tab timeline now move with tempo changes instead of staying at a fixed wall-clock position. Each locator stores its beat position; its display time is recomputed from the current tempo map so it always sits at the correct beat after BPM edits.
+- **Detect Tempo from ORIGINAL SONG** — New "Detect Tempo from ORIGINAL SONG" button in the Build Session panel (visible when ORIGINAL SONG stem is loaded). Runs librosa beat tracking on the stem and populates BPM and tempo automation events automatically.
+
+### v1.3.0 — April 9, 2026
+
+#### Edit Tab
+
+- **Build Session panel** — New collapsible panel at the bottom of the Edit tab for generating a complete Ableton Live 11 `.als` session from scratch. Set BPM, time signature, loop end bar, and locators; choose an output folder; click Build. The generated session includes full tempo and time signature automation envelopes, properly encoded WarpMarkers, and step-change tempo events (two FloatEvents per beat to prevent Ableton from interpreting them as ramps). Auto-populates from the loaded `.als` when first expanded.
+- **Auto-generated Click Track lane** — When stems are loaded without a CLICK TRACK stem, the Edit tab automatically generates and displays a click track preview lane. The click track ends at the ENDING locator downbeat + a short tail. Pattern: 6/8, 9/8, and 12/8 sessions use compound time (every third eighth note gets the quarter click); all other time signatures use simple time (quarter beats with eighth upbeats). Toolbar shows a spinner during generation and a checkmark when ready.
+- **Locator delete and drag** — Locator chips in the Edit tab can now be deleted via right-click context menu ("Delete Locator"). Build Session locators can be dragged to a new position, snapping to downbeats only.
+
+#### Suggest Locators
+
+- **Suggest Locators from lyric sheet** — New "Suggest Locators" button in the Edit tab toolbar opens a sheet where you can drop a lyric sheet (plain text or `.docx`) or paste a URL (Genius.com or AZLyrics) to fetch lyrics. Whisper audio alignment matches lyric sections to timestamps in the loaded session. Works in both ALS mode (writes locators back to the file) and Build Session mode (appends locators to the build list).
+
+### v1.2.6 — April 8, 2026
+
+#### AudioShake Tab (new)
+
+- **AI stem separation** — New AudioShake tab lets you drop any mixed audio file and separate it into up to 15 stems via the AudioShake API (vocals, lead vocals, backing vocals, instrumental, drums, bass, guitar, electric guitar, acoustic guitar, piano, keys, strings, wind, other, other-minus-guitar). Results download directly into a chosen output folder with inline playback for each separated stem.
+- **Run logging** — Every separation run writes a timestamped log to `logs/audioshake_*.log` capturing upload, task creation, per-poll progress, per-stem download status, and any errors.
+
+#### UI
+
+- **Double-click drag zone toggles fit/restore** — Double-clicking the 20px drag zone at the top of the window now toggles between fitting the window to the full available screen height and restoring it to its previous size, matching the behavior of the macOS zoom button. The drag zone height was also expanded from 12px to 20px for easier targeting.
+
+### v1.2.5 — April 7, 2026
+
+#### Edit Tab
+
+- **Rename stems and locators inline** — Double-click any stem name in the Edit tab sidebar or any locator chip in the locator lane to open the same rename picker used in the QA tab. Stem names show in red when they have naming issues; locator chips show in red when the name is invalid. The hover-reveal pencil button also works in both places. Locator fixes write back to the `.als` file and re-parse, identical to the QA tab flow.
+
+### v1.2.4 — April 7, 2026
+
+#### Edit Tab
+
+- **Higher-resolution waveforms** — Peak extraction now uses 512-sample windows (~86 peaks/sec) instead of a fixed 2,000-point budget. A 3-minute stem goes from ~2,000 to ~15,500 peaks, giving significantly more waveform detail at all zoom levels. Render paths subsample to the pixel budget when zoomed out so performance is unaffected.
 
 ### v1.2.3 — April 7, 2026
 

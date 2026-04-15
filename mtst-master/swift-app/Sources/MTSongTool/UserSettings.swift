@@ -39,6 +39,7 @@ class UserSettings: ObservableObject {
     private let nolanRyanVolumeKey     = "mtst_nr_volume"
     private let useKeychainKey         = "mtst_use_keychain"
     private let autoFadeCutsKey        = "mtst_auto_fade_cuts"
+    private let hasAudioShakeKeyKey    = "mtst_as_has_key"
 
     @Published var firstName: String {
         didSet { UserDefaults.standard.set(firstName, forKey: firstNameKey) }
@@ -85,6 +86,11 @@ class UserSettings: ObservableObject {
         didSet { UserDefaults.standard.set(autoFadeCuts, forKey: autoFadeCutsKey) }
     }
 
+    /// True when an AudioShake API key has been saved to Keychain.
+    @Published var hasAudioShakeKey: Bool {
+        didSet { UserDefaults.standard.set(hasAudioShakeKey, forKey: hasAudioShakeKeyKey) }
+    }
+
     /// The Finder volume name for the Nolan Ryan SMB share.
     /// This is the share name as it appears in /Volumes/ after mounting (default: "Pitching").
     /// The SMB server hostname is always "nolanryan" — this is separate from the server name.
@@ -113,6 +119,7 @@ class UserSettings: ObservableObject {
         self.hasBackOfficeCreds  = UserDefaults.standard.object(forKey: hasBackOfficeCredsKey)  as? Bool ?? false
         self.useKeychain         = UserDefaults.standard.object(forKey: useKeychainKey)         as? Bool ?? true
         self.autoFadeCuts        = UserDefaults.standard.object(forKey: autoFadeCutsKey)        as? Bool ?? true
+        self.hasAudioShakeKey    = UserDefaults.standard.object(forKey: hasAudioShakeKeyKey)    as? Bool ?? false
         // Migrate old default "nolanryan" (server hostname) → "Pitching" (share/volume name).
         let storedVolume = UserDefaults.standard.string(forKey: nolanRyanVolumeKey) ?? "nolanryan"
         self.nolanRyanVolumeName = storedVolume == "nolanryan" ? "Pitching" : storedVolume

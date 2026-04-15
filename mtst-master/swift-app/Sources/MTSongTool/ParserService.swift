@@ -1,6 +1,6 @@
 import Foundation
 
-struct TempoEvent {
+struct TempoEvent: Codable {
     let beat: Double   // beat position in the session
     let bpm: Double    // tempo value at that beat
 }
@@ -254,7 +254,7 @@ class ParserService: ObservableObject {
         }
     }
 
-    private nonisolated static func runSend(command: String) async -> String {
+    nonisolated static func runSend(command: String) async -> String {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let result = parserProcess.send(command)
