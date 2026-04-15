@@ -391,6 +391,50 @@ def _downgrade_to_live11(path):
     return {"ok": True, "new_path": out_path}
 
 
+def _detect_key(wav_path):
+    """Detect musical key using the Krumhansl-Schmuckler algorithm via librosa.
+
+    Returns {"key": "Am", "raw": "A minor", "confidence": 0.847}
+         or {"error": "..."}.
+    """
+    try:
+        import librosa
+        import numpy as np
+
+        y, sr = librosa.load(wav_path, mono=True)
+        # Separate harmonic content so percussion doesn't skew the chroma profile
+        y_harmonic, _ = librosa.effects.hpss(y)
+
+        chroma = librosa.feature.chroma_cqt(y=y_harmonic, sr=sr)
+        chroma_mean = chroma.mean(axis=1)
+
+        # Krumhansl-Schmuckler key profiles
+        major_p = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        minor_p = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        notes   = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+        best_corr, best_key = -np.inf, None
+        for i, note in enumerate(notes):
+            for mode, prof in [("major", major_p), ("minor", minor_p)]:
+                corr = np.corrcoef(chroma_mean, np.roll(prof, i))[0, 1]
+                if corr > best_corr:
+                    best_corr, best_key = corr, f"{note} {mode}"
+
+        # Map to MultiTracks approved keys (enharmonic equivalents for sharp-named outputs)
+        key_map = {
+            "C major": "C",    "C# major": "Db",  "D major": "D",    "D# major": "Eb",
+            "E major": "E",    "F major": "F",    "F# major": "Gb",  "G major": "G",
+            "G# major": "Ab",  "A major": "A",    "A# major": "Bb",  "B major": "B",
+            "C minor": "Cm",   "C# minor": "C#m", "D minor": "Dm",   "D# minor": "Ebm",
+            "E minor": "Em",   "F minor": "Fm",   "F# minor": "F#m", "G minor": "Gm",
+            "G# minor": "G#m", "A minor": "Am",   "A# minor": "Bbm", "B minor": "Bm",
+        }
+
+        return {"key": key_map[best_key], "raw": best_key, "confidence": round(float(best_corr), 3)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _ts_events_from_content(content):
     """Return a sorted list of (beat_pos, numerator, denominator) time-signature events
     parsed from raw decompressed .als XML bytes/string.  beat_pos is in Ableton
@@ -921,6 +965,9 @@ def run_server():
                     print(json.dumps(result), flush=True)
                 elif action == "downgrade_to_live11":
                     result = _downgrade_to_live11(cmd["path"])
+                    print(json.dumps(result), flush=True)
+                elif action == "detect_key":
+                    result = _detect_key(cmd["path"])
                     print(json.dumps(result), flush=True)
                 else:
                     print(json.dumps({"error": f"Unknown action: {action}"}), flush=True)

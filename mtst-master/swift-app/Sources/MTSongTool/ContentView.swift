@@ -25,6 +25,7 @@ struct ContentView: View {
 
     // Song Data fields
     @State private var songKey: String = ""
+    @State private var isDetectingKey: Bool = false
     @State private var songTimeSig: String = ""
     @State private var bpmText: String = ""
     @State private var previewStartText: String = ""
@@ -240,6 +241,17 @@ struct ContentView: View {
         .onChange(of: audioAnalyzer.isConverting) { converting in
             if !converting && audioAnalyzer.conversionErrors.isEmpty {
                 showToastMessage("Conversion complete", isError: false)
+            }
+        }
+        .onChange(of: audioAnalyzer.isScanning) { scanning in
+            // When stem scan finishes, auto-detect key from ORIGINAL SONG if songKey is empty
+            guard !scanning, songKey.isEmpty, let url = originalSongURL else { return }
+            Task {
+                isDetectingKey = true
+                defer { isDetectingKey = false }
+                if let key = try? await parser.detectKey(stemPath: url) {
+                    if songKey.isEmpty { songKey = key }
+                }
             }
         }
         .alert("Ableton 12 Session", isPresented: $showLive12Alert) {
@@ -724,6 +736,12 @@ struct ContentView: View {
 
     // Block until a stem scan has been completed (results must be present).
     // In Quick Check Mode stems are optional, so this is never a blocker.
+    private var originalSongURL: URL? {
+        audioAnalyzer.stemURLs.first {
+            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
+        }
+    }
+
     private var stemCheckRequired: Bool {
         !userSettings.quickCheckMode && audioAnalyzer.results.isEmpty
     }
@@ -1168,8 +1186,15 @@ struct ContentView: View {
                 // Fields grid
                 VStack(spacing: 14) {
                     HStack(spacing: 20) {
-                        songDataField(label: "Song Key", isMissing: songKey.isEmpty) {
-                            SongDataPickerView(selection: $songKey, options: SongDataOptions.songKeys, placeholder: "Select Key", isMissing: songKey.isEmpty, onEnter: { songDataFocus = nil; NSApp.keyWindow?.makeFirstResponder(nil) }, onTab: { songDataFocus = .timeSig }, triggerOpen: $openSongKeyPicker)
+                        songDataField(label: "Song Key", isMissing: songKey.isEmpty && !isDetectingKey) {
+                            HStack(spacing: 6) {
+                                SongDataPickerView(selection: $songKey, options: SongDataOptions.songKeys, placeholder: isDetectingKey ? "Detecting…" : "Select Key", isMissing: songKey.isEmpty && !isDetectingKey, onEnter: { songDataFocus = nil; NSApp.keyWindow?.makeFirstResponder(nil) }, onTab: { songDataFocus = .timeSig }, triggerOpen: $openSongKeyPicker)
+                                if isDetectingKey {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                        .frame(width: 16, height: 16)
+                                }
+                            }
                         }
 
                         songDataField(label: "Time Signature", isMissing: songTimeSig.isEmpty) {

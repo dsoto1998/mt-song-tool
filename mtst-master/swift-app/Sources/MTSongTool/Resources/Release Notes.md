@@ -1,11 +1,11 @@
-# MT Song Tool — v1.3.4
+# MT Song Tool — v1.4.0
 
 ## Features
 
 - **Session parsing** — Drag-and-drop or click-to-browse `.als` loading; extracts locators with accurate timestamps across tempo automation changes, time signatures, BPM, and loop bracket
 - **Locator validation** — Labels checked against the MultiTracks approved sections list; invalid labels highlighted red; auto-fix normalization and inline rename picker; corrections written back to the `.als` file
 - **Time Signatures panel** — Extracted from the Ableton automation envelope with fallback to static numerator/denominator
-- **Song Data panel** — Auto-populates Song Key, Time Signature, BPM, Preview Start/End from the session; all fields copyable
+- **Song Data panel** — Auto-populates Time Signature, BPM, and Preview Start/End from the session; Song Key auto-detected from the ORIGINAL SONG stem; all fields copyable
 - **Session validation** — Loop bracket vs audio clip alignment, barline checks with mid-song time signature support, tempo ramp detection; copy blocked on issues
 - **Stem Check panel** — Batch-validates `.wav` stems for silence, name conformance (~200 approved names), and audio format (44.1 kHz / 16-bit); smart name suggestions with confidence percentages; Fix Names and Fix Format (FFmpeg) buttons
 - **Stem audio preview** — Inline per-stem playback with waveform seek view; click to seek, drag to scrub
@@ -22,6 +22,12 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.4.0 — April 15, 2026
+
+#### QA Tab
+
+- **Song Key auto-detection** — When stems are loaded, ORIGINAL SONG.wav is analyzed in the background and Song Key is automatically suggested using the Krumhansl-Schmuckler pitch-class correlation algorithm. A spinner appears in the Song Key field while detection runs; the result fills in silently once complete. Never overwrites a key you've already selected.
 
 ### v1.3.4 — April 15, 2026
 

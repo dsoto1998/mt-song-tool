@@ -16,8 +16,8 @@ if [ ! -f "$PYINSTALLER" ]; then
     exit 1
 fi
 
-# Ensure lxml and hexdump are installed (dawtool dependencies)
-"$VENV/bin/pip" install lxml hexdump -q 2>&1
+# Ensure dependencies are installed
+"$VENV/bin/pip" install lxml hexdump librosa numpy -q 2>&1
 
 echo "==> Building parse_als (onedir for fast startup)…"
 "$PYINSTALLER" \
@@ -37,6 +37,10 @@ echo "==> Building parse_als (onedir for fast startup)…"
     --hidden-import lxml.etree \
     --collect-all lxml \
     --hidden-import hexdump \
+    --collect-all librosa \
+    --hidden-import librosa \
+    --collect-all numba \
+    --hidden-import numba \
     --paths "$DAWTOOL_ROOT" \
     parse_als.py 2>&1
 

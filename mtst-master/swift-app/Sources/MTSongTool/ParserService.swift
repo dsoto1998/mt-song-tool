@@ -254,6 +254,30 @@ class ParserService: ObservableObject {
         }
     }
 
+    /// Detect the musical key of a WAV file using the Krumhansl-Schmuckler algorithm.
+    /// Returns the detected key string (e.g. "Am", "C", "F#m") mapped to the approved list,
+    /// or throws if the parser returns an error.
+    func detectKey(stemPath: URL) async throws -> String {
+        let cmdDict: [String: Any] = ["action": "detect_key", "path": stemPath.path]
+        guard let cmdData = try? JSONSerialization.data(withJSONObject: cmdDict),
+              let cmdStr  = String(data: cmdData, encoding: .utf8) else {
+            throw NSError(domain: "ParserService", code: 0, userInfo: [NSLocalizedDescriptionKey: "Could not build detect_key command"])
+        }
+
+        let output = await Self.runSend(command: cmdStr)
+        guard let data = output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "ParserService", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid response from parser"])
+        }
+        if let err = json["error"] as? String {
+            throw NSError(domain: "ParserService", code: 0, userInfo: [NSLocalizedDescriptionKey: err])
+        }
+        guard let key = json["key"] as? String else {
+            throw NSError(domain: "ParserService", code: 0, userInfo: [NSLocalizedDescriptionKey: "No key in parser response"])
+        }
+        return key
+    }
+
     nonisolated static func runSend(command: String) async -> String {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
