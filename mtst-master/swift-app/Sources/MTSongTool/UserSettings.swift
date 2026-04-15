@@ -34,6 +34,8 @@ class UserSettings: ObservableObject {
     private let showCopyAllKey         = "mtst_show_copy_all"
     private let quickCheckModeKey      = "mtst_quick_check_mode"
     private let mtCompleteModeKey      = "mtst_mt_complete_mode"
+    private let jamNightModeKey        = "mtst_jam_night_mode"
+    private let showJamNightToggleKey  = "mtst_show_jam_night_toggle"
     private let backOfficeUsernameKey  = "mtst_bo_username"
     private let hasBackOfficeCredsKey  = "mtst_bo_has_creds"
     private let nolanRyanVolumeKey     = "mtst_nr_volume"
@@ -63,6 +65,15 @@ class UserSettings: ObservableObject {
 
     @Published var mtCompleteMode: Bool {
         didSet { UserDefaults.standard.set(mtCompleteMode, forKey: mtCompleteModeKey) }
+    }
+
+    @Published var jamNightMode: Bool {
+        didSet { UserDefaults.standard.set(jamNightMode, forKey: jamNightModeKey) }
+    }
+
+    /// When true, the Jam Night mode toggle is visible in the top bar.
+    @Published var showJamNightToggle: Bool {
+        didSet { UserDefaults.standard.set(showJamNightToggle, forKey: showJamNightToggleKey) }
     }
 
     /// BackOffice web login username (password stored in Keychain via CredentialStore).
@@ -115,6 +126,8 @@ class UserSettings: ObservableObject {
         self.showCopyAll    = UserDefaults.standard.object(forKey: showCopyAllKey)    as? Bool ?? false
         self.quickCheckMode      = UserDefaults.standard.object(forKey: quickCheckModeKey)      as? Bool ?? false
         self.mtCompleteMode      = UserDefaults.standard.object(forKey: mtCompleteModeKey)      as? Bool ?? false
+        self.jamNightMode        = UserDefaults.standard.object(forKey: jamNightModeKey)        as? Bool ?? false
+        self.showJamNightToggle  = UserDefaults.standard.object(forKey: showJamNightToggleKey)  as? Bool ?? false
         self.backOfficeUsername  = UserDefaults.standard.string(forKey: backOfficeUsernameKey)  ?? ""
         self.hasBackOfficeCreds  = UserDefaults.standard.object(forKey: hasBackOfficeCredsKey)  as? Bool ?? false
         self.useKeychain         = UserDefaults.standard.object(forKey: useKeychainKey)         as? Bool ?? true

@@ -46,6 +46,8 @@ struct ContentView: View {
     @State private var copiedBpm: Bool = false
     @State private var copiedPreviewStart: Bool = false
     @State private var copiedPreviewEnd: Bool = false
+    @State private var copiedSongDuration: Bool = false
+    @State private var copiedDisplayDuration: Bool = false
 
     // Active app tab
     enum AppTab { case qa, edit, audioshake }
@@ -321,6 +323,30 @@ struct ContentView: View {
 
                 Divider()
 
+                // Jam Night toggle visibility
+                HStack {
+                    Text("Jam Night")
+                        .font(.lato(size: 11))
+                        .foregroundColor(.fgDim)
+                    Spacer()
+                    HStack(spacing: 0) {
+                        SettingsPillButton(label: "Show", isActive: userSettings.showJamNightToggle) {
+                            userSettings.showJamNightToggle = true
+                        }
+                        SettingsPillButton(label: "Hide", isActive: !userSettings.showJamNightToggle) {
+                            userSettings.showJamNightToggle = false
+                            userSettings.jamNightMode = false
+                        }
+                    }
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.border, lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+
+                Divider()
+
                 // Edit tab settings
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Edit")
@@ -410,6 +436,46 @@ struct ContentView: View {
             }
             .padding(14)
             .frame(width: 260)
+        }
+    }
+
+    // MARK: Jam Night Mode toggle
+    @State private var jamNightHovered = false
+    private var jamNightToggle: some View {
+        Button {
+            userSettings.jamNightMode.toggle()
+        } label: {
+            let color: Color = userSettings.jamNightMode ? .accent : (jamNightHovered ? .fgBright : .fgDim)
+            HStack(spacing: 5) {
+                Image(systemName: userSettings.jamNightMode ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 10))
+                    .foregroundColor(color)
+                Text("Jam Night")
+                    .font(.lato(size: 10, weight: userSettings.jamNightMode ? .semibold : .regular))
+                    .foregroundColor(color)
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(userSettings.jamNightMode ? Color.accent.opacity(0.10) : Color.clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(
+                                userSettings.jamNightMode ? Color.accent.opacity(0.35) : Color.border.opacity(0.6),
+                                lineWidth: 1
+                            )
+                    )
+            )
+            .animation(.easeOut(duration: 0.12), value: userSettings.jamNightMode)
+            .animation(.easeOut(duration: 0.12), value: jamNightHovered)
+
+        }
+        .buttonStyle(.plain)
+        .onHover { h in
+            jamNightHovered = h
+            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
         }
     }
 
@@ -536,6 +602,9 @@ struct ContentView: View {
                 }
                 Spacer()
                 HStack(spacing: 10) {
+                    if userSettings.showJamNightToggle {
+                        jamNightToggle
+                    }
                     mtCompleteToggle
                     quickCheckToggle
                     settingsButton
@@ -625,11 +694,21 @@ struct ContentView: View {
             previewEndText = autoEnd
             previewEndAutoValue = autoEnd
         }
+
+        // Auto-enable MT Complete mode when short-code locators V1, VS, and V4 are all present
+        let locatorNames = Set(result.markers.map { $0.text })
+        if locatorNames.contains("V1") && locatorNames.contains("VS") && locatorNames.contains("V4") {
+            userSettings.mtCompleteMode = true
+        }
     }
 
     // MARK: Issue category checks
     private var hasSessionWarnings: Bool {
         guard let result = parser.result else { return false }
+        if userSettings.jamNightMode {
+            // Tempo ramp warnings are allowed for Jam Night songs
+            return result.warnings.contains { !$0.hasPrefix("Tempo ramp:") }
+        }
         return !result.warnings.isEmpty
     }
 
@@ -730,6 +809,7 @@ struct ContentView: View {
                             onBlocked: copyBlockedToast,
                             onFix: { fixes in applyLocatorFixes(fixes) },
                             mtCompleteMode: userSettings.mtCompleteMode,
+                            jamNightMode: userSettings.jamNightMode,
                             firstTempoChangeMarkerIndex: result.firstTempoChangeMarkerIndex,
                             stemPlayer: stemPlayer,
                             audioAnalyzer: audioAnalyzer
@@ -1043,7 +1123,20 @@ struct ContentView: View {
         locatorsSigMinimized = false
         userSettings.quickCheckMode = false
         userSettings.mtCompleteMode = false
+        userSettings.jamNightMode = false
         activeTab = .qa
+    }
+
+    private var songDurationText: String {
+        guard let d = parser.result?.expectedDuration else { return "" }
+        return String(format: "%.3f", d)
+    }
+
+    private var displayDurationText: String {
+        guard let markers = parser.result?.markers else { return "" }
+        guard let v1 = markers.first(where: { $0.text == "V1" }),
+              let secs = TimecodeHelper.toSeconds(v1.time) else { return "" }
+        return String(format: "%.3f", secs)
     }
 
     // MARK: Song Data panel
@@ -1121,6 +1214,24 @@ struct ContentView: View {
                             HoverCheckbox(isOn: $rehearsalMixOnly, isFocused: songDataFocus == .rehearsalMix, onTab: { songDataFocus = nil })
                         }
                     }
+
+                    if userSettings.mtCompleteMode {
+                        HStack(spacing: 20) {
+                            songDataField(label: "Song Duration") {
+                                HStack(spacing: 4) {
+                                    readOnlyDataDisplay(text: songDurationText)
+                                    songDataCopyButton(value: songDurationText, copied: $copiedSongDuration, copyDisabled: copyBlocked || songDurationText.isEmpty)
+                                }
+                            }
+                            songDataField(label: "Display Duration") {
+                                HStack(spacing: 4) {
+                                    readOnlyDataDisplay(text: displayDurationText)
+                                    songDataCopyButton(value: displayDurationText, copied: $copiedDisplayDuration, copyDisabled: copyBlocked || displayDurationText.isEmpty)
+                                }
+                            }
+                            Spacer()
+                        }
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
@@ -1186,5 +1297,20 @@ struct ContentView: View {
     @ViewBuilder
     private func songDataCopyButton(value: String, copied: Binding<Bool>, copyDisabled: Bool = false) -> some View {
         SongDataCopyButton(value: value, copied: copied, copyDisabled: copyDisabled, onBlocked: copyBlockedToast)
+    }
+
+    private func readOnlyDataDisplay(text: String) -> some View {
+        Text(text.isEmpty ? "—" : text)
+            .font(.lato(size: 13))
+            .foregroundColor(text.isEmpty ? .fgDim : .fgBright)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.inputBg)
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.border, lineWidth: 1))
+            )
     }
 }

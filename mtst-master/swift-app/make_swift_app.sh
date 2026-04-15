@@ -6,19 +6,36 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
 DAWTOOL_ROOT="$(cd .. && pwd)"
 
-# ── Step 1: Build the Python parser into a standalone binary ─────────────────
-echo "==> Step 1/4: Building parser binary (PyInstaller)…"
-bash build_parser.sh
+# ── Flag parsing ─────────────────────────────────────────────────────────────
+SKIP_PARSER=false
+for arg in "$@"; do
+    case "$arg" in
+        --skip-parser) SKIP_PARSER=true ;;
+    esac
+done
 
+# ── Step 1: Build the Python parser into a standalone binary ─────────────────
 PARSER_DIR="dist/parse_als"
-if [ ! -f "$PARSER_DIR/parse_als" ]; then
-    echo "❌  Parser binary not found at $PARSER_DIR/parse_als"
-    exit 1
+if [ "$SKIP_PARSER" = true ]; then
+    echo "==> Step 1/4: Skipping parser build (--skip-parser)"
+    if [ ! -f "$PARSER_DIR/parse_als" ]; then
+        echo "❌  No existing parser binary at $PARSER_DIR/parse_als — cannot skip."
+        echo "    Run without --skip-parser first to build the parser."
+        exit 1
+    fi
+    echo "    Using existing binary: $PARSER_DIR/parse_als"
+else
+    echo "==> Step 1/4: Building parser binary (PyInstaller)…"
+    bash build_parser.sh
+    if [ ! -f "$PARSER_DIR/parse_als" ]; then
+        echo "❌  Parser binary not found at $PARSER_DIR/parse_als"
+        exit 1
+    fi
 fi
 
 # ── Step 2: Build the Swift app ──────────────────────────────────────────────

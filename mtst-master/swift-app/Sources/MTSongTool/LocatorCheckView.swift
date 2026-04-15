@@ -39,6 +39,7 @@ struct LocatorCheckView: View {
     /// Array of (marker, newName) — parent applies the write-back + re-parse.
     let onFix: ([(Marker, String)]) -> Void
     var mtCompleteMode: Bool = false
+    var jamNightMode: Bool = false
     var firstTempoChangeMarkerIndex: Int? = nil
     @ObservedObject var stemPlayer: StemPlayerService
     @ObservedObject var audioAnalyzer: AudioAnalyzerService
@@ -127,7 +128,8 @@ struct LocatorCheckView: View {
 
             // Fake placeholder row when NEXT SONG is absent or misspelled
             // Suppressed in MT Complete mode (single-song sessions don't need NEXT SONG)
-            if !hasNextSong && !mtCompleteMode {
+            // Also suppressed in Jam Night mode
+            if !hasNextSong && !mtCompleteMode && !jamNightMode {
                 nextSongMissingRow
             }
         }

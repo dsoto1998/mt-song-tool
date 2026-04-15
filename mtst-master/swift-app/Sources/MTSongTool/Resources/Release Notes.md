@@ -1,4 +1,4 @@
-# MT Song Tool — v1.3.3
+# MT Song Tool — v1.3.4
 
 ## Features
 
@@ -22,6 +22,13 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.3.4 — April 15, 2026
+
+#### QA Tab
+
+- **Song Duration + Display Duration** — Two new read-only fields appear in the Song Data panel when MT Complete mode is active. Song Duration shows the loop bracket length in seconds (3 decimal places). Display Duration shows the start time of the V1 locator converted to seconds (3 decimal places). Both have copy buttons.
+- **MT Complete mode auto-detection** — Loading an `.als` session that contains locators V1, VS, and V4 now automatically enables MT Complete mode.
 
 ### v1.3.3 — April 15, 2026
 

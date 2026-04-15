@@ -19,7 +19,7 @@ struct MTSongToolApp: App {
             RootView()
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 820, height: 680)
+        .defaultSize(width: 1000, height: 1000)
         .commands {
             CommandGroup(after: .appSettings) {
                 Button("Change Name…") {
@@ -115,6 +115,12 @@ private struct RootView: View {
             window.styleMask.insert(.fullSizeContentView)
             window.minSize = NSSize(width: 680, height: 580)
             window.tabbingMode = .disallowed
+            if let saved = UserDefaults.standard.string(forKey: "MTSongToolWindowFrame") {
+                let frame = NSRectFromString(saved)
+                if frame.width >= 680 && frame.height >= 580 {
+                    window.setFrame(frame, display: true)
+                }
+            }
         }
     }
 }
@@ -208,6 +214,12 @@ struct WindowDragArea: NSViewRepresentable {
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard let window = NSApplication.shared.windows.first else { return }
+        let frame = window.frame
+        UserDefaults.standard.set(NSStringFromRect(frame), forKey: "MTSongToolWindowFrame")
     }
 }
 
