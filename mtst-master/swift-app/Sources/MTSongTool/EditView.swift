@@ -594,6 +594,10 @@ struct EditView: View {
                             for url in toRemove { editPlayer.removeStem(url) }
                             selectedURLs.subtract(toRemove)
                         },
+                        onRemoveStemByURL: { url in
+                            editPlayer.removeStem(url)
+                            selectedURLs.remove(url)
+                        },
                         selectedURLs: selectedURLs,
                         onLocatorFix: onLocatorFix,
                         onLocatorMove: { alsId, newBeat in
@@ -609,6 +613,12 @@ struct EditView: View {
                             } else {
                                 selectedClipIDs = [id]
                             }
+                            // Sync stem selection so ⌦ works after clicking a clip
+                            selectedURLs = Set(selectedClipIDs.compactMap { clipID in
+                                editPlayer.stemURLs.first(where: {
+                                    editPlayer.stemStates[$0]?.segments.contains(where: { $0.id == clipID }) == true
+                                })
+                            })
                         },
                         onTrimLeftEdge: { _, id, delta in
                             let ids = selectedClipIDs.contains(id) && selectedClipIDs.count > 1
@@ -916,7 +926,7 @@ struct EditTrackSidebar: View {
         .contextMenu {
             if let remove = onRemoveStem {
                 Button(role: .destructive) { remove() } label: {
-                    Label("Delete \"\(stemName)\"", systemImage: "trash")
+                    Label("Remove from Session", systemImage: "trash")
                 }
             }
         }
@@ -977,6 +987,7 @@ struct EditWaveformCanvas: View {
     var allStemHeights: [CGFloat] = []
     var onSetCrossSelection: (Int, Int, Range<Double>?) -> Void = { _, _, _ in }
     var onBeginInteraction: () -> Void = {}
+    var onRemoveStem: (() -> Void)? = nil
 
     @State private var dragStartClipStart: Double? = nil
     @State private var optionDragStartTime: Double? = nil
@@ -1194,6 +1205,13 @@ struct EditWaveformCanvas: View {
                 NSCursor.arrow.set()
             }
         }
+        .contextMenu {
+            if let remove = onRemoveStem {
+                Button(role: .destructive) { remove() } label: {
+                    Label("Remove from Session", systemImage: "trash")
+                }
+            }
+        }
     }
 }
 
@@ -1307,6 +1325,12 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onSelectClip: (UUID, Bool) -> Void = { _, _ in }
     var onTrimLeftEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onTrimRightEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
+    var onRemoveStemByURL: ((URL) -> Void)? = nil
+
+    private static let protectedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
+    private func isProtectedURL(_ url: URL) -> Bool {
+        Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+    }
 
     // 24px bar-number ruler + 20px locator lane
     static let rulerLaneHeight: CGFloat = 24
@@ -1585,11 +1609,16 @@ struct WaveformScrollHost: NSViewRepresentable {
                   !(c.scrollView?.window?.firstResponder is NSTextField)
             else { return event }
             let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            // Delete / Forward-delete — region delete if region selected, else stem delete if stems selected
-            if (event.keyCode == 51 || event.keyCode == 117) && mods.isEmpty {
+            // ⌫ Delete (keyCode 51) — delete selected region
+            if event.keyCode == 51 && mods.isEmpty {
                 if !c.parent.stemSelections.isEmpty {
                     DispatchQueue.main.async { c.parent.onDeleteRegion() }
-                } else if !c.parent.selectedURLs.isEmpty {
+                }
+                return nil
+            }
+            // ⌦ Forward Delete (keyCode 117) — remove selected stems from session
+            if event.keyCode == 117 && mods.isEmpty {
+                if !c.parent.selectedURLs.isEmpty {
                     DispatchQueue.main.async { c.parent.onRemoveStem() }
                 }
                 return nil
@@ -2051,7 +2080,8 @@ struct WaveformScrollHost: NSViewRepresentable {
                             let covered = (lo...hi).map { stemURLs[$0] }
                             onSetMultiStemSelection(covered, range)
                         },
-                        onBeginInteraction: { editPlayer.saveUndoSnapshot() }
+                        onBeginInteraction: { editPlayer.saveUndoSnapshot() },
+                        onRemoveStem: (!isProtectedURL(url) && onRemoveStemByURL != nil) ? { onRemoveStemByURL?(url) } : nil
                     )
                     .frame(height: height)
 
