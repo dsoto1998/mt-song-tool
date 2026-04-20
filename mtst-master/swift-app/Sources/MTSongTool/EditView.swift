@@ -608,8 +608,9 @@ struct EditView: View {
                                 else { selectedClipIDs.insert(id) }
                             } else {
                                 selectedClipIDs = [id]
+                                stemSelections = [:]  // clear region selection — new intent is clip/stem
                             }
-                            // Sync stem selection so ⌦ works after clicking a clip
+                            // Sync stem selection so Delete works after clicking a clip
                             selectedURLs = Set(selectedClipIDs.compactMap { clipID in
                                 editPlayer.stemURLs.first(where: {
                                     editPlayer.stemStates[$0]?.segments.contains(where: { $0.id == clipID }) == true
@@ -1609,14 +1610,16 @@ struct WaveformScrollHost: NSViewRepresentable {
                   !(c.scrollView?.window?.firstResponder is NSTextField)
             else { return event }
             let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            // ⌫ Delete (keyCode 51) — delete selected region
+            // ⌫ Delete (keyCode 51) — region delete if region selected, else stem delete
             if event.keyCode == 51 && mods.isEmpty {
                 if !c.parent.stemSelections.isEmpty {
                     DispatchQueue.main.async { c.parent.onDeleteRegion() }
+                } else if !c.parent.selectedURLs.isEmpty {
+                    DispatchQueue.main.async { c.parent.onRemoveStem() }
                 }
                 return nil
             }
-            // ⌦ Forward Delete (keyCode 117) — remove selected stems from session
+            // ⌦ Forward Delete (keyCode 117) — dedicated stem delete (ignores region selection)
             if event.keyCode == 117 && mods.isEmpty {
                 if !c.parent.selectedURLs.isEmpty {
                     DispatchQueue.main.async { c.parent.onRemoveStem() }
