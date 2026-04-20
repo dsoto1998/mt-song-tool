@@ -594,10 +594,6 @@ struct EditView: View {
                             for url in toRemove { editPlayer.removeStem(url) }
                             selectedURLs.subtract(toRemove)
                         },
-                        onRemoveStemByURL: { url in
-                            editPlayer.removeStem(url)
-                            selectedURLs.remove(url)
-                        },
                         selectedURLs: selectedURLs,
                         onLocatorFix: onLocatorFix,
                         onLocatorMove: { alsId, newBeat in
@@ -629,6 +625,10 @@ struct EditView: View {
                             let ids = selectedClipIDs.contains(id) && selectedClipIDs.count > 1
                                 ? selectedClipIDs : Set([id])
                             editPlayer.trimSegmentsRight(ids: ids, delta: delta)
+                        },
+                        onRemoveStemByURL: { url in
+                            editPlayer.removeStem(url)
+                            selectedURLs.remove(url)
                         }
                     )
 
