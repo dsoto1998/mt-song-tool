@@ -1605,9 +1605,9 @@ struct WaveformScrollHost: NSViewRepresentable {
         // Guards against firing when a text field is active (firstResponder is NSTextView/NSTextField).
         context.coordinator.keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
             guard let c = coordinator,
-                  c.scrollView?.window?.isKeyWindow == true,
-                  !(c.scrollView?.window?.firstResponder is NSTextView),
-                  !(c.scrollView?.window?.firstResponder is NSTextField)
+                  let window = c.scrollView?.window,
+                  !(window.firstResponder is NSTextView),
+                  !(window.firstResponder is NSTextField)
             else { return event }
             let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             // ⌫ Delete (keyCode 51) — region delete if region selected, else stem delete
