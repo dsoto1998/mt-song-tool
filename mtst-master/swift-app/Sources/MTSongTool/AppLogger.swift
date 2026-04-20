@@ -7,7 +7,10 @@ import Foundation
 final class AppLogger {
     static let shared = AppLogger()
 
-    private let logDir = URL(fileURLWithPath: "/Volumes/MTEng0/claude-apps/mt-song-tool/logs")
+    private let logDir: URL = {
+        let lib = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+        return lib.appendingPathComponent("Logs/MT Song Tool")
+    }()
     private let queue = DispatchQueue(label: "com.multitracks.mtst.logger", qos: .utility)
     private var fileHandle: FileHandle?
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import UniformTypeIdentifiers
 
 // MARK: - EditView (root)
 
@@ -12,6 +13,7 @@ struct EditView: View {
     let parsedResult: ParsedResult?
     var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
     var mtCompleteMode: Bool = false
+    var onFolderDrop: ((URL) -> Void)? = nil
 
     @ObservedObject private var userSettings = UserSettings.shared
 
@@ -21,11 +23,13 @@ struct EditView: View {
     @State private var isSnapEnabled: Bool = true
     @State private var selectedURLs: Set<URL> = []      // sidebar M/S/Gain group
     @State private var stemSelections: [URL: Range<Double>] = [:]  // per-stem region selections
+    @State private var selectedClipIDs: Set<UUID> = []             // per-segment clip selection for multi-trim
     @State private var rowHeights: [URL: CGFloat] = [:]
     @State private var defaultRowHeight: CGFloat = 64
     @State private var hasFitZoom: Bool = false
     @State private var viewportWidth: CGFloat = 0
     @State private var canvasRightPadding: Double = 0   // extra seconds grown when user scrolls near right edge
+    @State private var isFolderDropTargeted: Bool = false
 
     // Commit state
     @State private var isCommitting: Bool = false
@@ -37,17 +41,85 @@ struct EditView: View {
 
     // MARK: - Computed helpers
 
+    /// Loop bracket: bar 1 (beat 0) → 1 bar before NEXT SONG. Recalculates from NEXT SONG
+    /// each time — ignores any saved value in the .als XML.
+    private var loopBracket: (endBeat: Double, endSeconds: Double, bar: Int)? {
+        let allMarkers = parsedResult?.markers ?? []
+        guard let ns = allMarkers.first(where: { $0.text.uppercased() == "NEXT SONG" }) else { return nil }
+        let nsBeat: Double
+        if let ov = editPlayer.locatorOverrides[ns.alsId], let b = ov.beat {
+            nsBeat = b
+        } else if let b = ns.beat {
+            nsBeat = b
+        } else {
+            // Fallback: derive beat from time string via beatSchedule (works without rebuilt parser)
+            let schedule = metronome.beatSchedule
+            guard let secs = markerTimeToSeconds(ns.time), !schedule.isEmpty else { return nil }
+            let closest = schedule.min(by: { abs($0.timeSeconds - secs) < abs($1.timeSeconds - secs) })
+            nsBeat = closest?.absoluteBeat ?? 0
+        }
+
+        let timeSigs = parsedResult?.timeSignatures ?? []
+        let ts = timeSigs.filter { ($0.beat ?? 0) <= nsBeat }.last ?? timeSigs.first
+        let parts = ts?.sig.split(separator: "/") ?? []
+        let num = Double(parts.first.map(String.init) ?? "4") ?? 4
+        let den = Double(parts.last.map(String.init)  ?? "4") ?? 4
+        let beatsPerBar = num * (4.0 / den)
+
+        let loopEndBeat = nsBeat - beatsPerBar
+        guard loopEndBeat > 0 else { return nil }
+
+        let schedule = metronome.beatSchedule
+        let secs = editBeatToSeconds(loopEndBeat, schedule: schedule)
+        let bar = schedule.filter { $0.isDownbeat && $0.absoluteBeat <= loopEndBeat + 0.01 }.last?.bar ?? 1
+        return (loopEndBeat, secs, bar)
+    }
+
+    private func markerTimeToSeconds(_ time: String) -> Double? {
+        let parts = time.split(separator: ":")
+        if parts.count == 3, let m = Double(parts[0]), let s = Double(parts[1]), let ms = Double(parts[2]) {
+            return m * 60 + s + ms / 1000
+        }
+        if parts.count == 2, let m = Double(parts[0]), let s = Double(parts[1]) {
+            return m * 60 + s
+        }
+        return nil
+    }
+
+    private func editBeatToSeconds(_ beat: Double, schedule: [BeatInfo]) -> Double {
+        guard !schedule.isEmpty else { return 0 }
+        var prev = schedule[0]
+        for info in schedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
+
+    private func formatLoopTime(_ secs: Double) -> String {
+        let m = Int(secs) / 60
+        let s = Int(secs) % 60
+        let ms = Int((secs - Double(Int(secs))) * 1000)
+        return String(format: "%d:%02d.%03d", m, s, ms)
+    }
+
+    private static let protectedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
+
+    private func isProtectedStemURL(_ url: URL) -> Bool {
+        Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+    }
+
     /// CLICK TRACK → GUIDE → ORIGINAL SONG pinned to top; remainder alphabetical.
+    /// Excludes stems marked isExcluded (deleted via Delete key, restorable via undo).
     private var sortedStemURLs: [URL] {
         let priority: [String: Int] = ["CLICK TRACK": 0, "GUIDE": 1, "ORIGINAL SONG": 2]
-        return stemURLs.sorted { a, b in
-            let aKey = a.deletingPathExtension().lastPathComponent.uppercased()
-            let bKey = b.deletingPathExtension().lastPathComponent.uppercased()
-            let ap = priority[aKey] ?? Int.max
-            let bp = priority[bKey] ?? Int.max
-            if ap != bp { return ap < bp }
-            return aKey < bKey
-        }
+        return stemURLs
+            .filter { editPlayer.stemStates[$0]?.isExcluded != true }
+            .sorted { a, b in
+                let aKey = a.deletingPathExtension().lastPathComponent.uppercased()
+                let bKey = b.deletingPathExtension().lastPathComponent.uppercased()
+                let ap = priority[aKey] ?? Int.max
+                let bp = priority[bKey] ?? Int.max
+                if ap != bp { return ap < bp }
+                return aKey < bKey
+            }
     }
 
     private var playheadFraction: Double {
@@ -126,8 +198,27 @@ struct EditView: View {
         .cornerRadius(10)
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.border, lineWidth: 1)
+                .stroke(isFolderDropTargeted ? Color.accent : Color.border, lineWidth: isFolderDropTargeted ? 2 : 1)
+                .animation(.easeOut(duration: 0.12), value: isFolderDropTargeted)
         )
+        .onDrop(of: [UTType.fileURL, .folder], isTargeted: $isFolderDropTargeted) { providers in
+            guard let onFolderDrop, let provider = providers.first else { return false }
+            let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                ? UTType.fileURL.identifier : "public.folder"
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
+                DispatchQueue.main.async {
+                    var url: URL?
+                    if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                    else if let u = item as? NSURL { url = u as URL }
+                    else if let u = item as? URL { url = u }
+                    guard let url else { return }
+                    var isDir: ObjCBool = false
+                    FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                    if isDir.boolValue { onFolderDrop(url) }
+                }
+            }
+            return true
+        }
         .onAppear {
             // Share edit engine with metronome for sample-accurate click sync
             metronome.attachToEngine(editPlayer.engine)
@@ -177,15 +268,9 @@ struct EditView: View {
             zoomScale = 0.25
             zoomScaleAtGestureStart = 0.25
             canvasRightPadding = 0
+            selectedClipIDs = []
             editPlayer.loadStems(newURLs)
             rebuildBeatSchedule()
-        }
-        .onDeleteRegion {
-            guard !stemSelections.isEmpty else { return }
-            for (url, range) in stemSelections {
-                editPlayer.deleteRegion(url, lo: range.lowerBound, hi: range.upperBound)
-            }
-            stemSelections = [:]
         }
         .alert("Commit Error", isPresented: $showCommitError) {
             Button("OK") {}
@@ -277,6 +362,7 @@ struct EditView: View {
 
             // Cut at playhead (Cmd+K) — requires at least one stem selected
             Button {
+                editPlayer.saveUndoSnapshot()
                 for url in selectedURLs {
                     editPlayer.addCut(url, at: editPlayer.currentTime)
                 }
@@ -294,6 +380,27 @@ struct EditView: View {
             .keyboardShortcut("k", modifiers: .command)
 
             Spacer()
+
+            // Normalize Stems
+            if editPlayer.isNormalizing {
+                HStack(spacing: 4) {
+                    ProgressView().scaleEffect(0.7).tint(Color.accent)
+                    Text("Scanning…")
+                        .font(.lato(size: 11, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                }
+            } else {
+                Button("Normalize Stems") {
+                    editPlayer.normalizeStems()
+                }
+                .font(.lato(size: 11, weight: .regular))
+                .foregroundColor(editPlayer.hasCollectiveStems ? Color.fgBright : Color.fgMid)
+                .buttonStyle(.plain)
+                .disabled(!editPlayer.hasCollectiveStems)
+                .help("Set collective stems to −0.01 dBFS true peak; ORIGINAL SONG to −6 dBFS")
+            }
+
+            Divider().frame(height: 18)
 
             // Master peak meter
             MasterPeakMeter(peakDB: editPlayer.masterPeakDB)
@@ -318,10 +425,39 @@ struct EditView: View {
         }
     }
 
+    // MARK: - Loop bracket info strip
+
+    private var loopBracketStrip: some View {
+        HStack(spacing: 0) {
+            Color.bgCard.frame(width: 200)
+            Divider().foregroundColor(Color.border)
+            HStack(spacing: 6) {
+                Image(systemName: "repeat")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.accent.opacity(0.7))
+                if let lb = loopBracket {
+                    Text("Loop: bar 1 (0:00.000) → bar \(lb.bar) (\(formatLoopTime(lb.endSeconds)))")
+                        .font(.lato(size: 10, weight: .medium))
+                        .foregroundColor(Color.fgMid)
+                } else {
+                    Text("Loop: no NEXT SONG marker")
+                        .font(.lato(size: 10, weight: .regular))
+                        .foregroundColor(Color.fgMid.opacity(0.6))
+                }
+            }
+            .padding(.horizontal, 10)
+            Spacer()
+        }
+        .frame(height: 22)
+        .background(Color.bgCard)
+        .overlay(alignment: .bottom) { Divider().foregroundColor(Color.border) }
+    }
+
     // MARK: - Timeline
 
     private var timelineView: some View {
         VStack(spacing: 0) {
+        loopBracketStrip
         ScrollView(.vertical) {
             HStack(alignment: .top, spacing: 0) {
 
@@ -375,6 +511,10 @@ struct EditView: View {
                             analyzerResult: analyzer.results.first(where: { $0.filename == url.lastPathComponent }),
                             onRename: { newName in
                                 analyzer.renameStem(oldFilename: url.lastPathComponent, newStemName: newName)
+                            },
+                            onRemoveStem: isProtectedStemURL(url) ? nil : {
+                                editPlayer.removeStem(url)
+                                selectedURLs.remove(url)
                             }
                         )
 
@@ -424,7 +564,7 @@ struct EditView: View {
                             }
                         },
                         onSetStemSelection: { url, range in
-                            if let range { stemSelections = [url: range] } else { stemSelections = [:] }
+                            if let range { stemSelections = [url: range] } else { stemSelections = [:]; selectedClipIDs = [] }
                         },
                         onAddStemSelection: { url, range in
                             if let range { stemSelections[url] = range } else { stemSelections.removeValue(forKey: url) }
@@ -433,8 +573,53 @@ struct EditView: View {
                             // Grow the canvas by ~20 bars so the grid continues beyond the current right edge.
                             canvasRightPadding += lastBarSeconds * 20
                         },
+                        onSetMultiStemSelection: { urls, range in
+                            if let range {
+                                stemSelections = Dictionary(uniqueKeysWithValues: urls.map { ($0, range) })
+                            } else {
+                                stemSelections = [:]
+                            }
+                        },
+                        onDeleteRegion: {
+                            guard !stemSelections.isEmpty else { return }
+                            editPlayer.saveUndoSnapshot()
+                            for (url, range) in stemSelections {
+                                editPlayer.deleteRegion(url, lo: range.lowerBound, hi: range.upperBound)
+                            }
+                            stemSelections = [:]
+                        },
+                        onRemoveStem: {
+                            let toRemove = selectedURLs.filter { !isProtectedStemURL($0) }
+                            guard !toRemove.isEmpty else { return }
+                            for url in toRemove { editPlayer.removeStem(url) }
+                            selectedURLs.subtract(toRemove)
+                        },
+                        selectedURLs: selectedURLs,
                         onLocatorFix: onLocatorFix,
-                        mtCompleteMode: mtCompleteMode
+                        onLocatorMove: { alsId, newBeat in
+                            editPlayer.moveLocator(alsId: alsId, toBeat: newBeat)
+                        },
+                        locatorOverrides: editPlayer.locatorOverrides,
+                        mtCompleteMode: mtCompleteMode,
+                        selectedClipIDs: selectedClipIDs,
+                        onSelectClip: { id, additive in
+                            if additive {
+                                if selectedClipIDs.contains(id) { selectedClipIDs.remove(id) }
+                                else { selectedClipIDs.insert(id) }
+                            } else {
+                                selectedClipIDs = [id]
+                            }
+                        },
+                        onTrimLeftEdge: { _, id, delta in
+                            let ids = selectedClipIDs.contains(id) && selectedClipIDs.count > 1
+                                ? selectedClipIDs : Set([id])
+                            editPlayer.trimSegmentsLeft(ids: ids, delta: delta)
+                        },
+                        onTrimRightEdge: { _, id, delta in
+                            let ids = selectedClipIDs.contains(id) && selectedClipIDs.count > 1
+                                ? selectedClipIDs : Set([id])
+                            editPlayer.trimSegmentsRight(ids: ids, delta: delta)
+                        }
                     )
 
                     // Name labels are rendered as CATextLayers inside waveformContainer (move with clip on drag)
@@ -483,17 +668,23 @@ struct EditView: View {
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "waveform")
+            Image(systemName: isFolderDropTargeted ? "folder.fill" : "waveform")
                 .font(.system(size: 28))
-                .foregroundColor(Color.fgMid)
-            Text("No stems loaded")
+                .foregroundColor(isFolderDropTargeted ? Color.accent : Color.fgMid)
+                .animation(.easeOut(duration: 0.12), value: isFolderDropTargeted)
+            Text(isFolderDropTargeted ? "Release to load session" : "No stems loaded")
                 .font(.lato(size: 13))
-                .foregroundColor(Color.fgMid)
-            Text("Run a Stem Check in the QA tab first.")
-                .font(.lato(size: 11))
-                .foregroundColor(Color.fgDim)
+                .foregroundColor(isFolderDropTargeted ? Color.accent : Color.fgMid)
+            if !isFolderDropTargeted {
+                Text("Drop a session folder here, or run a Stem Check in the QA tab.")
+                    .font(.lato(size: 11))
+                    .foregroundColor(Color.fgDim)
+                    .multilineTextAlignment(.center)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(isFolderDropTargeted ? Color.dropHovBg : Color.clear)
+        .animation(.easeOut(duration: 0.12), value: isFolderDropTargeted)
     }
 
     // MARK: - Name Bar Overlay
@@ -574,6 +765,7 @@ struct EditTrackSidebar: View {
     let onResizeRow: (CGFloat) -> Void
     var analyzerResult: AudioFileResult? = nil
     var onRename: ((String) -> Void)? = nil
+    var onRemoveStem: (() -> Void)? = nil
 
     @State private var resizeStartHeight: CGFloat? = nil
     @State private var isEditingGain = false
@@ -721,6 +913,13 @@ struct EditTrackSidebar: View {
         .padding(.vertical, 6)
         .frame(width: 200, height: height, alignment: .topLeading)
         .background(isSelected ? Color.accent.opacity(0.08) : Color.bgCard)
+        .contextMenu {
+            if let remove = onRemoveStem {
+                Button(role: .destructive) { remove() } label: {
+                    Label("Delete \"\(stemName)\"", systemImage: "trash")
+                }
+            }
+        }
         .overlay(alignment: .bottom) {
             // Resize drag handle
             Color.border.opacity(0.01)
@@ -742,6 +941,8 @@ struct EditTrackSidebar: View {
 }
 
 // MARK: - EditWaveformCanvas
+
+private enum TrimEdge { case left, right }
 
 struct EditWaveformCanvas: View {
     let peaks: [Float]
@@ -766,16 +967,77 @@ struct EditWaveformCanvas: View {
     let onSetSelection: (Range<Double>?) -> Void   // no CMD: replace all stem selections
     let onAddSelection: (Range<Double>?) -> Void   // CMD: update just this stem's selection
 
+    var selectedClipIDs: Set<UUID> = []
+    var onSelectClip: (UUID, Bool) -> Void = { _, _ in }
+    var onTrimLeftEdge: (UUID, Double) -> Void = { _, _ in }
+    var onTrimRightEdge: (UUID, Double) -> Void = { _, _ in }
+
+    // Cross-stem selection: plain drag reports which stem-index range the mouse has crossed.
+    var stemIndex: Int = 0
+    var allStemHeights: [CGFloat] = []
+    var onSetCrossSelection: (Int, Int, Range<Double>?) -> Void = { _, _, _ in }
+    var onBeginInteraction: () -> Void = {}
+
     @State private var dragStartClipStart: Double? = nil
     @State private var optionDragStartTime: Double? = nil
     @State private var isDraggingForSelection: Bool = false
     @State private var isDraggingAdditive: Bool = false    // CMD held at drag start
+    @State private var trimEdge: TrimEdge? = nil
+    @State private var trimLastX: CGFloat? = nil
+    @State private var trimSegmentID: UUID? = nil
 
     // Name bar zone height — no visual drawn here; overlay in EditView handles rendering.
     // Top 18px of the canvas acts as the drag-to-move zone; below = selection zone.
     private let nameBarHeight: CGFloat = 18
 
     private var effectiveDuration: Double { max(totalDuration, 1) }
+
+    /// Returns the nearest trim edge (left/right) and its segment ID if the tap location is
+    /// within 8px of any segment boundary. Trim takes priority over name-bar move.
+    private func findTrimEdge(at location: CGPoint, totalWidth: CGFloat) -> (TrimEdge, UUID)? {
+        guard !segments.isEmpty, effectiveDuration > 0 else { return nil }
+        let hitZone: CGFloat = 8
+        for seg in segments {
+            let leftX  = CGFloat(seg.sessionStart / effectiveDuration) * totalWidth
+            let rightX = CGFloat(seg.sessionEnd   / effectiveDuration) * totalWidth
+            if abs(location.x - leftX)  <= hitZone { return (.left,  seg.id) }
+            if abs(location.x - rightX) <= hitZone { return (.right, seg.id) }
+        }
+        return nil
+    }
+    /// Returns the lo/hi stem indices covered by the vertical extent of the drag.
+    /// Uses the drag's startLocation.y and location.y (both in this canvas's coordinate space)
+    /// along with the heights of all stems to find which rows the mouse crossed.
+    private func computeStemRange(startY: CGFloat, currentY: CGFloat) -> (Int, Int) {
+        guard !allStemHeights.isEmpty, stemIndex < allStemHeights.count else {
+            return (stemIndex, stemIndex)
+        }
+        let myHeight = allStemHeights[stemIndex]
+        let topY    = min(startY, currentY)
+        let bottomY = max(startY, currentY)
+        var loIdx = stemIndex
+        var hiIdx = stemIndex
+        if topY < 0 {
+            var remaining: CGFloat = -topY
+            var idx = stemIndex - 1
+            while idx >= 0 && remaining > 0 {
+                loIdx = idx
+                remaining -= allStemHeights[idx] + 1   // +1 for row divider
+                idx -= 1
+            }
+        }
+        if bottomY > myHeight {
+            var remaining: CGFloat = bottomY - myHeight
+            var idx = stemIndex + 1
+            while idx < allStemHeights.count && remaining > 0 {
+                hiIdx = idx
+                remaining -= allStemHeights[idx] + 1
+                idx += 1
+            }
+        }
+        return (loIdx, hiIdx)
+    }
+
     private static let pixelsPerSecondBase: CGFloat = 80.0
 
     var body: some View {
@@ -787,51 +1049,68 @@ struct EditWaveformCanvas: View {
         Color.clear
             .frame(width: totalWidth)
         .background(Color.bg.opacity(0.15))
+        .contentShape(Rectangle())
         .gesture(
-            SpatialTapGesture()
-                .onEnded { event in
-                    let time = Double(event.location.x / totalWidth) * effectiveDuration
-                    let clamped = max(0, min(effectiveDuration, time))
-                    // Tap inside an existing selection: seek but keep selection
-                    // Tap outside (or no selection): seek + clear this track's selection
-                    if let sel = selectionRange, sel.contains(clamped) {
-                        onSeek(clamped)
-                    } else {
-                        onSeek(clamped)
-                        onSetSelection(nil)
-                    }
-                }
-        )
-        .gesture(
-            DragGesture(minimumDistance: 2)
+            // Single gesture handles both taps and drags.
+            // minimumDistance: 0 ensures onEnded always fires even for zero-movement clicks,
+            // which is required because SpatialTapGesture doesn't reliably fire inside
+            // NSHostingView/NSScrollView on macOS.
+            DragGesture(minimumDistance: 0)
                 .onChanged { value in
                     let isOption = NSEvent.modifierFlags.contains(.option)
 
+                    // Suppress mode detection until the drag exceeds 2px — prevents accidental
+                    // mode-setting on tiny jitter from minimumDistance: 0.
+                    let dist = sqrt(pow(value.translation.width, 2) + pow(value.translation.height, 2))
+                    guard dist >= 2 else { return }
+
                     // First frame: decide mode.
-                    // Top 18px (name bar zone) = move clip; waveform body = region select.
-                    // Option overrides anywhere to select. CMD = additive selection.
-                    if !isDraggingForSelection && dragStartClipStart == nil && optionDragStartTime == nil {
-                        let inNameBar = value.startLocation.y <= nameBarHeight
-                        if inNameBar && !isOption {
-                            dragStartClipStart = clipSessionStart
+                    // Trim takes priority: if drag starts within 8px of a segment edge → trim.
+                    // Then name-bar zone (top 18px) → move clip.
+                    // Otherwise (or Option held) → region select. CMD = additive.
+                    if trimEdge == nil && !isDraggingForSelection && dragStartClipStart == nil && optionDragStartTime == nil {
+                        if let (edge, segID) = findTrimEdge(at: value.startLocation, totalWidth: totalWidth) {
+                            onBeginInteraction()
+                            trimEdge = edge
+                            trimSegmentID = segID
+                            trimLastX = value.startLocation.x
                         } else {
-                            isDraggingForSelection = true
-                            isDraggingAdditive = NSEvent.modifierFlags.contains(.command)
-                            let rawT = Double(value.startLocation.x / totalWidth) * effectiveDuration
-                            let snapped = isSnapEnabled && !beatSchedule.isEmpty
-                                ? snapToGrid(rawT, schedule: beatSchedule) : rawT
-                            optionDragStartTime = max(0, min(effectiveDuration, snapped))
+                            let inNameBar = value.startLocation.y <= nameBarHeight
+                            if inNameBar && !isOption {
+                                onBeginInteraction()
+                                dragStartClipStart = clipSessionStart
+                            } else {
+                                isDraggingForSelection = true
+                                isDraggingAdditive = NSEvent.modifierFlags.contains(.command)
+                                let rawT = Double(value.startLocation.x / totalWidth) * effectiveDuration
+                                let snapped = isSnapEnabled && !beatSchedule.isEmpty
+                                    ? snapToGrid(rawT, schedule: beatSchedule) : rawT
+                                optionDragStartTime = max(0, min(effectiveDuration, snapped))
+                            }
                         }
                     }
 
-                    if isDraggingForSelection {
+                    if let edge = trimEdge, let segID = trimSegmentID {
+                        let deltaX = value.location.x - (trimLastX ?? value.startLocation.x)
+                        trimLastX = value.location.x
+                        if deltaX != 0 {
+                            let deltaSeconds = Double(deltaX / pixelsPerSecond)
+                            if edge == .left { onTrimLeftEdge(segID, deltaSeconds) }
+                            else { onTrimRightEdge(segID, deltaSeconds) }
+                        }
+                    } else if isDraggingForSelection {
                         let t0 = optionDragStartTime ?? 0
                         let rawT1 = Double(value.location.x / totalWidth) * effectiveDuration
                         let t1 = isSnapEnabled && !beatSchedule.isEmpty
                             ? snapToGrid(rawT1, schedule: beatSchedule) : rawT1
                         let lo = min(t0, t1); let hi = max(t0, t1)
                         if hi - lo > 0.001 {
-                            if isDraggingAdditive { onAddSelection(lo..<hi) } else { onSetSelection(lo..<hi) }
+                            if isDraggingAdditive {
+                                onAddSelection(lo..<hi)
+                            } else {
+                                let (loStem, hiStem) = computeStemRange(startY: value.startLocation.y, currentY: value.location.y)
+                                onSetCrossSelection(loStem, hiStem, lo..<hi)
+                            }
                         }
                     } else {
                         guard !isLocked else { return }
@@ -844,14 +1123,42 @@ struct EditWaveformCanvas: View {
                     }
                 }
                 .onEnded { value in
-                    if isDraggingForSelection {
+                    // Tap detection: if no drag mode was set (onChanged never advanced past the
+                    // 2px guard), treat as a click — seek and optionally clear selections.
+                    let isTap = trimEdge == nil && !isDraggingForSelection && dragStartClipStart == nil
+                    if isTap {
+                        let time = Double(value.startLocation.x / totalWidth) * effectiveDuration
+                        let clamped = max(0, min(effectiveDuration, time))
+                        let isCmd = NSEvent.modifierFlags.contains(.command)
+                        if let seg = segments.first(where: { $0.sessionStart <= clamped + 0.001 && $0.sessionEnd >= clamped - 0.001 }) {
+                            onSelectClip(seg.id, isCmd)
+                        } else {
+                            onSetSelection(nil)
+                        }
+                        onSeek(clamped)
+                        return
+                    }
+
+                    if let edge = trimEdge, let segID = trimSegmentID {
+                        let deltaX = value.location.x - (trimLastX ?? value.startLocation.x)
+                        if deltaX != 0 {
+                            let deltaSeconds = Double(deltaX / pixelsPerSecond)
+                            if edge == .left { onTrimLeftEdge(segID, deltaSeconds) }
+                            else { onTrimRightEdge(segID, deltaSeconds) }
+                        }
+                    } else if isDraggingForSelection {
                         let t0 = optionDragStartTime ?? 0
                         let rawT1 = Double(value.location.x / totalWidth) * effectiveDuration
                         let t1 = isSnapEnabled && !beatSchedule.isEmpty
                             ? snapToGrid(rawT1, schedule: beatSchedule) : rawT1
                         let lo = min(t0, t1); let hi = max(t0, t1)
                         if hi - lo > 0.001 {
-                            if isDraggingAdditive { onAddSelection(lo..<hi) } else { onSetSelection(lo..<hi) }
+                            if isDraggingAdditive {
+                                onAddSelection(lo..<hi)
+                            } else {
+                                let (loStem, hiStem) = computeStemRange(startY: value.startLocation.y, currentY: value.location.y)
+                                onSetCrossSelection(loStem, hiStem, lo..<hi)
+                            }
                         } else {
                             if isDraggingAdditive { onAddSelection(nil) } else { onSetSelection(nil) }
                         }
@@ -864,6 +1171,9 @@ struct EditWaveformCanvas: View {
                         }
                         onOffsetChange(newStart)
                     }
+                    trimEdge = nil
+                    trimLastX = nil
+                    trimSegmentID = nil
                     dragStartClipStart = nil
                     optionDragStartTime = nil
                     isDraggingForSelection = false
@@ -873,7 +1183,9 @@ struct EditWaveformCanvas: View {
         .onContinuousHover { phase in
             switch phase {
             case .active(let loc):
-                if loc.y <= nameBarHeight {
+                if let _ = findTrimEdge(at: loc, totalWidth: totalWidth) {
+                    NSCursor.resizeLeftRight.set()
+                } else if loc.y <= nameBarHeight {
                     NSCursor.openHand.set()
                 } else {
                     NSCursor.crosshair.set()
@@ -983,8 +1295,18 @@ struct WaveformScrollHost: NSViewRepresentable {
     let onSetStemSelection: (URL, Range<Double>?) -> Void  // canvas no-CMD: replace all
     let onAddStemSelection: (URL, Range<Double>?) -> Void  // canvas CMD: update this stem
     let onApproachingRightEdge: () -> Void           // called when scroll nears the right edge — grow canvas
+    var onSetMultiStemSelection: ([URL], Range<Double>?) -> Void = { _, _ in }
+    var onDeleteRegion: () -> Void = {}
+    var onRemoveStem: () -> Void = {}
+    var selectedURLs: Set<URL> = []
     var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
+    var onLocatorMove: (String, Double) -> Void = { _, _ in }  // (alsId, newBeat)
+    var locatorOverrides: [String: LocatorOverride] = [:]
     var mtCompleteMode: Bool = false
+    var selectedClipIDs: Set<UUID> = []
+    var onSelectClip: (UUID, Bool) -> Void = { _, _ in }
+    var onTrimLeftEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
+    var onTrimRightEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
 
     // 24px bar-number ruler + 20px locator lane
     static let rulerLaneHeight: CGFloat = 24
@@ -1023,8 +1345,13 @@ struct WaveformScrollHost: NSViewRepresentable {
         var locatorLineLayer: CAShapeLayer? // vertical lines through tracks at each locator
         var waveformContainer: CALayer?    // container for per-stem waveform + outline layers
         var lastContentVersion: Int = -1
+        var keyMonitor: Any?
 
         init(_ parent: WaveformScrollHost) { self.parent = parent }
+
+        deinit {
+            if let m = keyMonitor { NSEvent.removeMonitor(m) }
+        }
 
         @objc func handleMagnification(_ r: NSMagnificationGestureRecognizer) {
             guard let sv = scrollView else { return }
@@ -1106,7 +1433,35 @@ struct WaveformScrollHost: NSViewRepresentable {
         }
         h.combine(markers.count)
         for m in markers { h.combine(m.time); h.combine(m.text) }
+        for id in selectedClipIDs.sorted(by: { $0.uuidString < $1.uuidString }) { h.combine(id) }
+        h.combine(locatorOverrides.count)
+        for (alsId, ov) in locatorOverrides.sorted(by: { $0.key < $1.key }) {
+            h.combine(alsId); h.combine(ov.beat)
+        }
         return h.finalize()
+    }
+
+    /// Convert Ableton beat position to session seconds using the beat schedule.
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return 0 }
+        var prev = beatSchedule[0]
+        for info in beatSchedule {
+            if info.absoluteBeat > beat { break }
+            prev = info
+        }
+        return prev.timeSeconds
+    }
+
+    /// Effective session seconds for a marker, respecting locatorOverrides.
+    private func effectiveSecondsForMarker(_ m: Marker) -> Double? {
+        guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        if let ov = locatorOverrides[m.alsId], let overrideBeat = ov.beat {
+            return secondsForBeat(overrideBeat)
+        }
+        if let beat = m.beat {
+            return secondsForBeat(beat)
+        }
+        return Self.markerSeconds(m.time)
     }
 
     /// Explicit document size so NSHostingView is never undersized.
@@ -1214,6 +1569,38 @@ struct WaveformScrollHost: NSViewRepresentable {
             name: NSScrollView.didLiveScrollNotification,
             object: sv
         )
+
+        // Delete key monitor — AppKit-level so it works regardless of SwiftUI focus state.
+        // Guards against firing when a text field is active (firstResponder is NSTextView/NSTextField).
+        context.coordinator.keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
+            guard let c = coordinator,
+                  c.scrollView?.window?.isKeyWindow == true,
+                  !(c.scrollView?.window?.firstResponder is NSTextView),
+                  !(c.scrollView?.window?.firstResponder is NSTextField)
+            else { return event }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Delete / Forward-delete — region delete if region selected, else stem delete if stems selected
+            if (event.keyCode == 51 || event.keyCode == 117) && mods.isEmpty {
+                if !c.parent.stemSelections.isEmpty {
+                    DispatchQueue.main.async { c.parent.onDeleteRegion() }
+                } else if !c.parent.selectedURLs.isEmpty {
+                    DispatchQueue.main.async { c.parent.onRemoveStem() }
+                }
+                return nil
+            }
+            // CMD+Z — undo
+            if event.keyCode == 6 && mods == .command {
+                DispatchQueue.main.async { c.parent.editPlayer.undo() }
+                return nil
+            }
+            // CMD+SHIFT+Z — redo
+            if event.keyCode == 6 && mods == [.command, .shift] {
+                DispatchQueue.main.async { c.parent.editPlayer.redo() }
+                return nil
+            }
+            return event
+        }
+
         return sv
     }
 
@@ -1312,10 +1699,9 @@ struct WaveformScrollHost: NSViewRepresentable {
                     }
                 }
 
-                // Vertical marker lines through track area — positions match EditLocatorLane (SwiftUI)
+                // Vertical marker lines through track area — positions respect locatorOverrides
                 let markerPositions: [(x: CGFloat, label: String)] = markers.compactMap { m in
-                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty,
-                          let secs = WaveformScrollHost.markerSeconds(m.time) else { return nil }
+                    guard let secs = effectiveSecondsForMarker(m) else { return nil }
                     return (CGFloat(secs / totalDuration) * ds.width, m.text)
                 }.sorted { $0.x < $1.x }
                 if let lineLayer = context.coordinator.locatorLineLayer {
@@ -1332,6 +1718,7 @@ struct WaveformScrollHost: NSViewRepresentable {
                     lineLayer.path = linePath
                     CATransaction.commit()
                 }
+
             }
 
             // Rebuild per-stem waveform CAShapeLayers — vector-based, no texture limit
@@ -1419,6 +1806,41 @@ struct WaveformScrollHost: NSViewRepresentable {
                             headerLabel.frame = CGRect(x: segX + 7, y: yOff + 3, width: max(segW - 14, 0), height: 14)
                             headerLabel.zPosition = 3
                             wfContainer.addSublayer(headerLabel)
+
+                            // Clip selection: accent tint + outline when this segment is in selectedClipIDs
+                            if selectedClipIDs.contains(segment.id) {
+                                let clipSelFill = CALayer()
+                                clipSelFill.frame = CGRect(x: segX, y: yOff, width: segW, height: h)
+                                clipSelFill.backgroundColor = NSColor(Color.accent).withAlphaComponent(0.25).cgColor
+                                clipSelFill.zPosition = 4
+                                wfContainer.addSublayer(clipSelFill)
+
+                                let clipSelOutline = CAShapeLayer()
+                                clipSelOutline.frame = CGRect(x: 0, y: yOff, width: totalW, height: h)
+                                let clipSelPath = CGMutablePath()
+                                clipSelPath.addRoundedRect(in: CGRect(x: segX + 0.5, y: 0.5, width: segW - 1, height: h - 1), cornerWidth: 4, cornerHeight: 4)
+                                clipSelOutline.path = clipSelPath
+                                clipSelOutline.fillColor = nil
+                                clipSelOutline.strokeColor = NSColor(Color.accent).cgColor
+                                clipSelOutline.lineWidth = 2
+                                clipSelOutline.zPosition = 5
+                                wfContainer.addSublayer(clipSelOutline)
+                            }
+
+                            // Trim grip strips — 6px handles at each segment edge (brightened on hover via cursor)
+                            let leftGrip = CALayer()
+                            leftGrip.frame = CGRect(x: segX, y: yOff + 1, width: 6, height: h - 2)
+                            leftGrip.backgroundColor = NSColor.white.withAlphaComponent(0.35).cgColor
+                            leftGrip.cornerRadius = 2
+                            leftGrip.zPosition = 6
+                            wfContainer.addSublayer(leftGrip)
+
+                            let rightGrip = CALayer()
+                            rightGrip.frame = CGRect(x: segX + segW - 6, y: yOff + 1, width: 6, height: h - 2)
+                            rightGrip.backgroundColor = NSColor.white.withAlphaComponent(0.35).cgColor
+                            rightGrip.cornerRadius = 2
+                            rightGrip.zPosition = 6
+                            wfContainer.addSublayer(rightGrip)
                         }
                     } else if !state.peaks.isEmpty {
                         // Legacy single-clip path
@@ -1544,6 +1966,7 @@ struct WaveformScrollHost: NSViewRepresentable {
                         onSelectionChange(finalRange)
                         let delta = finalRange.lowerBound - originalRange.lowerBound
                         let targets = stemSelections.isEmpty ? Set(stemURLs) : Set(stemSelections.keys)
+                        editPlayer.saveUndoSnapshot()
                         for url in targets {
                             let lo = (stemSelections[url]?.lowerBound ?? originalRange.lowerBound)
                             let hi = (stemSelections[url]?.upperBound ?? originalRange.upperBound)
@@ -1551,15 +1974,19 @@ struct WaveformScrollHost: NSViewRepresentable {
                         }
                     }
                 )
-                // Locator lane — SwiftUI chips with double-click rename support
+                // Locator lane — SwiftUI chips with double-click rename + drag-to-reposition
                 EditLocatorLane(
                     markers: markers,
                     totalDuration: totalDuration,
                     mtCompleteMode: mtCompleteMode,
-                    onFix: onLocatorFix
+                    beatSchedule: beatSchedule,
+                    locatorOverrides: locatorOverrides,
+                    onFix: onLocatorFix,
+                    onLocatorMove: onLocatorMove
                 )
                 .frame(height: WaveformScrollHost.locatorLaneHeight)
-                ForEach(stemURLs, id: \.self) { url in
+                let allHeights = stemURLs.map { rowHeights[$0] ?? defaultRowHeight }
+                ForEach(Array(stemURLs.enumerated()), id: \.element) { (idx, url) in
                     let state = stemStates[url] ?? StemState()
                     let height = rowHeights[url] ?? defaultRowHeight
                     let clipStart = state.segments.min(by: { $0.sessionStart < $1.sessionStart })?.sessionStart ?? 0
@@ -1584,7 +2011,19 @@ struct WaveformScrollHost: NSViewRepresentable {
                         onTrimInChange: { onTrimInChange(url, $0) },
                         onTrimOutChange: { onTrimOutChange(url, $0) },
                         onSetSelection: { range in onSetStemSelection(url, range) },
-                        onAddSelection: { range in onAddStemSelection(url, range) }
+                        onAddSelection: { range in onAddStemSelection(url, range) },
+                        selectedClipIDs: selectedClipIDs,
+                        onSelectClip: { id, additive in onSelectClip(id, additive) },
+                        onTrimLeftEdge: { id, delta in onTrimLeftEdge(url, id, delta) },
+                        onTrimRightEdge: { id, delta in onTrimRightEdge(url, id, delta) },
+                        stemIndex: idx,
+                        allStemHeights: allHeights,
+                        onSetCrossSelection: { loIdx, hiIdx, range in
+                            let lo = max(0, loIdx); let hi = min(stemURLs.count - 1, hiIdx)
+                            let covered = (lo...hi).map { stemURLs[$0] }
+                            onSetMultiStemSelection(covered, range)
+                        },
+                        onBeginInteraction: { editPlayer.saveUndoSnapshot() }
                     )
                     .frame(height: height)
 
@@ -1875,13 +2314,19 @@ extension View {
 
 // MARK: - Edit Tab Locator Lane
 
-/// SwiftUI locator lane rendered above the track area. Replaces the old CALayer version,
-/// adding per-chip double-click rename (same picker as the QA tab LocatorCheckView).
+/// SwiftUI locator lane rendered above the track area. Supports double-click rename and
+/// drag-to-reposition (snaps to bar downbeats).
 struct EditLocatorLane: View {
     let markers: [Marker]
     let totalDuration: Double
     let mtCompleteMode: Bool
+    let beatSchedule: [BeatInfo]
+    let locatorOverrides: [String: LocatorOverride]
     let onFix: ([(Marker, String)]) -> Void
+    let onLocatorMove: (String, Double) -> Void
+
+    // Drag state — nil when no drag in progress
+    @State private var dragState: (alsId: String, startSeconds: Double, currentBeat: Double, currentSeconds: Double)? = nil
 
     private func markerSeconds(_ time: String) -> Double? {
         let parts = time.split(separator: ":")
@@ -1896,35 +2341,115 @@ struct EditLocatorLane: View {
         return nil
     }
 
+    /// Effective seconds for a marker, considering live drag and session overrides.
+    private func effectiveSeconds(for marker: Marker) -> Double {
+        if let ds = dragState, ds.alsId == marker.alsId { return ds.currentSeconds }
+        if let ov = locatorOverrides[marker.alsId], let overrideBeat = ov.beat {
+            return secondsForBeat(overrideBeat)
+        }
+        if let beat = marker.beat { return secondsForBeat(beat) }
+        return markerSeconds(marker.time) ?? 0
+    }
+
+    /// Convert Ableton beat position to session seconds using the beat schedule.
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return 0 }
+        // Find the two adjacent entries that bracket this beat and interpolate.
+        var prev = beatSchedule[0]
+        for info in beatSchedule {
+            if info.absoluteBeat > beat { break }
+            prev = info
+        }
+        return prev.timeSeconds
+    }
+
+    /// Snap raw seconds to the nearest bar downbeat; returns (snappedSeconds, absoluteBeat).
+    private func snapToDownbeat(_ seconds: Double) -> (seconds: Double, beat: Double) {
+        let downbeats = beatSchedule.filter { $0.isDownbeat }
+        guard !downbeats.isEmpty else { return (seconds, 0) }
+        let nearest = downbeats.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!
+        return (nearest.timeSeconds, nearest.absoluteBeat)
+    }
+
     var body: some View {
         GeometryReader { geo in
-            ZStack(alignment: .topLeading) {
-                // Transparent base that anchors the ZStack to the full lane width
-                Color.clear.frame(width: geo.size.width, height: WaveformScrollHost.locatorLaneHeight)
+            locatorContent(width: geo.size.width)
+        }
+    }
 
-                let width = geo.size.width
-                let sorted: [(Marker, CGFloat)] = markers.compactMap { m in
-                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty,
-                          totalDuration > 0,
-                          let secs = markerSeconds(m.time) else { return nil }
+    @ViewBuilder
+    private func locatorContent(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(width: width, height: WaveformScrollHost.locatorLaneHeight)
+
+            if totalDuration > 0 && width > 0 {
+                let positioned: [(marker: Marker, x: CGFloat)] = markers.compactMap { m in
+                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+                    let secs = effectiveSeconds(for: m)
                     return (m, CGFloat(secs / totalDuration) * width)
-                }.sorted { $0.1 < $1.1 }
+                }.sorted { $0.x < $1.x }
 
-                ForEach(Array(sorted.enumerated()), id: \.element.0.id) { i, pair in
-                    let (marker, x) = pair
-                    let nextX = i + 1 < sorted.count ? sorted[i + 1].1 : width
+                ForEach(Array(positioned.enumerated()), id: \.element.marker.id) { i, pair in
+                    let marker = pair.marker
+                    let x = pair.x
+                    let nextX = i + 1 < positioned.count ? positioned[i + 1].x : width
                     let chipW = max(0, nextX - x)
+                    let isDraggingThis = dragState?.alsId == marker.alsId
+                    let isDraggable = marker.text.uppercased() != "COUNT OFF" && !marker.alsId.isEmpty
+
                     EditLocatorChip(
                         marker: marker,
                         chipWidth: chipW,
                         mtCompleteMode: mtCompleteMode,
+                        isDragging: isDraggingThis,
                         onFix: { newName in onFix([(marker, newName)]) }
                     )
-                    .frame(width: chipW, height: WaveformScrollHost.locatorLaneHeight)
-                    .offset(x: x, y: 0)
+                    .frame(width: max(chipW, 4), height: WaveformScrollHost.locatorLaneHeight)
+                    .offset(x: max(0, min(x, width - 1)), y: 0)
+                    .if(isDraggable) { v in
+                        v.gesture(
+                            DragGesture(minimumDistance: 3)
+                                .onChanged { value in
+                                    let pixelsPerSecond = width / CGFloat(totalDuration)
+                                    let baseSeconds: Double
+                                    if let ds = dragState, ds.alsId == marker.alsId {
+                                        baseSeconds = ds.startSeconds
+                                    } else {
+                                        baseSeconds = effectiveSeconds(for: marker)
+                                    }
+                                    let rawSeconds = baseSeconds + Double(value.translation.width / pixelsPerSecond)
+                                    let clamped = max(0, min(totalDuration, rawSeconds))
+                                    let (snappedSecs, snappedBeat) = snapToDownbeat(clamped)
+                                    dragState = (alsId: marker.alsId, startSeconds: baseSeconds,
+                                                 currentBeat: snappedBeat, currentSeconds: snappedSecs)
+                                }
+                                .onEnded { _ in
+                                    if let ds = dragState, ds.alsId == marker.alsId {
+                                        onLocatorMove(ds.alsId, ds.currentBeat)
+                                    }
+                                    dragState = nil
+                                }
+                        )
+                    }
+                }
+
+                // Drag guide line — vertical accent line at current drag position
+                if let ds = dragState {
+                    let dragX = CGFloat(ds.currentSeconds / totalDuration) * width
+                    Rectangle()
+                        .fill(Color.accent.opacity(0.8))
+                        .frame(width: 1)
+                        .frame(maxHeight: .infinity)
+                        .offset(x: dragX, y: 0)
                 }
             }
         }
+    }
+}
+
+extension View {
+    @ViewBuilder func `if`(_ condition: Bool, transform: (Self) -> some View) -> some View {
+        if condition { transform(self) } else { self }
     }
 }
 
@@ -1934,6 +2459,7 @@ struct EditLocatorChip: View {
     let marker: Marker
     let chipWidth: CGFloat
     let mtCompleteMode: Bool
+    var isDragging: Bool = false
     let onFix: (String) -> Void
 
     @State private var pickerOpen = false
@@ -1953,14 +2479,16 @@ struct EditLocatorChip: View {
     }
 
     var body: some View {
-        let bgColor: Color = isInvalid ? Color.red.opacity(0.28) : Color(white: 0.12).opacity(0.88)
+        let bgColor: Color = isDragging ? Color.accent.opacity(0.35)
+            : isInvalid ? Color.red.opacity(0.28)
+            : Color(white: 0.12).opacity(0.88)
         let textColor: Color = isInvalid ? Color.red : Color.white.opacity(0.85)
 
         bgColor
             .overlay(alignment: .leading) {
                 // Left-edge accent line
-                (isInvalid ? Color.red.opacity(0.6) : Color.white.opacity(0.35))
-                    .frame(width: 1)
+                (isDragging ? Color.accent : isInvalid ? Color.red.opacity(0.6) : Color.white.opacity(0.35))
+                    .frame(width: isDragging ? 2 : 1)
             }
             .overlay(alignment: .leading) {
                 if chipWidth >= 8 {

@@ -3,8 +3,12 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['dawtool', 'dawtool.daw', 'dawtool.daw.ableton', 'pyexpat', 'xml.parsers.expat', 'lxml', 'lxml.etree', 'hexdump']
+hiddenimports = ['dawtool', 'dawtool.daw', 'dawtool.daw.ableton', 'pyexpat', 'xml.parsers.expat', 'lxml', 'lxml.etree', 'hexdump', 'librosa', 'numba']
 tmp_ret = collect_all('lxml')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('librosa')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('numba')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

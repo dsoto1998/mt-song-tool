@@ -807,6 +807,7 @@ def parse_file(path):
              # (dawtool strips them, which would hide extra-space locator errors).
              "text": locator_data[i][2] if i < len(locator_data) else m.text,
              "als_id": locator_data[i][0] if i < len(locator_data) else "",
+             "beat": locator_data[i][1] if i < len(locator_data) else 0.0,
              "off_beat": False}  # updated below after ts_events are computed
             for i, m in enumerate(proj.markers)
         ]
@@ -913,6 +914,31 @@ def parse_file(path):
         except Exception:
             tempo_events = []
 
+        # Compute timecodes for each tempo event using beat-to-seconds arithmetic.
+        # We do this ourselves (not via proj._calc_beat_real_time) because we bypass
+        # dawtool's tempo parsing for correctness on sessions with FloatEvent automation.
+        _te_times = []
+        _running = 0.0
+        for _i, (_b, _bpm) in enumerate(tempo_events):
+            if _i == 0:
+                _te_times.append(0.0)
+            else:
+                _prev_b, _prev_bpm = tempo_events[_i - 1]
+                _running += (_b - _prev_b) * 60.0 / _prev_bpm
+                _te_times.append(_running)
+
+        # Identify ramp pairs (same logic as _check_tempo_ramps)
+        _STEP_TOL = 0.01
+        _VAL_TOL = 1e-6
+        _ramp_starts = set()
+        _ramp_ends = set()
+        for _i in range(len(tempo_events) - 1):
+            _b0, _v0 = tempo_events[_i]
+            _b1, _v1 = tempo_events[_i + 1]
+            if abs(_v1 - _v0) > _VAL_TOL and (_b1 - _b0) > _STEP_TOL:
+                _ramp_starts.add(_i)
+                _ramp_ends.add(_i + 1)
+
         return json.dumps({
             "error": None,
             "file": os.path.basename(path),
@@ -927,7 +953,11 @@ def parse_file(path):
             "session_info": validation["session_info"],
             "expected_duration": expected_duration,
             "first_tempo_change_marker_index": first_tempo_change_marker_index,
-            "tempo_events": tempo_events,
+            "tempo_events": [
+                {"time": fmt_time(_te_times[i]), "bpm": v, "beat": b,
+                 "is_ramp_start": i in _ramp_starts, "is_ramp_end": i in _ramp_ends}
+                for i, (b, v) in enumerate(tempo_events)
+            ],
         })
 
     except FileNotFoundError:
@@ -944,9 +974,11 @@ def run_server():
       - Repeat until stdin closes
     Pre-imports dawtool so parsing is instant.
     """
-    # Pre-import everything so first parse is fast
+    # Pre-import everything so first parse/detect is fast
     import dawtool  # noqa
     from dawtool import load_project  # noqa
+    import librosa  # noqa — pre-warm for detect_key
+    import numpy  # noqa
 
     # Signal ready
     print(json.dumps({"ready": True}), flush=True)

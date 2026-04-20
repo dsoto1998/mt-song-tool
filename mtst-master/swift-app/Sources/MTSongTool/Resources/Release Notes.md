@@ -1,4 +1,4 @@
-# MT Song Tool — v1.4.0
+# MT Song Tool — v1.4.1
 
 ## Features
 
@@ -22,6 +22,12 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.4.1 — April 15, 2026
+
+#### QA Tab
+
+- **Improved Song Key accuracy** — Key detection now uses bass pitch tracking (PYIN) alongside harmonic analysis to correctly identify the tonic in modal keys (e.g. D Mixolydian now returns D instead of G). Also switched to a more accurate chroma algorithm (CQT-based) that handles songs with accidentals more reliably, and extended the analysis window from 60 to 120 seconds.
 
 ### v1.4.0 — April 15, 2026
 

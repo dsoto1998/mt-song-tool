@@ -19,6 +19,7 @@ struct BeatInfo {
     let isDownbeat: Bool
     var isSubdivisionTick: Bool = false   // true for eighth-note "and" positions
     var isSecondaryAccent: Bool = false   // true for group-downbeat beats (e.g. beat 4 in 6/8, beat 3 in 4/4)
+    var absoluteBeat: Double = 0          // Ableton beat position (cumulative from session start)
 }
 
 // MARK: - MetronomeService
@@ -169,7 +170,7 @@ class MetronomeService: ObservableObject {
         var effectiveTempoEvents = tempoEvents
         if effectiveTempoEvents.isEmpty, let bpm = staticBPM, bpm > 0 {
             Log("buildSchedule — no tempo events; using staticBPM=\(bpm)", "Metronome")
-            effectiveTempoEvents = [TempoEvent(beat: 0, bpm: bpm)]
+            effectiveTempoEvents = [TempoEvent(beat: 0, bpm: bpm, time: "00:00:000")]
         }
         // Stable sort preserving XML order for equal beat positions, then
         // deduplicate step changes (two events at the same beat) by keeping only
@@ -260,7 +261,8 @@ class MetronomeService: ObservableObject {
                 beat: beatInBar,
                 isDownbeat: isDownbeat,
                 isSubdivisionTick: isSubTick,
-                isSecondaryAccent: isSecAcc
+                isSecondaryAccent: isSecAcc,
+                absoluteBeat: beatNumber
             ))
 
             if !isSubTick {

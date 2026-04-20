@@ -18,6 +18,7 @@ struct AudioSegment: Identifiable {
 struct StemState {
     var isMuted: Bool = false
     var isSoloed: Bool = false
+    var isExcluded: Bool = false   // stem hidden from timeline and omitted from export
     var gain: Float = 1.0          // live monitoring gain (non-destructive)
     var peaks: [Float] = []        // waveform peaks — 1 per 512 samples (~86/sec at 44.1kHz)
     var duration: Double = 0.0     // audio file duration in seconds
@@ -70,6 +71,13 @@ struct StemState {
 
 // MARK: - EditPlayerService
 
+// MARK: - Session model
+
+struct LocatorOverride {
+    var name: String?
+    var beat: Double?
+}
+
 @MainActor
 class EditPlayerService: ObservableObject {
     @Published var isPlaying: Bool = false
@@ -78,8 +86,66 @@ class EditPlayerService: ObservableObject {
     @Published var masterPeakDB: Float = -96.0
     @Published var meterLevels: [URL: Float] = [:]   // per-stem peak dBFS — updated at ~43 Hz, separate from stemStates
     @Published var totalDuration: Double = 0
+    @Published var isNormalizing: Bool = false
     /// Published whenever playback (re)starts — EditView observes this to re-anchor the metronome.
     @Published var playAnchor: PlayAnchor? = nil
+
+    // MARK: - Session state
+    @Published var locatorOverrides: [String: LocatorOverride] = [:]
+    @Published var isSessionDirty: Bool = false
+
+    func moveLocator(alsId: String, toBeat beat: Double) {
+        var override = locatorOverrides[alsId] ?? LocatorOverride()
+        override.beat = beat
+        locatorOverrides[alsId] = override
+        isSessionDirty = true
+    }
+
+    func renameLocator(alsId: String, to name: String) {
+        var override = locatorOverrides[alsId] ?? LocatorOverride()
+        override.name = name
+        locatorOverrides[alsId] = override
+        isSessionDirty = true
+    }
+
+    func clearSession() {
+        locatorOverrides = [:]
+        isSessionDirty = false
+    }
+
+    // MARK: - Undo / Redo
+    @Published var canUndo: Bool = false
+    @Published var canRedo: Bool = false
+    private var undoStack: [[URL: StemState]] = []
+    private var redoStack: [[URL: StemState]] = []
+    private let maxUndoSteps = 30
+
+    /// Call before any mutating edit operation to save a restorable snapshot.
+    func saveUndoSnapshot() {
+        undoStack.append(stemStates)
+        if undoStack.count > maxUndoSteps { undoStack.removeFirst() }
+        redoStack = []
+        canUndo = true
+        canRedo = false
+    }
+
+    func undo() {
+        guard let snapshot = undoStack.popLast() else { return }
+        if isPlaying { stop() }
+        redoStack.append(stemStates)
+        stemStates = snapshot
+        canUndo = !undoStack.isEmpty
+        canRedo = true
+    }
+
+    func redo() {
+        guard let snapshot = redoStack.popLast() else { return }
+        if isPlaying { stop() }
+        undoStack.append(stemStates)
+        stemStates = snapshot
+        canUndo = true
+        canRedo = !redoStack.isEmpty
+    }
 
     let engine = AVAudioEngine()   // internal — MetronomeService attaches its playerNode here
     private var playerNodes: [URL: AVAudioPlayerNode] = [:]
@@ -345,7 +411,7 @@ class EditPlayerService: ObservableObject {
         let soloActive = stemStates.values.contains { $0.isSoloed }
         for url in stemURLs {
             guard let mixer = stemMixers[url], let state = stemStates[url] else { continue }
-            let effectiveMute = state.isMuted || (soloActive && !state.isSoloed)
+            let effectiveMute = state.isExcluded || state.isMuted || (soloActive && !state.isSoloed)
             mixer.outputVolume = effectiveMute ? 0 : state.gain
         }
     }
@@ -392,8 +458,78 @@ class EditPlayerService: ObservableObject {
         stemStates[url]?.deleteRegion(lo: lo, hi: hi)
     }
 
+    func removeStem(_ url: URL) {
+        saveUndoSnapshot()
+        stemStates[url]?.isExcluded = true
+        applyMixerVolumes()
+    }
+
     func moveRegion(_ url: URL, lo: Double, hi: Double, to newStart: Double) {
         stemStates[url]?.moveRegion(lo: lo, hi: hi, to: newStart)
+    }
+
+    // MARK: - Trim
+
+    /// Trims the left (start) edge of a specific segment — moves sessionStart + sourceStart by delta.
+    func trimSegmentLeft(id: UUID, delta: Double) {
+        guard let url = stemURLs.first(where: { stemStates[$0]?.segments.contains(where: { $0.id == id }) == true }),
+              var state = stemStates[url],
+              let idx = state.segments.firstIndex(where: { $0.id == id }) else { return }
+        let seg = state.segments[idx]
+        let newSourceStart = max(0, seg.sourceStart + delta)
+        let newSessionStart = max(0, seg.sessionStart + delta)
+        guard newSourceStart < seg.sourceEnd - 0.01 else { return }
+        state.segments[idx].sourceStart = newSourceStart
+        state.segments[idx].sessionStart = newSessionStart
+        stemStates[url] = state
+    }
+
+    /// Trims the right (end) edge of a specific segment — moves sourceEnd by delta.
+    func trimSegmentRight(id: UUID, delta: Double) {
+        guard let url = stemURLs.first(where: { stemStates[$0]?.segments.contains(where: { $0.id == id }) == true }),
+              var state = stemStates[url],
+              let idx = state.segments.firstIndex(where: { $0.id == id }) else { return }
+        let seg = state.segments[idx]
+        let newSourceEnd = min(state.duration, seg.sourceEnd + delta)
+        guard newSourceEnd > seg.sourceStart + 0.01 else { return }
+        state.segments[idx].sourceEnd = newSourceEnd
+        stemStates[url] = state
+    }
+
+    /// Trims the left edge of every segment whose ID is in `ids` — for multi-clip simultaneous trim.
+    func trimSegmentsLeft(ids: Set<UUID>, delta: Double) {
+        for url in stemURLs {
+            guard var state = stemStates[url] else { continue }
+            var changed = false
+            for idx in state.segments.indices {
+                guard ids.contains(state.segments[idx].id) else { continue }
+                let seg = state.segments[idx]
+                let newSourceStart = max(0, seg.sourceStart + delta)
+                let newSessionStart = max(0, seg.sessionStart + delta)
+                guard newSourceStart < seg.sourceEnd - 0.01 else { continue }
+                state.segments[idx].sourceStart = newSourceStart
+                state.segments[idx].sessionStart = newSessionStart
+                changed = true
+            }
+            if changed { stemStates[url] = state }
+        }
+    }
+
+    /// Trims the right edge of every segment whose ID is in `ids` — for multi-clip simultaneous trim.
+    func trimSegmentsRight(ids: Set<UUID>, delta: Double) {
+        for url in stemURLs {
+            guard var state = stemStates[url] else { continue }
+            var changed = false
+            for idx in state.segments.indices {
+                guard ids.contains(state.segments[idx].id) else { continue }
+                let seg = state.segments[idx]
+                let newSourceEnd = min(state.duration, seg.sourceEnd + delta)
+                guard newSourceEnd > seg.sourceStart + 0.01 else { continue }
+                state.segments[idx].sourceEnd = newSourceEnd
+                changed = true
+            }
+            if changed { stemStates[url] = state }
+        }
     }
 
     /// Shifts all segments of the given stem by `delta` seconds.
@@ -499,6 +635,151 @@ class EditPlayerService: ObservableObject {
                 let asset = AVURLAsset(url: url)
                 let duration = CMTimeGetSeconds(asset.duration)
                 continuation.resume(returning: duration)
+            }
+        }
+    }
+
+    // MARK: - Normalization
+
+    /// Stems excluded from collective normalization (reference / fixed-level stems).
+    private static let lockedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
+
+    private var collectiveURLs: [URL] {
+        stemURLs.filter { url in
+            let name = url.deletingPathExtension().lastPathComponent.uppercased()
+            return !Self.lockedStemNames.contains(name)
+        }
+    }
+
+    var hasCollectiveStems: Bool { !collectiveURLs.isEmpty }
+
+    /// Scans the mixed collective stems for true peak using 4x oversampling.
+    /// Uses streaming AVAudioConverter so the polyphase FIR filter state stays warm across chunks.
+    /// Returns linear peak amplitude (not dB).
+    private static func scanCollectiveMixTruePeak(urls: [URL], gains: [URL: Float]) async -> Float {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let chunkFrames = AVAudioFrameCount(4096)
+                let oversampleFactor = 4
+
+                // Open all files; use format of first file as mix format.
+                let files = urls.compactMap { try? AVAudioFile(forReading: $0) }
+                guard let firstFile = files.first else { continuation.resume(returning: 0); return }
+
+                let srcFormat = firstFile.processingFormat
+                let sampleRate = srcFormat.sampleRate
+                let channelCount = srcFormat.channelCount
+
+                guard let dstFormat = AVAudioFormat(
+                    standardFormatWithSampleRate: sampleRate * Double(oversampleFactor),
+                    channels: channelCount
+                ) else { continuation.resume(returning: 0); return }
+
+                guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
+                    continuation.resume(returning: 0); return
+                }
+
+                let dstCapacity = chunkFrames * AVAudioFrameCount(oversampleFactor)
+                guard let dstChunk = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: dstCapacity),
+                      let mixChunk = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: chunkFrames)
+                else { continuation.resume(returning: 0); return }
+
+                let totalFrames = Int64(firstFile.length)
+                var framesProcessed = Int64(0)
+                var allTimePeak: Float = 0
+
+                // Streaming convert: single converter instance, .endOfStream only when exhausted.
+                while true {
+                    dstChunk.frameLength = 0
+                    var convError: NSError?
+                    let status = converter.convert(to: dstChunk, error: &convError) { _, outStatus in
+                        guard framesProcessed < totalFrames else {
+                            outStatus.pointee = .endOfStream
+                            return nil
+                        }
+                        let toProcess = AVAudioFrameCount(min(Int64(chunkFrames), totalFrames - framesProcessed))
+
+                        // Zero mix buffer
+                        mixChunk.frameLength = toProcess
+                        if let ch = mixChunk.floatChannelData {
+                            for c in 0..<Int(channelCount) {
+                                vDSP_vclr(ch[c], 1, vDSP_Length(toProcess))
+                            }
+                        }
+
+                        // Accumulate each stem (gain-scaled) into mix buffer
+                        for (file, url) in zip(files, urls) {
+                            let gain = gains[url] ?? 1.0
+                            let framePos = Int64(Double(framesProcessed) * (file.processingFormat.sampleRate / srcFormat.sampleRate))
+                            if let readBuf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: toProcess) {
+                                file.framePosition = framePos
+                                _ = try? file.read(into: readBuf, frameCount: toProcess)
+                                if let src = readBuf.floatChannelData, let dst = mixChunk.floatChannelData {
+                                    for c in 0..<Int(channelCount) {
+                                        var g = gain
+                                        vDSP_vsma(src[c], 1, &g, dst[c], 1, dst[c], 1, vDSP_Length(toProcess))
+                                    }
+                                }
+                            }
+                        }
+
+                        framesProcessed += Int64(toProcess)
+                        outStatus.pointee = .haveData
+                        return mixChunk
+                    }
+
+                    // Measure peak of this upsampled chunk
+                    if let ch = dstChunk.floatChannelData {
+                        for c in 0..<Int(dstChunk.format.channelCount) {
+                            var peak: Float = 0
+                            vDSP_maxmgv(ch[c], 1, &peak, vDSP_Length(dstChunk.frameLength))
+                            allTimePeak = max(allTimePeak, peak)
+                        }
+                    }
+
+                    if status != .haveData { break }
+                }
+
+                continuation.resume(returning: allTimePeak)
+            }
+        }
+    }
+
+    /// Normalizes collective stems to −0.01 dBFS true peak and ORIGINAL SONG to −6 dBFS from file peak.
+    func normalizeStems() {
+        guard !isNormalizing else { return }
+        let urls = collectiveURLs
+        guard !urls.isEmpty else { return }
+
+        isNormalizing = true
+        let currentGains = stemURLs.reduce(into: [URL: Float]()) { $0[$1] = stemStates[$1]?.gain ?? 1.0 }
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let peak = await Self.scanCollectiveMixTruePeak(urls: urls, gains: currentGains)
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if peak > 0 {
+                    let targetLinear: Float = pow(10, -0.01 / 20)   // −0.01 dBFS
+                    let multiplier = targetLinear / peak
+                    for url in urls {
+                        let newGain = (self.stemStates[url]?.gain ?? 1.0) * multiplier
+                        self.setGain(url, newGain)
+                    }
+                }
+
+                // Normalize ORIGINAL SONG to −6 dBFS from raw file peak
+                let ogName = "ORIGINAL SONG"
+                if let ogURL = self.stemURLs.first(where: {
+                    $0.deletingPathExtension().lastPathComponent.uppercased() == ogName
+                }), let ogPeaks = self.stemStates[ogURL]?.peaks, let filePeak = ogPeaks.max(), filePeak > 0 {
+                    let ogTarget: Float = pow(10, -6.0 / 20)
+                    let ogMultiplier = ogTarget / filePeak
+                    self.setGain(ogURL, (self.stemStates[ogURL]?.gain ?? 1.0) * ogMultiplier)
+                }
+
+                self.isNormalizing = false
             }
         }
     }

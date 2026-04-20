@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import AVFoundation
 
 @MainActor
 final class AudioShakeService: ObservableObject {
@@ -39,6 +40,8 @@ final class AudioShakeService: ObservableObject {
         let id = UUID()
         let model: String
         let url: URL
+        var waveformPeaks: [Float] = []
+        var duration: Double = 0
 
         var displayName: String {
             AudioShakeService.allModels.first { $0.id == model }?.label ?? model
@@ -71,14 +74,26 @@ final class AudioShakeService: ObservableObject {
 
     nonisolated static let modelGroups = ["Vocals", "Core", "Guitar", "Keys", "Other"]
 
+    /// Default stem selection — shown blue in the UI on launch and after Clear All.
+    nonisolated static let defaultModels: Set<String> = [
+        "vocals_lead", "vocals_backing",
+        "drums", "bass",
+        "guitar", "guitar_electric", "guitar_acoustic",
+        "piano", "keys",
+        "strings", "wind", "other-x-guitar"
+    ]
+
     // MARK: - Published
 
     @Published var phase: Phase = .idle
     @Published var results: [StemResult] = []
+    @Published var extractionPhase: Phase = .idle
+    @Published var extractingURL: URL? = nil
 
     // MARK: - Private
 
     private var runTask: Task<Void, Never>?
+    private var extractionTask: Task<Void, Never>?
     private let baseURL = "https://api.audioshake.ai"
     private let urlSession = URLSession.shared
     private var logHandle: FileHandle?
@@ -107,8 +122,20 @@ final class AudioShakeService: ObservableObject {
 
     func reset() {
         cancel()
+        extractionTask?.cancel()
+        extractionTask = nil
         results = []
         phase = .idle
+        extractionPhase = .idle
+        extractingURL = nil
+    }
+
+    func runPianoExtraction(from url: URL, outputFolder: URL) {
+        extractionTask?.cancel()
+        extractingURL = url
+        openLogFile()
+        log("=== Piano extraction started from: \(url.lastPathComponent) ===")
+        extractionTask = Task { await _runPianoExtraction(fileURL: url, outputFolder: outputFolder) }
     }
 
     // MARK: - Core
@@ -121,9 +148,31 @@ final class AudioShakeService: ObservableObject {
             return
         }
         do {
+            // Convert FLAC → WAV before upload (AudioShake does not support FLAC)
+            var uploadURL = fileURL
+            var tempWAV: URL? = nil
+            if fileURL.pathExtension.lowercased() == "flac" {
+                phase = .uploading
+                log("Converting FLAC to WAV before upload…")
+                let converted = await Task.detached(priority: .userInitiated) {
+                    guard let ffmpeg = AudioAnalyzerService.ffmpegPath() else { return Optional<URL>.none }
+                    return AudioShakeService.convertFlacToWav(url: fileURL, ffmpegPath: ffmpeg)
+                }.value
+                guard let wav = converted else {
+                    log("ERROR: FLAC → WAV conversion failed")
+                    closeLogFile()
+                    phase = .failed("Could not convert FLAC to WAV before upload.")
+                    return
+                }
+                log("FLAC converted → \(wav.lastPathComponent)")
+                uploadURL = wav
+                tempWAV = wav
+            }
+            defer { if let t = tempWAV { try? FileManager.default.removeItem(at: t) } }
+
             phase = .uploading
-            log("Uploading asset: \(fileURL.lastPathComponent)")
-            let assetId = try await uploadAsset(fileURL: fileURL, apiKey: apiKey)
+            log("Uploading asset: \(uploadURL.lastPathComponent)")
+            let assetId = try await uploadAsset(fileURL: uploadURL, apiKey: apiKey)
             log("Asset uploaded — assetId: \(assetId)")
             try Task.checkCancellation()
 
@@ -143,6 +192,7 @@ final class AudioShakeService: ObservableObject {
             for t in errored { log("  ERROR target: \(t.model) status=\(t.status)") }
 
             var stemResults: [StemResult] = []
+            var pcmErrors: [String] = []
 
             for (i, target) in completed.enumerated() {
                 let wavOutput = target.outputs?.first(where: { $0.format == "wav" })
@@ -154,18 +204,39 @@ final class AudioShakeService: ObservableObject {
                 }
                 try Task.checkCancellation()
                 phase = .downloading(i, completed.count)
-                let dest = outputFolder.appendingPathComponent("\(target.model).wav")
-                log("Downloading [\(i+1)/\(completed.count)] \(target.model) from \(dlURL.lastPathComponent)")
+                let displayName = Self.allModels.first { $0.id == target.model }?.label ?? target.model
+                let dest = outputFolder.appendingPathComponent("\(displayName).wav")
+                log("Downloading [\(i+1)/\(completed.count)] \(target.model) → \(displayName).wav from \(dlURL.lastPathComponent)")
                 try await downloadFile(from: dlURL, to: dest)
                 log("  Saved → \(dest.path)")
-                stemResults.append(StemResult(model: target.model, url: dest))
+                // Convert to 24-bit PCM so Ableton can import it (AudioShake outputs 32-bit float)
+                let (pcmOK, pcmErr) = await Task.detached(priority: .userInitiated) {
+                    guard let ffmpeg = AudioAnalyzerService.ffmpegPath() else {
+                        return (false, "FFmpeg not found")
+                    }
+                    return AudioShakeService.convertToPCM24(url: dest, ffmpegPath: ffmpeg)
+                }.value
+                if !pcmOK {
+                    log("  WARN: PCM conversion failed for \(dest.lastPathComponent): \(pcmErr)")
+                    pcmErrors.append(dest.lastPathComponent)
+                }
+                let (peaks, dur) = await Task.detached(priority: .userInitiated) {
+                    AudioShakeService.extractPeaks(url: dest)
+                }.value
+                stemResults.append(StemResult(model: target.model, url: dest,
+                                              waveformPeaks: peaks, duration: dur))
                 phase = .downloading(i + 1, completed.count)
             }
 
             results = stemResults
             log("=== Run complete — \(stemResults.count)/\(models.count) stems saved ===")
             closeLogFile()
-            phase = .done
+            if pcmErrors.isEmpty {
+                phase = .done
+            } else {
+                let names = pcmErrors.joined(separator: ", ")
+                phase = .failed("Format conversion failed for \(names) — re-encode to 24-bit PCM before importing into Ableton.")
+            }
         } catch is CancellationError {
             log("Run cancelled (CancellationError)")
             closeLogFile()
@@ -175,6 +246,125 @@ final class AudioShakeService: ObservableObject {
             closeLogFile()
             phase = .failed(error.localizedDescription)
         }
+    }
+
+    // MARK: - Piano extraction
+
+    private func _runPianoExtraction(fileURL: URL, outputFolder: URL) async {
+        guard let apiKey = CredentialStore.load(key: CredentialStore.audioShakeAPIKeyKey), !apiKey.isEmpty else {
+            log("ERROR: No API key configured")
+            closeLogFile()
+            extractionPhase = .failed("No API key — add one in Settings.")
+            extractingURL = nil
+            return
+        }
+        do {
+            extractionPhase = .uploading
+            log("Uploading stem for re-separation: \(fileURL.lastPathComponent)")
+            let assetId = try await uploadAsset(fileURL: fileURL, apiKey: apiKey)
+            log("Asset uploaded — assetId: \(assetId)")
+            try Task.checkCancellation()
+
+            extractionPhase = .processing("Queuing…")
+            let taskId = try await createResidualTask(assetId: assetId, apiKey: apiKey)
+            log("Residual task created — taskId: \(taskId)")
+            try Task.checkCancellation()
+
+            log("Polling for completion…")
+            let taskResponse = try await pollUntilDone(taskId: taskId, apiKey: apiKey)
+            try Task.checkCancellation()
+
+            guard let pianoTarget = taskResponse.targets.first(where: { $0.model == "piano" && $0.status == "completed" }),
+                  let outputs = pianoTarget.outputs, !outputs.isEmpty else {
+                throw NSError(domain: "AudioShake", code: 0,
+                              userInfo: [NSLocalizedDescriptionKey: "No completed piano output in response"])
+            }
+
+            var newResults: [StemResult] = []
+            var pcmErrors: [String] = []
+
+            // Output 0 → isolated piano from the re-uploaded stem
+            if let dlURL = URL(string: outputs[0].url) {
+                extractionPhase = .downloading(0, outputs.count)
+                let dest = outputFolder.appendingPathComponent("Piano (from Other-Guitar).wav")
+                log("Downloading piano stem → \(dest.lastPathComponent)")
+                try await downloadFile(from: dlURL, to: dest)
+                let (pcmOK, pcmErr) = await Task.detached(priority: .userInitiated) {
+                    guard let ffmpeg = AudioAnalyzerService.ffmpegPath() else { return (false, "FFmpeg not found") }
+                    return AudioShakeService.convertToPCM24(url: dest, ffmpegPath: ffmpeg)
+                }.value
+                if !pcmOK {
+                    log("  WARN: PCM conversion failed for \(dest.lastPathComponent): \(pcmErr)")
+                    pcmErrors.append(dest.lastPathComponent)
+                }
+                let (peaks, dur) = await Task.detached(priority: .userInitiated) {
+                    AudioShakeService.extractPeaks(url: dest)
+                }.value
+                newResults.append(StemResult(model: "Piano (from Other-Guitar)", url: dest,
+                                             waveformPeaks: peaks, duration: dur))
+                extractionPhase = .downloading(1, outputs.count)
+            }
+
+            // Output 1 (residual) → other-x-guitar minus piano
+            if outputs.count > 1, let dlURL = URL(string: outputs[1].url) {
+                extractionPhase = .downloading(1, outputs.count)
+                let dest = outputFolder.appendingPathComponent("Other-Guitar (no Piano).wav")
+                log("Downloading residual stem → \(dest.lastPathComponent)")
+                try await downloadFile(from: dlURL, to: dest)
+                let (pcmOK, pcmErr) = await Task.detached(priority: .userInitiated) {
+                    guard let ffmpeg = AudioAnalyzerService.ffmpegPath() else { return (false, "FFmpeg not found") }
+                    return AudioShakeService.convertToPCM24(url: dest, ffmpegPath: ffmpeg)
+                }.value
+                if !pcmOK {
+                    log("  WARN: PCM conversion failed for \(dest.lastPathComponent): \(pcmErr)")
+                    pcmErrors.append(dest.lastPathComponent)
+                }
+                let (peaks, dur) = await Task.detached(priority: .userInitiated) {
+                    AudioShakeService.extractPeaks(url: dest)
+                }.value
+                newResults.append(StemResult(model: "Other-Guitar (no Piano)", url: dest,
+                                             waveformPeaks: peaks, duration: dur))
+                extractionPhase = .downloading(2, outputs.count)
+            } else {
+                log("NOTE: Only one output received — residual may not be in output[1]. Check raw log above.")
+            }
+
+            results.append(contentsOf: newResults)
+            log("=== Piano extraction complete — \(newResults.count) stem(s) added ===")
+            closeLogFile()
+            if pcmErrors.isEmpty {
+                extractionPhase = .done
+            } else {
+                let names = pcmErrors.joined(separator: ", ")
+                extractionPhase = .failed("Format conversion failed for \(names) — re-encode to 24-bit PCM before importing into Ableton.")
+            }
+            extractingURL = nil
+        } catch is CancellationError {
+            log("Extraction cancelled (CancellationError)")
+            closeLogFile()
+            extractingURL = nil
+        } catch {
+            log("ERROR: \(error.localizedDescription)")
+            log("=== Piano extraction failed ===")
+            closeLogFile()
+            extractionPhase = .failed(error.localizedDescription)
+            extractingURL = nil
+        }
+    }
+
+    private func createResidualTask(assetId: String, apiKey: String) async throws -> String {
+        let url = URL(string: "\(baseURL)/tasks")!
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let targets: [[String: Any]] = [["model": "piano", "formats": ["wav"], "residual": true]]
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["assetId": assetId, "targets": targets])
+
+        let (data, response) = try await urlSession.data(for: req)
+        try checkHTTP(response, data)
+        return try JSONDecoder().decode(TaskCreatedResponse.self, from: data).id
     }
 
     // MARK: - API calls
@@ -242,6 +432,95 @@ final class AudioShakeService: ObservableObject {
         let fm = FileManager.default
         if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
         try fm.moveItem(at: tmp, to: dest)
+    }
+
+    /// Extracts 500 normalized (0–1) amplitude peaks and duration from an audio file.
+    /// Runs off the main thread — call via Task.detached.
+    nonisolated static func extractPeaks(url: URL) -> ([Float], Double) {
+        guard let file = try? AVAudioFile(forReading: url) else { return ([], 0) }
+        let format = file.processingFormat
+        let duration = Double(file.length) / format.sampleRate
+        let targetPoints = 500
+        var peaks = [Float](repeating: 0, count: targetPoints)
+        let chunkSize: AVAudioFrameCount = 8192
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkSize) else {
+            return ([], duration)
+        }
+        let totalFrames = file.length
+        let channelCount = Int(format.channelCount)
+        while file.framePosition < file.length {
+            let framePos = file.framePosition
+            guard (try? file.read(into: buffer)) != nil else { break }
+            guard let channelData = buffer.floatChannelData else { break }
+            let frameCount = Int(buffer.frameLength)
+            for f in 0..<frameCount {
+                let bucket = min(
+                    Int(Double(framePos + AVAudioFramePosition(f)) / Double(totalFrames) * Double(targetPoints)),
+                    targetPoints - 1
+                )
+                var maxSample: Float = 0
+                for ch in 0..<channelCount {
+                    let s = abs(channelData[ch][f])
+                    if s > maxSample { maxSample = s }
+                }
+                if maxSample > peaks[bucket] { peaks[bucket] = maxSample }
+            }
+        }
+        if let maxPeak = peaks.max(), maxPeak > 0 {
+            peaks = peaks.map { $0 / maxPeak }
+        }
+        return (peaks, duration)
+    }
+
+    /// Converts a FLAC file to a temporary WAV in the system temp directory.
+    /// Returns the temp WAV URL on success, or nil on failure.
+    /// Caller is responsible for deleting the temp file when done.
+    nonisolated private static func convertFlacToWav(url: URL, ffmpegPath: String) -> URL? {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + "_audioshake.wav")
+        try? FileManager.default.removeItem(at: tmp)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpegPath)
+        proc.arguments = ["-hide_banner", "-loglevel", "error", "-y", "-i", url.path, tmp.path]
+        do { try proc.run(); proc.waitUntilExit() } catch { return nil }
+        return proc.terminationStatus == 0 ? tmp : nil
+    }
+
+    /// Converts a WAV file to 24-bit integer PCM in-place using FFmpeg.
+    /// Preserves original sample rate. On success, replaces the file at `url`.
+    /// On failure, leaves the original file intact and returns an error message.
+    nonisolated private static func convertToPCM24(url: URL, ffmpegPath: String) -> (Bool, String) {
+        let tmp = url.deletingPathExtension().appendingPathExtension("_pcm24tmp.wav")
+        try? FileManager.default.removeItem(at: tmp)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpegPath)
+        proc.arguments = [
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", url.path,
+            "-c:a", "pcm_s24le",
+            tmp.path
+        ]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        do { try proc.run(); proc.waitUntilExit() } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return (false, error.localizedDescription)
+        }
+        guard proc.terminationStatus == 0 else {
+            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                ?? "Unknown FFmpeg error"
+            try? FileManager.default.removeItem(at: tmp)
+            return (false, msg.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.moveItem(at: tmp, to: url)
+            return (true, "")
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return (false, error.localizedDescription)
+        }
     }
 
     private func checkHTTP(_ response: URLResponse, _ data: Data) throws {
@@ -312,9 +591,19 @@ private struct TargetStatus: Decodable {
     let model: String
     let status: String
     let outputs: [OutputFile]?
+
+    enum CodingKeys: String, CodingKey {
+        case model, status
+        case outputs = "output"
+    }
 }
 
 private struct OutputFile: Decodable {
     let format: String
     let url: String
+
+    enum CodingKeys: String, CodingKey {
+        case format
+        case url = "link"
+    }
 }

@@ -11,15 +11,17 @@ struct AudioAnalysisView: View {
     var expectedDuration: Double? = nil     // passed from ContentView via parser.result
     @Binding var isMinimized: Bool          // lifted to ContentView so re-parses don't reset it
     var quickCheckMode: Bool = false        // when true, missing stems don't show red border
+    var jamNightMode: Bool = false          // when true, only ORIGINAL SONG is required
     @State private var isTargeted = false
     @State private var isHovering = false
     @State private var showConvertConfirm = false
     @State private var showFixNamesConfirm = false
     private let scrollAreaHeight: CGFloat = 256  // 8 rows × 32pt
 
-    // Required stems in fixed display order; GUIDE omitted when rehearsalMixOnly
+    // Required stems in fixed display order
     private var requiredStems: [String] {
-        rehearsalMixOnly
+        if jamNightMode { return ["ORIGINAL SONG"] }
+        return rehearsalMixOnly
             ? ["CLICK TRACK", "ORIGINAL SONG"]
             : ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
     }
@@ -114,13 +116,15 @@ struct AudioAnalysisView: View {
                 errorView(message: err)
             } else if !analyzer.results.isEmpty {
                 if !isMinimized {
+                    collapseToggleView
                     ScrollView(.vertical, showsIndicators: true) {
                         resultsListView
                     }
                     .frame(height: scrollAreaHeight)
                     .transition(.opacity.combined(with: .move(edge: .top)))
+                } else {
+                    collapseToggleView
                 }
-                collapseToggleView
             } else {
                 dropZoneView
             }
@@ -172,18 +176,50 @@ struct AudioAnalysisView: View {
         .animation(.easeOut(duration: 0.12), value: isTargeted)
         .contentShape(Rectangle())
         .onHover { h in withAnimation(.easeOut(duration: 0.12)) { isHovering = h } }
-        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { providers in
+        .onDrop(of: [UTType.fileURL, .folder], isTargeted: $isTargeted) { providers in
             guard let provider = providers.first else { return false }
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            // loadItem(forTypeIdentifier:) required on macOS — Finder delivers folder URLs as
+            // bookmark Data via public.file-url; loadObject(ofClass: URL.self) returns nil for folders.
+            let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                ? UTType.fileURL.identifier : "public.folder"
+            Log("provider types=\(provider.registeredTypeIdentifiers) → loading as \(typeId)", "StemDrop")
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, error in
+                Log("loadItem: itemType=\(type(of: item)) error=\(String(describing: error))", "StemDrop")
                 DispatchQueue.main.async {
                     var url: URL?
-                    if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                    else if let u = item as? URL { url = u }
+                    if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else if let u = item as? NSURL {
+                        url = u as URL
+                    } else if let u = item as? URL {
+                        url = u
+                    }
+                    Log("resolved url=\(url?.path ?? "nil")", "StemDrop")
                     guard let url else { return }
                     var isDir: ObjCBool = false
-                    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return }
-                    analyzer.expectedDuration = expectedDuration
-                    analyzer.analyze(folder: url)
+                    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+                        Log("not a directory or not found: \(url.path)", "StemDrop")
+                        return
+                    }
+                    let fm = FileManager.default
+                    let items = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
+                    if items.contains(where: { $0.pathExtension.lowercased() == "wav" }) {
+                        analyzer.expectedDuration = expectedDuration
+                        analyzer.analyze(folder: url)
+                    } else {
+                        let subfolders = items.filter { item in
+                            var isSubDir: ObjCBool = false
+                            fm.fileExists(atPath: item.path, isDirectory: &isSubDir)
+                            return isSubDir.boolValue
+                        }
+                        if let stemsDir = subfolders.first(where: { dir in
+                            let contents = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
+                            return contents.contains { $0.pathExtension.lowercased() == "wav" }
+                        }) {
+                            analyzer.expectedDuration = expectedDuration
+                            analyzer.analyze(folder: stemsDir)
+                        }
+                    }
                 }
             }
             return true
@@ -369,7 +405,7 @@ struct MissingStemRow: View {
 
 // MARK: - Waveform seek control
 
-private struct WaveformSeekView: View {
+struct WaveformSeekView: View {
     let peaks: [Float]           // normalized 0–1, 500 points
     let progress: Double         // 0–1 current playhead position
     var sectionStart: Double? = nil  // seconds; nil = no active section

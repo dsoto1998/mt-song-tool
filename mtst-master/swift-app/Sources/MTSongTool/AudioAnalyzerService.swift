@@ -763,6 +763,8 @@ class AudioAnalyzerService: ObservableObject {
                 let dest   = workingFolder.appendingPathComponent(result.filename)
                 let state  = stemStates[source] ?? StemState()
 
+                if state.isExcluded { continue }
+
                 let hasSegmentEdits = state.segments.count > 1 ||
                     (state.segments.first.map { $0.sessionStart != 0 } ?? false)
                 let hasOffset  = state.offset != 0

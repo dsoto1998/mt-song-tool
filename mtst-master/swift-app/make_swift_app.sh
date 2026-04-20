@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
 DAWTOOL_ROOT="$(cd .. && pwd)"
@@ -65,8 +65,11 @@ mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
 # Swift binary (main executable)
 cp "$SWIFT_BIN" "$MACOS/MTSongTool"
 
-# Parser directory (bundled alongside main executable)
-cp -R "$PARSER_DIR" "$MACOS/parse_als_dir"
+# Parser directory — in Resources (not MacOS) so codesign doesn't recurse into
+# Python _internal/ and choke on .dist-info dirs / .py files
+cp -R "$PARSER_DIR" "$RESOURCES/parse_als_dir"
+# Strip pip metadata dirs — not needed at runtime, confuse codesign
+find "$RESOURCES/parse_als_dir" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
 
 # Font resources (from shared fonts/ directory)
 FONTS_DIR="$DAWTOOL_ROOT/fonts"
@@ -80,17 +83,6 @@ cp "$FONTS_DIR/Lato-Black.ttf" "$RESOURCES/"
 ICNS="$DAWTOOL_ROOT/sonic.icns"
 if [ -f "$ICNS" ]; then
     cp "$ICNS" "$RESOURCES/AppIcon.icns"
-fi
-
-# Metronome sounds (AIF click files for Edit tab metronome)
-METRO_SRC="$DAWTOOL_ROOT/metronome sounds"
-METRO_DEST="$RESOURCES/metronome"
-if [ -d "$METRO_SRC" ]; then
-    mkdir -p "$METRO_DEST"
-    cp "$METRO_SRC/"*.aif "$METRO_DEST/" 2>/dev/null || true
-    echo "      Resources/metronome/      — metronome click sounds"
-else
-    echo "⚠️   Metronome sounds not found — metronome will use dev fallback path"
 fi
 
 # FFmpeg binary + dylibs (reused from AudioConverter build — enables audio conversion in MTST)
@@ -150,6 +142,44 @@ echo "      Resources/                — fonts + icon"
 echo "      Contents/Frameworks/      — FFmpeg binary + audio codec dylibs"
 echo ""
 
+# ── Remove AppleDouble metadata files ────────────────────────────────────────
+# cp creates ._* files (e.g. ._libvpx.11.dylib) when copying between volumes.
+# These are physical files — NOT extended attributes — so xattr -cr doesn't
+# remove them. codesign treats ._*.dylib as unsigned code objects → the bundle
+# signature becomes invalid and Gatekeeper rejects with "not supported on Mac".
+find "$APP_BUNDLE" -name "._*" -delete
+
+# ── Ad-hoc re-sign the assembled bundle ─────────────────────────────────────
+# SPM signs the binary as a standalone executable (no bundle resources). After
+# we add Resources and Frameworks, that signature is invalid. Re-sign with an
+# ad-hoc identity so macOS accepts it on all machines.
+#
+# Sign order: .so/.dylib extensions first, then main binary, then bundle.
+# We avoid --deep because the PyInstaller _internal/ directory contains
+# .dist-info dirs and .py files that confuse codesign's recursive checker.
+# parse_als_dir lives in Resources/ (not MacOS/) so it is not recursively
+# checked when signing the MacOS/MTSongTool executable.
+echo "==> Signing bundle (ad-hoc)…"
+
+# Sign dylibs inside Frameworks/
+find "$FRAMEWORKS" -type f \( -name "*.dylib" -o -name "ffmpeg" \) | while read f; do
+    codesign --force --sign - "$f" 2>/dev/null
+done
+
+# Sign Python extension modules inside parse_als_dir
+find "$RESOURCES/parse_als_dir" -type f \( -name "*.so" -o -name "*.dylib" \) | while read f; do
+    codesign --force --sign - "$f" 2>/dev/null
+done
+
+# Sign the parse_als executable
+codesign --force --sign - "$RESOURCES/parse_als_dir/parse_als"
+
+# Sign the main Swift binary, then the full bundle (no --deep)
+codesign --force --sign - "$MACOS/MTSongTool"
+codesign --force --sign - "$APP_BUNDLE"
+echo "✅  Bundle signed"
+echo ""
+
 # ── Install directly to /Applications (no sudo needed for admin users) ────────
 echo "==> Installing to /Applications…"
 killall "MT Song Tool" 2>/dev/null || true
@@ -179,12 +209,20 @@ rm -rf "$PKG_SCRIPTS"
 mkdir -p "$PKG_SCRIPTS"
 cat > "$PKG_SCRIPTS/postinstall" << 'POSTINSTALL'
 #!/bin/bash
-# Quit any running instance of MT Song Tool so the new version is used immediately
+APP="/Applications/MT Song Tool.app"
+
+# Quit any running instance so the new version is used immediately
 killall "MT Song Tool" 2>/dev/null || true
 
-# Clear macOS quarantine flag — prevents Gatekeeper translocation which would
-# cause the system to keep launching the old version from a randomized path
-xattr -cr "/Applications/MT Song Tool.app"
+# Clear macOS quarantine flag — the PKG carries the signed bundle; no re-signing
+# needed. Re-signing in postinstall would corrupt the pre-signed bundle if any
+# codesign step fails partway through (which is silent due to error suppression).
+xattr -cr "$APP"
+
+# Fix permissions — pkgbuild installs as root:wheel with 700, making binaries
+# non-executable by the running user (causes "not supported on this Mac" on launch
+# and parser fallback to dev python3 path).
+chmod -R 755 "$APP"
 
 exit 0
 POSTINSTALL
@@ -204,7 +242,7 @@ pkgbuild \
 
 rm -rf "$PKG_STAGING" "$PKG_SCRIPTS"
 
-# Wrap the .pkg + Release Notes in a versioned folder inside a zip
+# Wrap the .pkg + Release Notes + Install helper in a versioned folder inside a zip
 RELEASE_FOLDER="$APP_NAME v$VERSION"
 ZIP_STAGING="/tmp/mtst_zip_staging"
 ZIP_OUT="$VERSIONS_DIR/$RELEASE_FOLDER.zip"
@@ -217,6 +255,30 @@ mkdir -p "$ZIP_STAGING/$RELEASE_FOLDER"
 mv "$PKG_OUT" "$ZIP_STAGING/$RELEASE_FOLDER/"
 [ -f "$RELEASE_NOTES" ] && cp "$RELEASE_NOTES" "$ZIP_STAGING/$RELEASE_FOLDER/"
 
+# Install helper script — handles AirDrop quarantine without needing Developer ID signing.
+# macOS Gatekeeper blocks unsigned .pkg files received via AirDrop with no visible "Open Anyway".
+# A .command file (shell script) shows a plain "are you sure?" dialog instead — user clicks Open,
+# Terminal runs the script, quarantine is stripped from the .pkg, macOS Installer opens normally.
+INSTALL_CMD="$ZIP_STAGING/$RELEASE_FOLDER/Install $APP_NAME.command"
+cat > "$INSTALL_CMD" << 'INSTALLSCRIPT'
+#!/bin/bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG="$(ls "$DIR"/MT\ Song\ Tool*.pkg 2>/dev/null | head -1)"
+
+if [ -z "$PKG" ]; then
+    echo "Error: MT Song Tool .pkg not found next to this script."
+    read -rsp $'Press Enter to close...\n'
+    exit 1
+fi
+
+echo "Removing security quarantine from installer..."
+xattr -d com.apple.quarantine "$PKG" 2>/dev/null || true
+
+echo "Opening installer..."
+open "$PKG"
+INSTALLSCRIPT
+chmod +x "$INSTALL_CMD"
+
 cd "$ZIP_STAGING"
 zip -r "$ZIP_OUT" "$RELEASE_FOLDER"
 cd - > /dev/null
@@ -228,11 +290,11 @@ echo "✅  Distribution zip ready: $ZIP_OUT"
 echo ""
 echo "    Contains: $RELEASE_FOLDER/"
 echo "      ├── $APP_NAME $VERSION.pkg"
+echo "      ├── Install $APP_NAME.command"
 echo "      └── Release Notes.md"
 echo ""
-echo "    Share the zip — recipient unzips and double-clicks the .pkg to install."
+echo "    AirDrop the zip — recipient unzips, then:"
+echo "      • Normal install:  double-click the .pkg"
+echo "      • If blocked:      double-click 'Install $APP_NAME.command' instead"
 echo "    No Python, no FFmpeg, no Homebrew required."
-echo ""
-echo "If macOS says the app is damaged after install, run:"
-echo "  xattr -cr /Applications/\"$APP_NAME\".app"
 echo ""

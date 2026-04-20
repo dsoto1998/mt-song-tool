@@ -13,6 +13,7 @@ struct ContentView: View {
     @ObservedObject private var userSettings = UserSettings.shared
     @State private var copiedMarkers = false
     @State private var copiedSigs = false
+    @State private var copiedTempos = false
     @State private var showSettings = false
     @State private var showLive12Alert = false
     @State private var showOldVersionAlert = false
@@ -99,7 +100,8 @@ struct ContentView: View {
                         analyzer: audioAnalyzer,
                         parsedResult: parser.result,
                         onLocatorFix: { fixes in applyLocatorFixes(fixes) },
-                        mtCompleteMode: userSettings.mtCompleteMode
+                        mtCompleteMode: userSettings.mtCompleteMode,
+                        onFolderDrop: { url in handleFolderDrop(url) }
                     )
                     .padding(.horizontal, 20)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -131,7 +133,8 @@ struct ContentView: View {
                                     rehearsalMixOnly: rehearsalMixOnly,
                                     expectedDuration: parser.result?.expectedDuration,
                                     isMinimized: $stemCheckMinimized,
-                                    quickCheckMode: userSettings.quickCheckMode
+                                    quickCheckMode: userSettings.quickCheckMode,
+                                    jamNightMode: userSettings.jamNightMode
                                 )
                                 .frame(maxWidth: .infinity)
                                 // Clear All only shown here in Quick Check Mode without a loaded file
@@ -579,6 +582,16 @@ struct ContentView: View {
         }
     }
 
+    private func tempoDisplayTime(for time: String, previousTime: String?) -> String {
+        guard let prev = previousTime, prev == time else { return time }
+        let parts = time.split(separator: ":", maxSplits: 2)
+        guard parts.count == 3,
+              let mm = Int(parts[0]),
+              let ss = Int(parts[1]),
+              let mmm = Int(parts[2]) else { return time }
+        return String(format: "%02d:%02d:%03d", mm, ss, min(mmm + 1, 999))
+    }
+
     private func tabButton(label: String, tab: AppTab) -> some View {
         let isActive = activeTab == tab
         return Button(label) {
@@ -635,7 +648,9 @@ struct ContentView: View {
         } else if let result = parser.result {
             resultsView(result: result)
         } else {
-            DropZoneView(errorMessage: parser.errorMessage) { url in
+            DropZoneView(errorMessage: parser.errorMessage, onFolderDrop: { url in
+                handleFolderDrop(url)
+            }) { url in
                 loadNewFile(path: url.path)
             }
         }
@@ -664,6 +679,34 @@ struct ContentView: View {
         parser.parse(alsPath: path)
     }
 
+    // MARK: Handle a dropped session folder — finds .als + stems subfolder
+    private func handleFolderDrop(_ url: URL) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles
+        ) else { return }
+
+        // Load the first .als found at root
+        if let alsURL = items.first(where: { $0.pathExtension.lowercased() == "als" }) {
+            loadNewFile(path: alsURL.path)
+        }
+
+        // Find the first subdirectory that contains .wav files — treat it as the stems folder
+        let subfolders = items.filter { item in
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: item.path, isDirectory: &isDir)
+            return isDir.boolValue
+        }
+        if let stemsDir = subfolders.first(where: { dir in
+            let contents = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
+            return contents.contains { $0.pathExtension.lowercased() == "wav" }
+        }) {
+            audioAnalyzer.analyze(folder: stemsDir)
+        }
+    }
+
     // MARK: File picker (used by file bar tap and initial drop zone)
     private func openFilePicker() {
         let panel = NSOpenPanel()
@@ -673,7 +716,8 @@ struct ContentView: View {
         panel.message = "Choose an Ableton Live Set (.als)"
         panel.prompt = "Open"
 
-        if panel.runModal() == .OK, let url = panel.url {
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
             loadNewFile(path: url.path)
         }
     }
@@ -718,8 +762,12 @@ struct ContentView: View {
     private var hasSessionWarnings: Bool {
         guard let result = parser.result else { return false }
         if userSettings.jamNightMode {
-            // Tempo ramp warnings are allowed for Jam Night songs
-            return result.warnings.contains { !$0.hasPrefix("Tempo ramp:") }
+            // Jam Night: allow tempo ramps, loop/clip alignment issues
+            return result.warnings.contains {
+                !$0.hasPrefix("Tempo ramp:") &&
+                !$0.hasSuffix("does not end on beat 1") &&
+                !$0.contains("are not the same length")
+            }
         }
         return !result.warnings.isEmpty
     }
@@ -750,15 +798,18 @@ struct ContentView: View {
         audioAnalyzer.results.contains { !$0.isClean }
     }
 
-    // Block if a stem scan has been run but CLICK TRACK, ORIGINAL SONG, or
-    // GUIDE (unless RehearsalMix Only) are not present in the results.
+    // Block if a stem scan has been run but required stems are not present.
+    // Jam Night: only ORIGINAL SONG required. Normal: CLICK TRACK + ORIGINAL SONG (+ GUIDE unless rehearsalMixOnly).
     private var hasMissingRequiredStems: Bool {
         guard !audioAnalyzer.results.isEmpty else { return false }
         let present = Set(audioAnalyzer.results.map {
             URL(fileURLWithPath: $0.filename).deletingPathExtension().lastPathComponent.uppercased()
         })
-        var required: Set<String> = ["CLICK TRACK", "ORIGINAL SONG"]
-        if !rehearsalMixOnly { required.insert("GUIDE") }
+        var required: Set<String> = ["ORIGINAL SONG"]
+        if !userSettings.jamNightMode {
+            required.insert("CLICK TRACK")
+            if !rehearsalMixOnly { required.insert("GUIDE") }
+        }
         return !required.isSubset(of: present)
     }
 
@@ -801,6 +852,32 @@ struct ContentView: View {
     private func resultsView(result: ParsedResult) -> some View {
         VStack(spacing: 12) {
                 // Two independent scrollable panels — always rendered so headers stay visible
+                if !locatorsSigMinimized {
+                    HStack {
+                        Spacer()
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) { locatorsSigMinimized.toggle() }
+                        } label: {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.fgDim)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 3)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.fgDim.opacity(0.08))
+                                        .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { h in
+                            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                        }
+                        Spacer()
+                    }
+                    .frame(height: 18)
+                    .contentShape(Rectangle())
+                }
                 HStack(alignment: .top, spacing: 20) {
                     // Locators panel
                     PanelView(
@@ -880,36 +957,80 @@ struct ContentView: View {
                             RowView(number: index + 1, left: ts.time, right: ts.sig, copyDisabled: copyBlocked, onBlocked: copyBlockedToast)
                         }
                     }
+
+                    // Tempo panel (Jam Night mode only)
+                    if userSettings.jamNightMode {
+                        PanelView(
+                            title: "Tempo",
+                            icon: "metronome",
+                            isEmpty: result.tempoEvents.isEmpty,
+                            emptyMessage: "No tempo data",
+                            copyLabel: copiedTempos ? "Copied!" : "Copy All",
+                            showCopyButton: userSettings.showCopyAll,
+                            copyDisabled: copyBlocked,
+                            copyBlockedReason: copyBlockedReason,
+                            onCopyBlocked: copyBlockedToast,
+                            onCopy: {
+                                if copiedTempos { withAnimation(.easeOut(duration: 0.1)) { copiedTempos = false }; return }
+                                let text = result.tempoEvents.map { "\($0.time)  \(String(format: "%.2f", $0.bpm)) BPM" }.joined(separator: "\n")
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(text, forType: .string)
+                                withAnimation(.easeOut(duration: 0.1)) { copiedTempos = true }
+                            }
+                        ) {
+                            HStack(spacing: 12) {
+                                Text("#")
+                                    .frame(width: 22, alignment: .trailing)
+                                Text("BPM")
+                                    .frame(width: 108, alignment: .leading)
+                                Text("TIME")
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .font(.lato(size: 10, weight: .semibold))
+                            .foregroundColor(.fgDim)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 5)
+
+                            Divider().background(Color.border)
+
+                            ForEach(Array(result.tempoEvents.enumerated()), id: \.offset) { index, event in
+                                let isRamp = event.isRampStart || event.isRampEnd
+                                RowView(number: index + 1, left: String(format: "%.2f", event.bpm), right: tempoDisplayTime(for: event.time, previousTime: index > 0 ? result.tempoEvents[index - 1].time : nil), isInvalid: isRamp, rampBadge: isRamp, copyDisabled: copyBlocked, onBlocked: copyBlockedToast, leftMinWidth: 44)
+                            }
+                        }
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: locatorsSigMinimized ? 38 : 2000)
                 .clipped()
                 .layoutPriority(1)
 
-                // Collapse toggle for Locators + Time Signatures
-                HStack {
-                    Spacer()
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) { locatorsSigMinimized.toggle() }
-                    } label: {
-                        Image(systemName: locatorsSigMinimized ? "chevron.down" : "chevron.up")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.fgDim)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 3)
-                            .background(
-                                Capsule()
-                                    .fill(Color.fgDim.opacity(0.08))
-                                    .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
-                            )
+                // Collapse toggle — bottom only when collapsed
+                if locatorsSigMinimized {
+                    HStack {
+                        Spacer()
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) { locatorsSigMinimized.toggle() }
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.fgDim)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 3)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.fgDim.opacity(0.08))
+                                        .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { h in
+                            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                        }
+                        Spacer()
                     }
-                    .buttonStyle(.plain)
-                    .onHover { h in
-                        if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-                    }
-                    Spacer()
+                    .frame(height: 18)
+                    .contentShape(Rectangle())
                 }
-                .frame(height: 18)
-                .contentShape(Rectangle())
 
                 // MARK: Session warnings
                 if !result.warnings.isEmpty {
@@ -1045,8 +1166,14 @@ struct ContentView: View {
                         } else if let u = item as? URL {
                             url = u
                         }
-                        guard let url, url.pathExtension.lowercased() == "als" else { return }
-                        loadNewFile(path: url.path)
+                        guard let url else { return }
+                        var isDir: ObjCBool = false
+                        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                        if isDir.boolValue {
+                            handleFolderDrop(url)
+                        } else if url.pathExtension.lowercased() == "als" {
+                            loadNewFile(path: url.path)
+                        }
                     }
                 }
                 return true
@@ -1142,7 +1269,7 @@ struct ContentView: View {
         userSettings.quickCheckMode = false
         userSettings.mtCompleteMode = false
         userSettings.jamNightMode = false
-        activeTab = .qa
+        NotificationCenter.default.post(name: .audioShakeClearAll, object: nil)
     }
 
     private var songDurationText: String {
@@ -1182,6 +1309,30 @@ struct ContentView: View {
                 .background(Color.border)
 
             if !songDataMinimized {
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) { songDataMinimized.toggle() }
+                    } label: {
+                        Image(systemName: "chevron.up")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.fgDim)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule()
+                                    .fill(Color.fgDim.opacity(0.08))
+                                    .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { h in
+                        if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                    }
+                    Spacer()
+                }
+                .frame(height: 18)
+                .contentShape(Rectangle())
 
                 // Fields grid
                 VStack(spacing: 14) {
@@ -1272,33 +1423,32 @@ struct ContentView: View {
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            // Collapse toggle — always shown at bottom
-            HStack {
-                Spacer()
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { songDataMinimized.toggle() }
-                } label: {
-                    Image(systemName: songDataMinimized ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.fgDim)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule()
-                                .fill(Color.fgDim.opacity(0.08))
-                                .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
-                        )
+            } else {
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) { songDataMinimized.toggle() }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.fgDim)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule()
+                                    .fill(Color.fgDim.opacity(0.08))
+                                    .overlay(Capsule().stroke(Color.border.opacity(0.6), lineWidth: 0.5))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { h in
+                        if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                    }
+                    Spacer()
                 }
-                .buttonStyle(.plain)
-                .onHover { h in
-                    if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-                }
-                Spacer()
+                .frame(height: 18)
+                .contentShape(Rectangle())
             }
-            .frame(height: 18)
-            .contentShape(Rectangle())
         }
         .cardStyle()
     }

@@ -3,6 +3,9 @@ import Foundation
 struct TempoEvent: Codable {
     let beat: Double   // beat position in the session
     let bpm: Double    // tempo value at that beat
+    let time: String   // formatted timecode MM:SS:mmm
+    var isRampStart: Bool = false
+    var isRampEnd: Bool = false
 }
 
 struct ParsedResult {
@@ -24,6 +27,7 @@ struct Marker: Identifiable {
     var text: String
     var alsId: String = ""   // Ableton XML locator Id — used for write-back
     var offBeat: Bool = false  // true if locator does not land on beat 1 of a bar
+    var beat: Double? = nil   // Ableton beat position (from <Time Value="..."> in .als XML)
 }
 
 struct TimeSig: Identifiable {
@@ -47,7 +51,16 @@ class ParserProcess {
 
     /// Resolve the parser binary path
     private static func resolveParser() -> (executable: String, args: [String], env: [String: String]?) {
-        // 1. Bundled binary in parse_als_dir next to main executable
+        // 1a. Bundled binary in Resources/parse_als_dir (new location — avoids codesign issues)
+        if let resourcesURL = Bundle.main.resourceURL {
+            let resourcesPath = resourcesURL
+                .appendingPathComponent("parse_als_dir")
+                .appendingPathComponent("parse_als").path
+            if FileManager.default.isExecutableFile(atPath: resourcesPath) {
+                return (executable: resourcesPath, args: ["--server"], env: nil)
+            }
+        }
+        // 1b. Fallback: MacOS/parse_als_dir (legacy location from older builds)
         let execURL = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0])
         let macosDir = execURL.deletingLastPathComponent()
         let bundlePath = macosDir
@@ -304,7 +317,7 @@ class ParserService: ObservableObject {
         let bpm = json["bpm"] as? Double
 
         let markersRaw = json["markers"] as? [[String: Any]] ?? []
-        let markers = markersRaw.map { Marker(time: $0["time"] as? String ?? "", timeEnd: $0["time_end"] as? String ?? "", text: $0["text"] as? String ?? "", alsId: $0["als_id"] as? String ?? "", offBeat: $0["off_beat"] as? Bool ?? false) }
+        let markers = markersRaw.map { Marker(time: $0["time"] as? String ?? "", timeEnd: $0["time_end"] as? String ?? "", text: $0["text"] as? String ?? "", alsId: $0["als_id"] as? String ?? "", offBeat: $0["off_beat"] as? Bool ?? false, beat: $0["beat"] as? Double) }
 
         let tsRaw = json["time_signatures"] as? [[String: Any]] ?? []
         let timeSigs = tsRaw.map { TimeSig(time: $0["time"] as? String ?? "", sig: $0["sig"] as? String ?? "", beat: $0["beat"] as? Double) }
@@ -314,10 +327,14 @@ class ParserService: ObservableObject {
         let firstTempoChangeMarkerIndex = json["first_tempo_change_marker_index"] as? Int
         let liveMajorVersion = json["live_major_version"] as? Int
 
-        let tempoEventsRaw = json["tempo_events"] as? [[Double]] ?? []
-        let tempoEvents = tempoEventsRaw.compactMap { arr -> TempoEvent? in
-            guard arr.count >= 2 else { return nil }
-            return TempoEvent(beat: arr[0], bpm: arr[1])
+        let tempoEventsRaw = json["tempo_events"] as? [[String: Any]] ?? []
+        let tempoEvents = tempoEventsRaw.compactMap { dict -> TempoEvent? in
+            guard let beat = dict["beat"] as? Double,
+                  let bpm  = dict["bpm"]  as? Double,
+                  let time = dict["time"] as? String else { return nil }
+            let isRampStart = dict["is_ramp_start"] as? Bool ?? false
+            let isRampEnd   = dict["is_ramp_end"]   as? Bool ?? false
+            return TempoEvent(beat: beat, bpm: bpm, time: time, isRampStart: isRampStart, isRampEnd: isRampEnd)
         }
 
         Log("parsed '\(fileName)' — bpm=\(bpm.map { String($0) } ?? "nil") tempoEvents=\(tempoEvents.count) timeSigs=\(timeSigs.count) markers=\(markers.count) expectedDuration=\(expectedDuration.map { String(format: "%.2f", $0) } ?? "nil") liveMajorVersion=\(liveMajorVersion.map { String($0) } ?? "nil")", "Parser")

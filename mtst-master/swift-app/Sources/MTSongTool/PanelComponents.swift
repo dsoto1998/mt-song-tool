@@ -85,6 +85,7 @@ struct LogOutButton: View {
 // MARK: - Drop Zone
 struct DropZoneView: View {
     let errorMessage: String?
+    var onFolderDrop: ((URL) -> Void)? = nil
     let onDrop: (URL) -> Void
 
     @State private var isHovering = false
@@ -116,11 +117,11 @@ struct DropZoneView: View {
                     .animation(.spring(response: 0.25), value: isTargeted)
 
                 VStack(spacing: 4) {
-                    Text("Drop your .als file here")
+                    Text("Drop your .als or session folder")
                         .font(.lato(size: 16, weight: .medium))
                         .foregroundColor(.fgBright)
 
-                    Text("or click to browse")
+                    Text("or click to browse for an .als file")
                         .font(.lato(size: 13))
                         .foregroundColor(.fgDim)
                 }
@@ -143,19 +144,36 @@ struct DropZoneView: View {
         .onTapGesture {
             openFilePicker()
         }
-        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { providers in
+        .onDrop(of: [UTType.fileURL, .folder], isTargeted: $isTargeted) { providers in
             guard let provider = providers.first else { return false }
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            // loadItem(forTypeIdentifier:) is required on macOS — folders are delivered as
+            // bookmark Data via public.file-url, not as URL objects, so loadObject(ofClass: URL.self)
+            // silently returns nil for folder drops from Finder.
+            let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                ? UTType.fileURL.identifier : "public.folder"
+            Log("provider types=\(provider.registeredTypeIdentifiers) → loading as \(typeId)", "DropZone")
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, error in
+                Log("loadItem: itemType=\(type(of: item)) error=\(String(describing: error))", "DropZone")
                 DispatchQueue.main.async {
                     var url: URL?
                     if let data = item as? Data {
                         url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else if let u = item as? NSURL {
+                        url = u as URL
                     } else if let u = item as? URL {
                         url = u
                     }
-                    guard let url, url.pathExtension.lowercased() == "als" else { return }
-                    flashSuccess()
-                    onDrop(url)
+                    Log("resolved url=\(url?.path ?? "nil")", "DropZone")
+                    guard let url else { return }
+                    var isDir: ObjCBool = false
+                    FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                    if isDir.boolValue {
+                        flashSuccess()
+                        onFolderDrop?(url)
+                    } else if url.pathExtension.lowercased() == "als" {
+                        flashSuccess()
+                        onDrop(url)
+                    }
                 }
             }
             return true
@@ -170,7 +188,8 @@ struct DropZoneView: View {
         panel.message = "Choose an Ableton Live Set (.als)"
         panel.prompt = "Open"
 
-        if panel.runModal() == .OK, let url = panel.url {
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
             flashSuccess()
             onDrop(url)
         }
@@ -251,11 +270,16 @@ struct RowView: View {
     let left: String
     let right: String
     var isInvalid: Bool = false
+    var rampBadge: Bool = false
     var copyDisabled: Bool = false
     var onBlocked: (() -> Void)? = nil
+    var leftMinWidth: CGFloat = 0
+    var rightMinWidth: CGFloat = 0
     @State private var isHovering = false
     @State private var copied = false
     @State private var buttonHover = false
+    @State private var copiedRight = false
+    @State private var buttonHoverRight = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -270,7 +294,7 @@ struct RowView: View {
                     .font(.lato(size: 12))
                     .foregroundColor(isInvalid ? Color.red : .accent)
                     .lineLimit(1)
-                Spacer(minLength: 0)
+                    .frame(minWidth: leftMinWidth, alignment: .leading)
                 Button {
                     if copyDisabled { onBlocked?(); return }
                     if copied { withAnimation(.easeOut(duration: 0.1)) { copied = false }; return }
@@ -295,11 +319,45 @@ struct RowView: View {
             }
             .frame(width: 108, alignment: .leading)
 
-            Text(right)
-                .font(.lato(size: 12))
-                .foregroundColor(isInvalid ? Color.red : .fgBright)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 4) {
+                Text(right)
+                    .font(.lato(size: 12))
+                    .foregroundColor(isInvalid ? Color.red : .fgBright)
+                    .lineLimit(1)
+                    .frame(minWidth: rightMinWidth, alignment: .leading)
+                Button {
+                    if copyDisabled { onBlocked?(); return }
+                    if copiedRight { withAnimation(.easeOut(duration: 0.1)) { copiedRight = false }; return }
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(right, forType: .string)
+                    withAnimation(.easeOut(duration: 0.1)) { copiedRight = true }
+                } label: {
+                    Image(systemName: copiedRight ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(copiedRight ? Color.greenLight : (buttonHoverRight ? .accent : .fgDim))
+                        .frame(width: 20, height: 20)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(buttonHoverRight ? Color.accent.opacity(0.15) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onHover { h in
+                    withAnimation(.easeOut(duration: 0.12)) { buttonHoverRight = h }
+                }
+                if rampBadge {
+                    Spacer()
+                    Text("RAMP")
+                        .font(.lato(size: 10, weight: .bold))
+                        .foregroundColor(Color.red)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.red.opacity(0.15))
+                        .clipShape(Capsule())
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)

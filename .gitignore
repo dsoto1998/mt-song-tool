@@ -32,3 +32,10 @@ mtst-master/swift-app/dist/parse_als/_internal/
 
 # Test files
 test-ableton-files/
+
+# Large local-only directories (too large for GitHub)
+Demos/
+mt-click-guide/
+
+# Claude planning session data
+.planning/
