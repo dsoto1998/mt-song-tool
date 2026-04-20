@@ -1287,6 +1287,36 @@ struct GlobalSelectionBar: View {
     }
 }
 
+// MARK: - EditScrollView
+
+/// NSScrollView subclass that handles Delete/Forward-Delete in the responder chain.
+/// Belt-and-suspenders with the AppKit local event monitor: even if the monitor is bypassed,
+/// the scroll view handles the keys gracefully and never beeps.
+private class EditScrollView: NSScrollView {
+    var onDeleteKey: (() -> Void)?
+    var onForwardDeleteKey: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        window?.makeFirstResponder(self)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 51 && mods.isEmpty {          // ⌫ Delete
+            onDeleteKey?()
+            return
+        }
+        if event.keyCode == 117 && mods.isEmpty {         // ⌦ Forward Delete
+            onForwardDeleteKey?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
 // MARK: - WaveformScrollHost
 
 /// NSScrollView wrapper that gives programmatic scroll-position control for mouse-centered zoom.
@@ -1504,7 +1534,20 @@ struct WaveformScrollHost: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let sv = NSScrollView()
+        let sv = EditScrollView()
+        sv.onDeleteKey = { [weak coordinator = context.coordinator] in
+            guard let c = coordinator else { return }
+            DispatchQueue.main.async {
+                if !c.parent.stemSelections.isEmpty { c.parent.onDeleteRegion() }
+                else if !c.parent.selectedURLs.isEmpty { c.parent.onRemoveStem() }
+            }
+        }
+        sv.onForwardDeleteKey = { [weak coordinator = context.coordinator] in
+            guard let c = coordinator else { return }
+            DispatchQueue.main.async {
+                if !c.parent.selectedURLs.isEmpty { c.parent.onRemoveStem() }
+            }
+        }
         sv.hasHorizontalScroller = true
         sv.hasVerticalScroller = false
         sv.autohidesScrollers = true
