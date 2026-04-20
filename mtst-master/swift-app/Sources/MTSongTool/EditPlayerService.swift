@@ -2,6 +2,14 @@ import AVFoundation
 import Accelerate
 import Combine
 
+// MARK: - MeterAtom
+
+/// Lock-free Float storage for audio-thread → main-thread meter updates.
+/// Float read/write is a single aligned instruction on ARM64 and x86_64 — safe without locks.
+private final class MeterAtom: @unchecked Sendable {
+    var value: Float = -96.0
+}
+
 // MARK: - AudioSegment
 
 /// One independently-positioned piece of a stem's audio. `sessionStart` is absolute session time.
@@ -153,6 +161,10 @@ class EditPlayerService: ObservableObject {
     private var tapInstalled: [URL: Bool] = [:]
     private var engineStarted = false
 
+    // Atomic meter storage — audio tap writes here (no alloc), timer batch-reads to meterLevels
+    private var meterAtomics: [URL: MeterAtom] = [:]
+    private let masterAtom = MeterAtom()
+
     // Ordered stem list (for display)
     private(set) var stemURLs: [URL] = []
 
@@ -182,6 +194,8 @@ class EditPlayerService: ObservableObject {
         stemURLs = urls
         stemStates = [:]
         meterLevels = [:]
+        meterAtomics = Dictionary(uniqueKeysWithValues: urls.map { ($0, MeterAtom()) })
+        masterAtom.value = -96.0
         totalDuration = 0
 
         for url in urls {
@@ -226,6 +240,7 @@ class EditPlayerService: ObservableObject {
         playerNodes = [:]
         stemMixers = [:]
         tapInstalled = [:]
+        meterAtomics = [:]
         stemURLs = []
     }
 
@@ -364,13 +379,20 @@ class EditPlayerService: ObservableObject {
 
     private func startTimeTimer() {
         timeTimer?.invalidate()
-        timeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        // 60 Hz — matches display refresh. Single Task per tick batches time + all meter reads
+        // into one SwiftUI update, replacing the old N*43 Hz audio-thread Task allocations.
+        timeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isPlaying else { return }
                 let now = mach_absolute_time()
-                guard now >= self.startHostTime else { return }  // pre-roll: audio hasn't started yet
+                guard now >= self.startHostTime else { return }
                 let elapsed = machTimeToSeconds(now - self.startHostTime)
                 self.currentTime = self.startSessionTime + elapsed
+                // Batch-read atomic meter values written by audio tap — one publish per frame
+                var levels = [URL: Float]()
+                for (url, atom) in self.meterAtomics { levels[url] = atom.value }
+                self.meterLevels = levels
+                self.masterPeakDB = self.masterAtom.value
             }
         }
     }
@@ -558,7 +580,7 @@ class EditPlayerService: ObservableObject {
     private func installMasterTap() {
         let masterMixer = engine.mainMixerNode
         let format = masterMixer.outputFormat(forBus: 0)
-        masterMixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+        masterMixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [masterAtom] buffer, _ in
             guard let channelData = buffer.floatChannelData else { return }
             var peak: Float = 0
             for ch in 0..<Int(buffer.format.channelCount) {
@@ -566,15 +588,16 @@ class EditPlayerService: ObservableObject {
                 vDSP_maxmgv(channelData[ch], 1, &channelPeak, vDSP_Length(buffer.frameLength))
                 peak = max(peak, channelPeak)
             }
-            let db = peak > 0 ? 20 * log10(peak) : -96.0
-            Task { @MainActor [weak self] in self?.masterPeakDB = db }
+            // Write directly — Float assignment is atomic on ARM64/x86_64. No Task alloc.
+            masterAtom.value = peak > 0 ? 20 * log10(peak) : -96.0
         }
     }
 
     func installStemTap(_ url: URL) {
         guard let mixer = stemMixers[url], tapInstalled[url] != true else { return }
+        guard let atom = meterAtomics[url] else { return }
         let format = mixer.outputFormat(forBus: 0)
-        mixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, url] buffer, _ in
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [atom] buffer, _ in
             guard let channelData = buffer.floatChannelData else { return }
             var peak: Float = 0
             for ch in 0..<Int(buffer.format.channelCount) {
@@ -582,8 +605,8 @@ class EditPlayerService: ObservableObject {
                 vDSP_maxmgv(channelData[ch], 1, &channelPeak, vDSP_Length(buffer.frameLength))
                 peak = max(peak, channelPeak)
             }
-            let db = peak > 0 ? 20 * log10(peak) : -96.0
-            Task { @MainActor [weak self] in self?.meterLevels[url] = db }
+            // Write directly — Float assignment is atomic on ARM64/x86_64. No Task alloc.
+            atom.value = peak > 0 ? 20 * log10(peak) : -96.0
         }
         tapInstalled[url] = true
     }

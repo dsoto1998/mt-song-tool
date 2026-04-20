@@ -1336,6 +1336,7 @@ struct WaveformScrollHost: NSViewRepresentable {
 
         var gestureStartZoom: CGFloat = 1
         var gestureFocalFraction: CGFloat = 0
+        var isZooming: Bool = false   // suppresses waveform path rebuild during pinch
 
         var playheadLayer: CAShapeLayer?
         var gridDownbeatLayer: CAShapeLayer?
@@ -1359,6 +1360,7 @@ struct WaveformScrollHost: NSViewRepresentable {
 
             switch r.state {
             case .began:
+                isZooming = true
                 gestureStartZoom = parent.zoomScale
                 let focalX = r.location(in: clipView).x
                 let contentW = clipView.documentRect.width
@@ -1367,7 +1369,10 @@ struct WaveformScrollHost: NSViewRepresentable {
             case .changed, .ended:
                 let newZoom = max(0.01, min(100, gestureStartZoom * (1 + r.magnification)))
                 parent.zoomScale = newZoom
-                if r.state == .ended { parent.zoomScaleAtGestureStart = newZoom }
+                if r.state == .ended {
+                    isZooming = false
+                    parent.zoomScaleAtGestureStart = newZoom
+                }
 
                 // Recompute content width using the same formula as EditWaveformCanvas
                 let newContentW = max(CGFloat(parent.totalDuration) * 80.0 * newZoom, 400)
@@ -1535,6 +1540,7 @@ struct WaveformScrollHost: NSViewRepresentable {
 
         // CALayer waveform container — per-stem waveform fills + segment outlines
         let waveformContainer = CALayer()
+        waveformContainer.anchorPoint = CGPoint(x: 0, y: 0)
         waveformContainer.frame = CGRect(origin: .zero, size: documentSize)
         waveformContainer.zPosition = 0
         hv.layer?.addSublayer(waveformContainer)
@@ -1721,8 +1727,22 @@ struct WaveformScrollHost: NSViewRepresentable {
 
             }
 
-            // Rebuild per-stem waveform CAShapeLayers — vector-based, no texture limit
+            // Rebuild per-stem waveform CAShapeLayers — during pinch zoom, scale the container
+            // via CATransform3D so waveforms track the gesture without path recomputation.
+            // On gesture end (isZooming = false), reset transform and do full rebuild.
             if let wfContainer = context.coordinator.waveformContainer {
+            if context.coordinator.isZooming {
+                let startWidth = max(CGFloat(totalDuration) * 80.0 * zoomScaleAtGestureStart, 400)
+                let scaleX = startWidth > 0 ? ds.width / startWidth : 1
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                wfContainer.frame = CGRect(origin: .zero, size: CGSize(width: startWidth, height: ds.height))
+                wfContainer.transform = CATransform3DMakeScale(scaleX, 1, 1)
+                CATransaction.commit()
+            } else {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                wfContainer.transform = CATransform3DIdentity
                 wfContainer.frame = CGRect(origin: .zero, size: ds)
                 wfContainer.sublayers?.forEach { $0.removeFromSuperlayer() }
 
@@ -1927,15 +1947,23 @@ struct WaveformScrollHost: NSViewRepresentable {
 
                     yOff += h + 1  // +1 for Divider
                 }
-            }
+                CATransaction.commit()
+            } // end else (not zooming)
+            } // end if let wfContainer
 
             hv.rootView = AnyView(waveformContent())
+            // Capture zooming state now — by the time async fires the gesture may have ended.
+            let wasZooming = context.coordinator.isZooming
             DispatchQueue.main.async { [weak nsView] in
                 guard let sv = nsView else { return }
                 sv.tile()
-                let origin = sv.contentView.bounds.origin
-                sv.contentView.scroll(to: origin)
-                sv.reflectScrolledClipView(sv.contentView)
+                // Skip scroll-position reset during zoom — handleMagnification owns
+                // scroll position during the gesture and races with this block.
+                if !wasZooming {
+                    let origin = sv.contentView.bounds.origin
+                    sv.contentView.scroll(to: origin)
+                    sv.reflectScrolledClipView(sv.contentView)
+                }
             }
         }
     }
