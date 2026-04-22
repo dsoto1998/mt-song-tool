@@ -156,6 +156,8 @@ class EditPlayerService: ObservableObject {
     }
 
     let engine = AVAudioEngine()   // internal — MetronomeService attaches its playerNode here
+    private let stemBusMixer = AVAudioMixerNode()  // all stems sum here; tap measures stems only (metronome bypasses)
+    private var stemBusAttached = false
     private var playerNodes: [URL: AVAudioPlayerNode] = [:]
     private var stemMixers: [URL: AVAudioMixerNode] = [:]
     private var tapInstalled: [URL: Bool] = [:]
@@ -198,6 +200,12 @@ class EditPlayerService: ObservableObject {
         masterAtom.value = -96.0
         totalDuration = 0
 
+        if !stemBusAttached {
+            engine.attach(stemBusMixer)
+            engine.connect(stemBusMixer, to: engine.mainMixerNode, format: nil)
+            stemBusAttached = true
+        }
+
         for url in urls {
             let playerNode = AVAudioPlayerNode()
             let mixerNode = AVAudioMixerNode()
@@ -205,7 +213,7 @@ class EditPlayerService: ObservableObject {
             engine.attach(playerNode)
             engine.attach(mixerNode)
             engine.connect(playerNode, to: mixerNode, format: nil)
-            engine.connect(mixerNode, to: engine.mainMixerNode, format: nil)
+            engine.connect(mixerNode, to: stemBusMixer, format: nil)
 
             playerNodes[url] = playerNode
             stemMixers[url] = mixerNode
@@ -234,7 +242,7 @@ class EditPlayerService: ObservableObject {
     }
 
     private func teardownNodes() {
-        engine.mainMixerNode.removeTap(onBus: 0)
+        stemBusMixer.removeTap(onBus: 0)
         for (_, player) in playerNodes { engine.detach(player) }
         for (_, mixer) in stemMixers { engine.detach(mixer) }
         playerNodes = [:]
@@ -578,9 +586,8 @@ class EditPlayerService: ObservableObject {
     // MARK: - Metering
 
     private func installMasterTap() {
-        let masterMixer = engine.mainMixerNode
-        let format = masterMixer.outputFormat(forBus: 0)
-        masterMixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [masterAtom] buffer, _ in
+        let format = stemBusMixer.outputFormat(forBus: 0)
+        stemBusMixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [masterAtom] buffer, _ in
             guard let channelData = buffer.floatChannelData else { return }
             var peak: Float = 0
             for ch in 0..<Int(buffer.format.channelCount) {

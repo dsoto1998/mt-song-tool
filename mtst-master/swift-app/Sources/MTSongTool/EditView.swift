@@ -2141,8 +2141,8 @@ struct WaveformScrollHost: NSViewRepresentable {
 // MARK: - Peak Meters
 
 private func meterBarColor(_ db: Float) -> Color {
-    if db > -3 { return .red }
-    if db > -6 { return Color(red: 1, green: 0.8, blue: 0) }
+    if db > 0  { return .red }
+    if db >= 0 { return Color(red: 1, green: 0.8, blue: 0) }
     return Color(red: 0.2, green: 0.8, blue: 0.3)
 }
 private func meterFraction(_ db: Float) -> CGFloat {
@@ -2197,7 +2197,7 @@ struct MasterPeakMeter: View {
 
             Text(peakLabel)
                 .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(allTimePeak > -3 ? .red : allTimePeak > -6 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
+                .foregroundColor(allTimePeak > 0 ? .red : allTimePeak >= 0 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
                 .frame(width: 38, alignment: .trailing)
                 .onTapGesture { allTimePeak = -96 }
                 .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
