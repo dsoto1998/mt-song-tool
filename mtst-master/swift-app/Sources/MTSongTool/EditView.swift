@@ -404,7 +404,7 @@ struct EditView: View {
 
             // Master peak meter
             MasterPeakMeter(peakDB: editPlayer.masterPeakDB)
-                .frame(width: 100, height: 10)
+                .frame(height: 10)
 
             Divider().frame(height: 18)
 
@@ -2163,21 +2163,50 @@ struct StemPeakMeter: View {
 
 struct MasterPeakMeter: View {
     let peakDB: Float
-    private var fraction: CGFloat {
-        CGFloat(max(0, (peakDB + 60) / 60))
+    @State private var allTimePeak: Float = -96.0
+
+    private func fraction(_ db: Float) -> CGFloat {
+        CGFloat(max(0, (db + 60) / 60))
     }
-    private var meterColor: Color {
-        if peakDB > -3 { return .red }
-        if peakDB > -6 { return Color(red: 1, green: 0.8, blue: 0) }
+    private func barColor(_ db: Float) -> Color {
+        if db > -3 { return .red }
+        if db > -6 { return Color(red: 1, green: 0.8, blue: 0) }
         return Color(red: 0.2, green: 0.8, blue: 0.3)
     }
+    private var peakLabel: String {
+        allTimePeak <= -96 ? "---" : String(format: "%.2f", allTimePeak)
+    }
+
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(Color.border.opacity(0.4))
-                RoundedRectangle(cornerRadius: 2).fill(meterColor)
-                    .frame(width: geo.size.width * fraction)
+        HStack(spacing: 6) {
+            // Bar
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.border.opacity(0.4))
+                    RoundedRectangle(cornerRadius: 2).fill(barColor(peakDB))
+                        .frame(width: geo.size.width * fraction(peakDB))
+                    // All-time peak tick
+                    if allTimePeak > -96 {
+                        Rectangle()
+                            .fill(barColor(allTimePeak))
+                            .frame(width: 1.5)
+                            .offset(x: max(0, geo.size.width * fraction(allTimePeak) - 1.5))
+                    }
+                }
             }
+            .frame(width: 80)
+
+            // All-time peak number — click to reset
+            Text(peakLabel)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(allTimePeak > -3 ? .red : allTimePeak > -6 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
+                .frame(width: 38, alignment: .trailing)
+                .onTapGesture { allTimePeak = -96 }
+                .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
+                .help("All-time peak — click to reset")
+        }
+        .onChange(of: peakDB) { db in
+            if db > allTimePeak { allTimePeak = db }
         }
     }
 }
