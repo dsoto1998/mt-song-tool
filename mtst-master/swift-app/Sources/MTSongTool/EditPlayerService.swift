@@ -158,6 +158,7 @@ class EditPlayerService: ObservableObject {
     let engine = AVAudioEngine()   // internal — MetronomeService attaches its playerNode here
     private let stemBusMixer = AVAudioMixerNode()  // all stems sum here; tap measures stems only (metronome bypasses)
     private var stemBusAttached = false
+    private var masterTapInstalled = false
     private var playerNodes: [URL: AVAudioPlayerNode] = [:]
     private var stemMixers: [URL: AVAudioMixerNode] = [:]
     private var tapInstalled: [URL: Bool] = [:]
@@ -244,7 +245,7 @@ class EditPlayerService: ObservableObject {
     }
 
     private func teardownNodes() {
-        stemBusMixer.removeTap(onBus: 0)
+        if masterTapInstalled { stemBusMixer.removeTap(onBus: 0); masterTapInstalled = false }
         for (_, player) in playerNodes { engine.detach(player) }
         for (_, mixer) in stemMixers { engine.detach(mixer) }
         playerNodes = [:]
@@ -588,6 +589,7 @@ class EditPlayerService: ObservableObject {
     // MARK: - Metering
 
     private func installMasterTap() {
+        masterTapInstalled = true
         let format = stemBusMixer.outputFormat(forBus: 0)
         stemBusMixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [masterAtom] buffer, _ in
             guard let channelData = buffer.floatChannelData else { return }
