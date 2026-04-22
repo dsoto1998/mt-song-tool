@@ -2140,63 +2140,61 @@ struct WaveformScrollHost: NSViewRepresentable {
 
 // MARK: - Peak Meters
 
+private func meterBarColor(_ db: Float) -> Color {
+    if db > -3 { return .red }
+    if db > -6 { return Color(red: 1, green: 0.8, blue: 0) }
+    return Color(red: 0.2, green: 0.8, blue: 0.3)
+}
+private func meterFraction(_ db: Float) -> CGFloat {
+    CGFloat(max(0, min(1, (db + 60) / 60)))
+}
+
+/// Canvas-based meter bar — single GPU draw call per frame, no SwiftUI view diffing.
 struct StemPeakMeter: View {
     let peakDB: Float
-    private var fraction: CGFloat {
-        CGFloat(max(0, (peakDB + 60) / 60))  // maps -60…0 dBFS to 0…1
-    }
-    private var meterColor: Color {
-        if peakDB > -3 { return .red }
-        if peakDB > -6 { return Color(red: 1, green: 0.8, blue: 0) }
-        return Color(red: 0.2, green: 0.8, blue: 0.3)
-    }
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(Color.border.opacity(0.4))
-                RoundedRectangle(cornerRadius: 2).fill(meterColor)
-                    .frame(width: geo.size.width * fraction)
+        Canvas { ctx, size in
+            ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 2),
+                     with: .color(Color.border.opacity(0.4)))
+            let w = size.width * meterFraction(peakDB)
+            if w > 0 {
+                ctx.fill(Path(roundedRect: CGRect(x: 0, y: 0, width: w, height: size.height), cornerRadius: 2),
+                         with: .color(meterBarColor(peakDB)))
             }
         }
     }
 }
 
+/// Canvas-based master meter with all-time peak hold tick + dB readout. Click number to reset.
 struct MasterPeakMeter: View {
     let peakDB: Float
     @State private var allTimePeak: Float = -96.0
 
-    private func fraction(_ db: Float) -> CGFloat {
-        CGFloat(max(0, (db + 60) / 60))
-    }
-    private func barColor(_ db: Float) -> Color {
-        if db > -3 { return .red }
-        if db > -6 { return Color(red: 1, green: 0.8, blue: 0) }
-        return Color(red: 0.2, green: 0.8, blue: 0.3)
-    }
     private var peakLabel: String {
         allTimePeak <= -96 ? "---" : String(format: "%.2f", allTimePeak)
     }
 
     var body: some View {
         HStack(spacing: 6) {
-            // Bar
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2).fill(Color.border.opacity(0.4))
-                    RoundedRectangle(cornerRadius: 2).fill(barColor(peakDB))
-                        .frame(width: geo.size.width * fraction(peakDB))
-                    // All-time peak tick
-                    if allTimePeak > -96 {
-                        Rectangle()
-                            .fill(barColor(allTimePeak))
-                            .frame(width: 1.5)
-                            .offset(x: max(0, geo.size.width * fraction(allTimePeak) - 1.5))
-                    }
+            Canvas { ctx, size in
+                // Track
+                ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 2),
+                         with: .color(Color.border.opacity(0.4)))
+                // Live bar
+                let w = size.width * meterFraction(peakDB)
+                if w > 0 {
+                    ctx.fill(Path(roundedRect: CGRect(x: 0, y: 0, width: w, height: size.height), cornerRadius: 2),
+                             with: .color(meterBarColor(peakDB)))
+                }
+                // All-time peak tick
+                if allTimePeak > -96 {
+                    let tx = max(0, size.width * meterFraction(allTimePeak) - 1.5)
+                    ctx.fill(Path(CGRect(x: tx, y: 0, width: 1.5, height: size.height)),
+                             with: .color(meterBarColor(allTimePeak)))
                 }
             }
             .frame(width: 80)
 
-            // All-time peak number — click to reset
             Text(peakLabel)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(allTimePeak > -3 ? .red : allTimePeak > -6 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
