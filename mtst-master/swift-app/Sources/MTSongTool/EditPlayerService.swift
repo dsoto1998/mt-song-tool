@@ -213,7 +213,9 @@ class EditPlayerService: ObservableObject {
             engine.attach(playerNode)
             engine.attach(mixerNode)
             engine.connect(playerNode, to: mixerNode, format: nil)
-            engine.connect(mixerNode, to: stemBusMixer, format: nil)
+            // Locked stems (OG/Guide/Click) bypass stemBusMixer — master meter measures collective only
+            let isLocked = Self.lockedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+            engine.connect(mixerNode, to: isLocked ? engine.mainMixerNode : stemBusMixer, format: nil)
 
             playerNodes[url] = playerNode
             stemMixers[url] = mixerNode

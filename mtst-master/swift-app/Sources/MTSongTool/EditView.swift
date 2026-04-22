@@ -477,6 +477,7 @@ struct EditView: View {
                             meterDB: editPlayer.meterLevels[url] ?? -96.0,
                             isSelected: isSelected,
                             height: height,
+                            isLockedStem: isProtectedStemURL(url),
                             onToggleMute: {
                                 if isSelected && selectedURLs.count > 1 {
                                     editPlayer.setMutedForURLs(Array(selectedURLs), !state.isMuted)
@@ -768,6 +769,7 @@ struct EditTrackSidebar: View {
     let meterDB: Float
     let isSelected: Bool
     let height: CGFloat
+    var isLockedStem: Bool = false
 
     let onToggleMute: () -> Void
     let onToggleSolo: () -> Void
@@ -785,6 +787,7 @@ struct EditTrackSidebar: View {
     @State private var renameSelection = ""
     @State private var renameDismissedViaEnter = false
     @State private var pencilHover = false
+    @State private var allTimePeak: Float = -96.0
 
     var stemName: String { url.deletingPathExtension().lastPathComponent }
 
@@ -883,6 +886,16 @@ struct EditTrackSidebar: View {
                     .frame(width: 50, height: 8)
 
                 Spacer()
+
+                // Locked stems (OG/Guide/Click) get peak-hold meter in remaining space
+                if isLockedStem {
+                    LockedStemMeter(peakDB: meterDB, allTimePeak: allTimePeak) {
+                        allTimePeak = -96
+                    }
+                }
+            }
+            .onChange(of: meterDB) { db in
+                if isLockedStem, db > allTimePeak { allTimePeak = db }
             }
 
             // Gain (dB: -60 to +60, 0 dB = neutral)
@@ -2147,6 +2160,46 @@ private func meterBarColor(_ db: Float) -> Color {
 }
 private func meterFraction(_ db: Float) -> CGFloat {
     CGFloat(max(0, min(1, (db + 60) / 60)))
+}
+
+/// Compact peak-hold meter for locked stems (OG/Guide/Click) — fits in sidebar right margin.
+/// Canvas bar + dB number; tap number to reset peak hold.
+struct LockedStemMeter: View {
+    let peakDB: Float
+    let allTimePeak: Float
+    let onReset: () -> Void
+
+    private var peakLabel: String {
+        allTimePeak <= -96 ? "---" : String(format: "%.1f", allTimePeak)
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Canvas { ctx, size in
+                ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 2),
+                         with: .color(Color.border.opacity(0.4)))
+                let w = size.width * meterFraction(peakDB)
+                if w > 0 {
+                    ctx.fill(Path(roundedRect: CGRect(x: 0, y: 0, width: w, height: size.height), cornerRadius: 2),
+                             with: .color(meterBarColor(peakDB)))
+                }
+                if allTimePeak > -96 {
+                    let tx = max(0, size.width * meterFraction(allTimePeak) - 1)
+                    ctx.fill(Path(CGRect(x: tx, y: 0, width: 1, height: size.height)),
+                             with: .color(meterBarColor(allTimePeak)))
+                }
+            }
+            .frame(width: 38, height: 6)
+
+            Text(peakLabel)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(allTimePeak > 0 ? .red : allTimePeak >= 0 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
+                .frame(width: 32, alignment: .trailing)
+                .onTapGesture { onReset() }
+                .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
+                .help("Peak hold — click to reset")
+        }
+    }
 }
 
 /// Canvas-based meter bar — single GPU draw call per frame, no SwiftUI view diffing.
