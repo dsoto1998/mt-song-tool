@@ -605,10 +605,19 @@ class EditPlayerService: ObservableObject {
     }
 
     func installStemTap(_ url: URL) {
-        guard let mixer = stemMixers[url], tapInstalled[url] != true else { return }
+        guard tapInstalled[url] != true else { return }
         guard let atom = meterAtomics[url] else { return }
-        let format = mixer.outputFormat(forBus: 0)
-        mixer.installTap(onBus: 0, bufferSize: 1024, format: format) { [atom] buffer, _ in
+        // Locked stems (OG/Guide/Click) tap the playerNode (pre-mute) so meter stays active when muted.
+        // Collective stems tap the mixerNode (post-gain, post-mute) which is correct for monitoring.
+        let isLocked = Self.lockedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+        let tapNode: AVAudioNode
+        if isLocked, let player = playerNodes[url] {
+            tapNode = player
+        } else if let mixer = stemMixers[url] {
+            tapNode = mixer
+        } else { return }
+        let format = tapNode.outputFormat(forBus: 0)
+        tapNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [atom] buffer, _ in
             guard let channelData = buffer.floatChannelData else { return }
             var peak: Float = 0
             for ch in 0..<Int(buffer.format.channelCount) {

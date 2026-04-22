@@ -429,7 +429,7 @@ struct EditView: View {
 
     private var loopBracketStrip: some View {
         HStack(spacing: 0) {
-            Color.bgCard.frame(width: 200)
+            Color.bgCard.frame(width: 220)
             Divider().foregroundColor(Color.border)
             HStack(spacing: 6) {
                 Image(systemName: "repeat")
@@ -464,7 +464,7 @@ struct EditView: View {
                 // Left column: track headers — anchored, never scrolls horizontally
                 VStack(spacing: 0) {
                     Color.bgCard
-                        .frame(width: 200, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
                     Divider().foregroundColor(Color.border)
                     ForEach(sortedStemURLs, id: \.self) { url in
                         let state = editPlayer.stemStates[url] ?? StemState()
@@ -522,7 +522,7 @@ struct EditView: View {
                         Divider().foregroundColor(Color.border)
                     }
                 }
-                .frame(width: 200)
+                .frame(width: 220)
 
                 Divider().foregroundColor(Color.border)
 
@@ -651,7 +651,7 @@ struct EditView: View {
 
         // Global selection bar — outside ScrollView, always visible regardless of vertical scroll
         HStack(spacing: 0) {
-            Color.bgCard.frame(width: 200)
+            Color.bgCard.frame(width: 220)
             Divider().foregroundColor(Color.border)
             let globalRange: Range<Double>? = {
                 guard !stemSelections.isEmpty else { return nil }
@@ -935,7 +935,7 @@ struct EditTrackSidebar: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .frame(width: 200, height: height, alignment: .topLeading)
+        .frame(width: 220, height: height, alignment: .topLeading)
         .background(isSelected ? Color.accent.opacity(0.08) : Color.bgCard)
         .contextMenu {
             if let remove = onRemoveStem {
