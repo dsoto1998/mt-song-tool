@@ -670,48 +670,69 @@ class EditPlayerService: ObservableObject {
     private var collectiveURLs: [URL] {
         stemURLs.filter { url in
             let name = url.deletingPathExtension().lastPathComponent.uppercased()
-            return !Self.lockedStemNames.contains(name)
+            return !Self.lockedStemNames.contains(name) && stemStates[url]?.isExcluded != true
         }
     }
 
     var hasCollectiveStems: Bool { !collectiveURLs.isEmpty }
 
-    /// Scans the mixed collective stems for true peak using 4x oversampling.
-    /// Uses streaming AVAudioConverter so the polyphase FIR filter state stays warm across chunks.
-    /// Returns linear peak amplitude (not dB).
-    private static func scanCollectiveMixTruePeak(urls: [URL], gains: [URL: Float]) async -> Float {
+    // Per-stem data captured on main thread before async scan.
+    private struct NormItem: Sendable {
+        let url: URL
+        let gain: Float
+        let trimIn: Double
+        let trimOut: Double?
+    }
+
+    /// Sums all collective stems into a virtual bus and measures true peak (4× oversampled).
+    /// Each file is read from its trimIn..trimOut range; files are aligned from position 0.
+    /// Uses max(all file lengths) as total — no early stop if one file is shorter.
+    private static func scanBusTruePeak(items: [NormItem]) async -> Float {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let chunkFrames = AVAudioFrameCount(4096)
                 let oversampleFactor = 4
 
-                // Open all files; use format of first file as mix format.
-                let files = urls.compactMap { try? AVAudioFile(forReading: $0) }
-                guard let firstFile = files.first else { continuation.resume(returning: 0); return }
+                struct StemFile {
+                    let file: AVAudioFile
+                    let gain: Float
+                    let startFrame: Int64
+                    let endFrame: Int64
+                }
 
-                let srcFormat = firstFile.processingFormat
+                let stemFiles: [StemFile] = items.compactMap { item in
+                    guard let file = try? AVAudioFile(forReading: item.url) else { return nil }
+                    let sr = file.processingFormat.sampleRate
+                    let totalFileFrames = file.length
+                    let start = Int64(item.trimIn * sr)
+                    let end = item.trimOut.map { Int64($0 * sr) } ?? totalFileFrames
+                    let s = min(max(0, start), totalFileFrames)
+                    let e = min(max(s, end), totalFileFrames)
+                    return StemFile(file: file, gain: item.gain, startFrame: s, endFrame: e)
+                }
+                guard !stemFiles.isEmpty else { continuation.resume(returning: 0); return }
+
+                let srcFormat = stemFiles[0].file.processingFormat
                 let sampleRate = srcFormat.sampleRate
                 let channelCount = srcFormat.channelCount
+
+                // Scan length = longest trimmed stem — never cut short by a shorter sibling.
+                let totalFrames = stemFiles.map { $0.endFrame - $0.startFrame }.max() ?? 0
+                guard totalFrames > 0 else { continuation.resume(returning: 0); return }
 
                 guard let dstFormat = AVAudioFormat(
                     standardFormatWithSampleRate: sampleRate * Double(oversampleFactor),
                     channels: channelCount
-                ) else { continuation.resume(returning: 0); return }
-
-                guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
-                    continuation.resume(returning: 0); return
-                }
-
-                let dstCapacity = chunkFrames * AVAudioFrameCount(oversampleFactor)
-                guard let dstChunk = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: dstCapacity),
-                      let mixChunk = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: chunkFrames)
+                ),
+                let converter = AVAudioConverter(from: srcFormat, to: dstFormat),
+                let dstChunk = AVAudioPCMBuffer(pcmFormat: dstFormat,
+                                               frameCapacity: chunkFrames * AVAudioFrameCount(oversampleFactor)),
+                let mixChunk = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: chunkFrames)
                 else { continuation.resume(returning: 0); return }
 
-                let totalFrames = Int64(firstFile.length)
                 var framesProcessed = Int64(0)
                 var allTimePeak: Float = 0
 
-                // Streaming convert: single converter instance, .endOfStream only when exhausted.
                 while true {
                     dstChunk.frameLength = 0
                     var convError: NSError?
@@ -722,25 +743,24 @@ class EditPlayerService: ObservableObject {
                         }
                         let toProcess = AVAudioFrameCount(min(Int64(chunkFrames), totalFrames - framesProcessed))
 
-                        // Zero mix buffer
                         mixChunk.frameLength = toProcess
                         if let ch = mixChunk.floatChannelData {
-                            for c in 0..<Int(channelCount) {
-                                vDSP_vclr(ch[c], 1, vDSP_Length(toProcess))
-                            }
+                            for c in 0..<Int(channelCount) { vDSP_vclr(ch[c], 1, vDSP_Length(toProcess)) }
                         }
 
-                        // Accumulate each stem (gain-scaled) into mix buffer
-                        for (file, url) in zip(files, urls) {
-                            let gain = gains[url] ?? 1.0
-                            let framePos = Int64(Double(framesProcessed) * (file.processingFormat.sampleRate / srcFormat.sampleRate))
-                            if let readBuf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: toProcess) {
-                                file.framePosition = framePos
-                                _ = try? file.read(into: readBuf, frameCount: toProcess)
+                        for sf in stemFiles {
+                            let fileFrame = sf.startFrame + framesProcessed
+                            guard fileFrame < sf.endFrame else { continue }
+                            let available = Int64(sf.endFrame - fileFrame)
+                            let frames = AVAudioFrameCount(min(Int64(toProcess), available))
+                            if let readBuf = AVAudioPCMBuffer(pcmFormat: sf.file.processingFormat,
+                                                              frameCapacity: frames) {
+                                sf.file.framePosition = fileFrame
+                                _ = try? sf.file.read(into: readBuf, frameCount: frames)
                                 if let src = readBuf.floatChannelData, let dst = mixChunk.floatChannelData {
                                     for c in 0..<Int(channelCount) {
-                                        var g = gain
-                                        vDSP_vsma(src[c], 1, &g, dst[c], 1, dst[c], 1, vDSP_Length(toProcess))
+                                        var g = sf.gain
+                                        vDSP_vsma(src[c], 1, &g, dst[c], 1, dst[c], 1, vDSP_Length(frames))
                                     }
                                 }
                             }
@@ -768,38 +788,104 @@ class EditPlayerService: ObservableObject {
         }
     }
 
-    /// Normalizes collective stems to −0.01 dBFS true peak and ORIGINAL SONG to −6 dBFS from file peak.
+    /// Single-file true peak scan (4× oversampled). Used for ORIGINAL SONG.
+    /// Returns linear peak of the raw file at unity gain.
+    private static func scanSingleTruePeak(url: URL) async -> Float {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let chunkFrames = AVAudioFrameCount(4096)
+                let oversampleFactor = 4
+                guard let file = try? AVAudioFile(forReading: url), file.length > 0 else {
+                    continuation.resume(returning: 0); return
+                }
+                let srcFormat = file.processingFormat
+                let totalFrames = file.length
+                guard let dstFormat = AVAudioFormat(
+                    standardFormatWithSampleRate: srcFormat.sampleRate * Double(oversampleFactor),
+                    channels: srcFormat.channelCount
+                ),
+                let converter = AVAudioConverter(from: srcFormat, to: dstFormat),
+                let dstChunk = AVAudioPCMBuffer(pcmFormat: dstFormat,
+                                               frameCapacity: chunkFrames * AVAudioFrameCount(oversampleFactor)),
+                let readChunk = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: chunkFrames)
+                else { continuation.resume(returning: 0); return }
+
+                var framesProcessed = Int64(0)
+                var allTimePeak: Float = 0
+                while true {
+                    dstChunk.frameLength = 0
+                    var convError: NSError?
+                    let status = converter.convert(to: dstChunk, error: &convError) { _, outStatus in
+                        guard framesProcessed < totalFrames else { outStatus.pointee = .endOfStream; return nil }
+                        let toProcess = AVAudioFrameCount(min(Int64(chunkFrames), totalFrames - framesProcessed))
+                        readChunk.frameLength = toProcess
+                        file.framePosition = framesProcessed
+                        _ = try? file.read(into: readChunk, frameCount: toProcess)
+                        framesProcessed += Int64(toProcess)
+                        outStatus.pointee = .haveData
+                        return readChunk
+                    }
+                    if let ch = dstChunk.floatChannelData {
+                        for c in 0..<Int(dstChunk.format.channelCount) {
+                            var peak: Float = 0
+                            vDSP_maxmgv(ch[c], 1, &peak, vDSP_Length(dstChunk.frameLength))
+                            allTimePeak = max(allTimePeak, peak)
+                        }
+                    }
+                    if status != .haveData { break }
+                }
+                continuation.resume(returning: allTimePeak)
+            }
+        }
+    }
+
+    /// Normalizes collective stems to −0.01 dBFS (bus true peak) and ORIGINAL SONG to −6 dBFS (file true peak).
+    /// Both scans run concurrently. Collective stems receive a uniform dB delta (balance preserved).
+    /// ORIGINAL SONG gain is set absolutely from file peak — previous gain adjustments are replaced.
     func normalizeStems() {
         guard !isNormalizing else { return }
-        let urls = collectiveURLs
-        guard !urls.isEmpty else { return }
+
+        let items: [NormItem] = collectiveURLs.compactMap { url in
+            guard let s = stemStates[url] else { return nil }
+            return NormItem(url: url, gain: s.gain, trimIn: s.trimIn, trimOut: s.trimOut)
+        }
+        guard !items.isEmpty else { return }
+
+        let ogURL = stemURLs.first {
+            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
+                && stemStates[$0]?.isExcluded != true
+        }
 
         isNormalizing = true
-        let currentGains = stemURLs.reduce(into: [URL: Float]()) { $0[$1] = stemStates[$1]?.gain ?? 1.0 }
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-            let peak = await Self.scanCollectiveMixTruePeak(urls: urls, gains: currentGains)
+
+            // Both scans fire concurrently.
+            async let busPeakTask = Self.scanBusTruePeak(items: items)
+            let busPeak: Float
+            let ogPeak: Float
+            if let ogURL {
+                async let ogPeakTask = Self.scanSingleTruePeak(url: ogURL)
+                (busPeak, ogPeak) = await (busPeakTask, ogPeakTask)
+            } else {
+                busPeak = await busPeakTask
+                ogPeak = 0
+            }
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                if peak > 0 {
-                    let targetLinear: Float = pow(10, -0.01 / 20)   // −0.01 dBFS
-                    let multiplier = targetLinear / peak
-                    for url in urls {
-                        let newGain = (self.stemStates[url]?.gain ?? 1.0) * multiplier
-                        self.setGain(url, newGain)
-                    }
+
+                // Uniform dB delta applied to all collective stems — relative balance preserved.
+                if busPeak > 0 {
+                    let targetLinear: Float = pow(10, -0.01 / 20)
+                    let multiplier = targetLinear / busPeak
+                    for item in items { self.setGain(item.url, item.gain * multiplier) }
                 }
 
-                // Normalize ORIGINAL SONG to −6 dBFS from raw file peak
-                let ogName = "ORIGINAL SONG"
-                if let ogURL = self.stemURLs.first(where: {
-                    $0.deletingPathExtension().lastPathComponent.uppercased() == ogName
-                }), let ogPeaks = self.stemStates[ogURL]?.peaks, let filePeak = ogPeaks.max(), filePeak > 0 {
-                    let ogTarget: Float = pow(10, -6.0 / 20)
-                    let ogMultiplier = ogTarget / filePeak
-                    self.setGain(ogURL, (self.stemStates[ogURL]?.gain ?? 1.0) * ogMultiplier)
+                // ORIGINAL SONG: absolute gain from raw-file true peak → −6 dBFS.
+                if let ogURL, ogPeak > 0 {
+                    self.setGain(ogURL, pow(10, -6.0 / 20) / ogPeak)
                 }
 
                 self.isNormalizing = false
