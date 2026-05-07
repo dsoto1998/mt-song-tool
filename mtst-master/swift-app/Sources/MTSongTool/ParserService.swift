@@ -1,6 +1,6 @@
 import Foundation
 
-struct TempoEvent: Codable {
+struct TempoEvent: Codable, Equatable {
     let beat: Double   // beat position in the session
     let bpm: Double    // tempo value at that beat
     let time: String   // formatted timecode MM:SS:mmm
@@ -15,6 +15,7 @@ struct ParsedResult {
     var timeSignatures: [TimeSig]
     var warnings: [String]
     var expectedDuration: Double?   // loop bracket length in seconds (nil if not computable)
+    var loopEndBeat: Double?        // Ableton transport loop end in beats (from session_info.loop_end)
     var firstTempoChangeMarkerIndex: Int?  // index of first marker at/after first tempo change; nil if no changes
     var liveMajorVersion: Int?      // e.g. 11 or 12; nil if not determinable
     var tempoEvents: [TempoEvent]   // beat→BPM automation events for metronome scheduling
@@ -291,6 +292,45 @@ class ParserService: ObservableObject {
         return key
     }
 
+    static func saveAlsEdits(
+        alsPath: String,
+        tempoEvents: [TempoEvent],
+        timeSigEvents: [TimeSigEvent],
+        locatorOverrides: [String: LocatorOverride],
+        outputPath: String? = nil
+    ) async throws -> String {
+        var cmd: [String: Any] = [
+            "action": "save_als_edits",
+            "path": alsPath,
+            "tempo_events": tempoEvents.map { ["beat": $0.beat, "bpm": $0.bpm] },
+            "time_sig_events": timeSigEvents.map { ["beat": $0.beat, "numerator": $0.numerator, "denominator": $0.denominator] },
+            "locator_overrides": locatorOverrides.compactMap { id, ov -> [String: Any]? in
+                if ov.beat == nil && ov.name == nil { return nil }
+                var d: [String: Any] = ["als_id": id]
+                if let b = ov.beat { d["beat"] = b }
+                if let n = ov.name { d["name"] = n }
+                return d
+            }
+        ]
+        if let out = outputPath { cmd["output_path"] = out }
+        guard let cmdData = try? JSONSerialization.data(withJSONObject: cmd),
+              let cmdStr  = String(data: cmdData, encoding: .utf8) else {
+            throw NSError(domain: "ParserService", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not build save_als_edits command"])
+        }
+        let output = await runSend(command: cmdStr)
+        guard let data = output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "ParserService", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid response from parser"])
+        }
+        if let err = json["error"] as? String {
+            throw NSError(domain: "ParserService", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: err])
+        }
+        return json["new_path"] as? String ?? alsPath
+    }
+
     nonisolated static func runSend(command: String) async -> String {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -324,6 +364,7 @@ class ParserService: ObservableObject {
 
         let warnings = json["warnings"] as? [String] ?? []
         let expectedDuration = json["expected_duration"] as? Double
+        let loopEndBeat = (json["session_info"] as? [String: Any])?["loop_end"] as? Double
         let firstTempoChangeMarkerIndex = json["first_tempo_change_marker_index"] as? Int
         let liveMajorVersion = json["live_major_version"] as? Int
 
@@ -341,6 +382,6 @@ class ParserService: ObservableObject {
         if !tempoEvents.isEmpty {
             Log("tempoEvents: \(tempoEvents.prefix(5).map { "beat=\($0.beat) bpm=\($0.bpm)" }.joined(separator: ", "))\(tempoEvents.count > 5 ? " …+\(tempoEvents.count - 5) more" : "")", "Parser")
         }
-        result = ParsedResult(file: fileName, bpm: bpm, markers: markers, timeSignatures: timeSigs, warnings: warnings, expectedDuration: expectedDuration, firstTempoChangeMarkerIndex: firstTempoChangeMarkerIndex, liveMajorVersion: liveMajorVersion, tempoEvents: tempoEvents)
+        result = ParsedResult(file: fileName, bpm: bpm, markers: markers, timeSignatures: timeSigs, warnings: warnings, expectedDuration: expectedDuration, loopEndBeat: loopEndBeat, firstTempoChangeMarkerIndex: firstTempoChangeMarkerIndex, liveMajorVersion: liveMajorVersion, tempoEvents: tempoEvents)
     }
 }

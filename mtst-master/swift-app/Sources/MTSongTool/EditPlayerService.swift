@@ -86,6 +86,13 @@ struct LocatorOverride {
     var beat: Double?
 }
 
+struct TimeSigEvent: Equatable {
+    var beat: Double
+    var numerator: Int
+    var denominator: Int
+    var sig: String { "\(numerator)/\(denominator)" }
+}
+
 @MainActor
 class EditPlayerService: ObservableObject {
     @Published var isPlaying: Bool = false
@@ -101,6 +108,8 @@ class EditPlayerService: ObservableObject {
     // MARK: - Session state
     @Published var locatorOverrides: [String: LocatorOverride] = [:]
     @Published var isSessionDirty: Bool = false
+    @Published var editableTempoEvents: [TempoEvent] = []
+    @Published var timeSigOverrides: [TimeSigEvent] = []
 
     func moveLocator(alsId: String, toBeat beat: Double) {
         var override = locatorOverrides[alsId] ?? LocatorOverride()
@@ -119,6 +128,115 @@ class EditPlayerService: ObservableObject {
     func clearSession() {
         locatorOverrides = [:]
         isSessionDirty = false
+    }
+
+    /// Load tempo events from parse result — deduplicate same-beat pairs to 1-per-step.
+    /// Keeps the last event at each beat position (the "after step" target BPM in Ableton format).
+    func seedTempoEvents(_ events: [TempoEvent]) {
+        let sorted = events.sorted { $0.beat < $1.beat }
+        var result: [TempoEvent] = []
+        var i = 0
+        while i < sorted.count {
+            var j = i + 1
+            while j < sorted.count && abs(sorted[j].beat - sorted[i].beat) < 0.001 { j += 1 }
+            result.append(sorted[j - 1])
+            i = j
+        }
+        editableTempoEvents = result
+    }
+
+    /// Add a new tempo event. No-op if within 0.5 beats of an existing event.
+    func addTempoEvent(atBeat beat: Double, bpm: Double) {
+        guard !editableTempoEvents.contains(where: { abs($0.beat - beat) < 0.5 }) else { return }
+        var evs = editableTempoEvents
+        evs.append(TempoEvent(beat: beat, bpm: max(1, bpm), time: ""))
+        evs.sort { $0.beat < $1.beat }
+        editableTempoEvents = evs
+        isSessionDirty = true
+    }
+
+    /// Delete tempo event by index. Refuses to delete the beat-0 anchor event (index 0).
+    func deleteTempoEvent(at index: Int) {
+        guard index > 0, index < editableTempoEvents.count else { return }
+        editableTempoEvents.remove(at: index)
+        isSessionDirty = true
+    }
+
+    /// Delete multiple tempo events by index. Beat-0 anchor (index 0) is never removed.
+    func deleteTempoEvents(at indices: [Int]) {
+        let toRemove = Set(indices).filter { $0 > 0 && $0 < editableTempoEvents.count }
+        guard !toRemove.isEmpty else { return }
+        saveUndoSnapshot()
+        editableTempoEvents = editableTempoEvents.enumerated()
+            .filter { !toRemove.contains($0.offset) }
+            .map(\.element)
+        isSessionDirty = true
+    }
+
+    // MARK: - Time Signature Overrides
+
+    /// Seed time sig overrides from parse result — falls back to 4/4 at beat 0 if empty.
+    func seedTimeSigEvents(_ timeSigs: [TimeSig]) {
+        let parsed: [TimeSigEvent] = timeSigs.compactMap { ts in
+            let parts = ts.sig.split(separator: "/")
+            guard parts.count == 2,
+                  let n = Int(parts[0]), let d = Int(parts[1]) else { return nil }
+            return TimeSigEvent(beat: ts.beat ?? 0, numerator: n, denominator: d)
+        }.sorted { $0.beat < $1.beat }
+        timeSigOverrides = parsed.isEmpty ? [TimeSigEvent(beat: 0, numerator: 4, denominator: 4)] : parsed
+    }
+
+    /// Add a new time sig event. No-op if within 0.5 beats of an existing event.
+    func addTimeSig(atBeat beat: Double, numerator: Int, denominator: Int) {
+        guard !timeSigOverrides.contains(where: { abs($0.beat - beat) < 0.5 }) else { return }
+        timeSigOverrides.append(TimeSigEvent(beat: beat, numerator: numerator, denominator: denominator))
+        timeSigOverrides.sort { $0.beat < $1.beat }
+        isSessionDirty = true
+    }
+
+    /// Delete time sig event by index. Refuses to delete the beat-0 anchor (index 0).
+    func deleteTimeSig(at index: Int) {
+        guard index > 0, index < timeSigOverrides.count else { return }
+        timeSigOverrides.remove(at: index)
+        isSessionDirty = true
+    }
+
+    /// Update the numerator/denominator of a time sig event.
+    func updateTimeSig(at index: Int, numerator: Int, denominator: Int) {
+        guard index >= 0, index < timeSigOverrides.count else { return }
+        timeSigOverrides[index].numerator = numerator
+        timeSigOverrides[index].denominator = denominator
+        isSessionDirty = true
+    }
+
+    /// Reposition a time sig event to a new beat. Beat-0 anchor is immovable.
+    /// Clamps to stay between its neighbors (0.5-beat gap minimum).
+    func moveTimeSig(at index: Int, toBeat beat: Double) {
+        guard index > 0, index < timeSigOverrides.count else { return }
+        let prevBeat = timeSigOverrides[index - 1].beat + 0.5
+        let nextBeat = index < timeSigOverrides.count - 1 ? timeSigOverrides[index + 1].beat - 0.5 : Double.infinity
+        timeSigOverrides[index].beat = max(prevBeat, min(nextBeat, beat))
+        isSessionDirty = true
+    }
+
+    /// Update both beat position and BPM of a tempo event in a single publish.
+    /// Beat-0 event's beat is locked; only BPM can change.
+    func updateTempoEvent(at index: Int, beat: Double, bpm: Double) {
+        guard index >= 0, index < editableTempoEvents.count else { return }
+        var evs = editableTempoEvents
+        let old = evs[index]
+        let finalBeat: Double
+        if index == 0 {
+            finalBeat = old.beat  // immovable
+        } else {
+            let prevBeat = evs[index - 1].beat + 0.001
+            let nextBeat = index < evs.count - 1 ? evs[index + 1].beat - 0.001 : Double.infinity
+            finalBeat = max(prevBeat, min(nextBeat, beat))
+        }
+        evs[index] = TempoEvent(beat: finalBeat, bpm: max(1, bpm), time: old.time,
+                                isRampStart: old.isRampStart, isRampEnd: old.isRampEnd)
+        editableTempoEvents = evs
+        isSessionDirty = true
     }
 
     // MARK: - Undo / Redo

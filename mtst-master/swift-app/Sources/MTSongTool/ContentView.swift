@@ -66,6 +66,11 @@ struct ContentView: View {
     @State private var openSongKeyPicker = false
     @State private var openTimeSigPicker = false
 
+    // ALS picker (shown when folder drop finds multiple .als files)
+    @State private var showAlsPicker: Bool = false
+    @State private var alsPickerCandidates: [URL] = []
+    @State private var pendingDropFolder: URL? = nil
+
     var body: some View {
         ZStack {
             Color.bg.ignoresSafeArea()
@@ -100,6 +105,8 @@ struct ContentView: View {
                         analyzer: audioAnalyzer,
                         parsedResult: parser.result,
                         onLocatorFix: { fixes in applyLocatorFixes(fixes) },
+                        onSaveEdits: { newPath in loadNewFile(path: newPath) },
+                        alsFullPath: parser.alsPath,
                         mtCompleteMode: userSettings.mtCompleteMode,
                         onFolderDrop: { url in handleFolderDrop(url) }
                     )
@@ -270,6 +277,20 @@ struct ContentView: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text("This session was saved in an older version of Ableton. Open it in Ableton 11 and save it before loading it in MT Song Tool.")
+        }
+        .sheet(isPresented: $showAlsPicker) {
+            AlsPickerSheet(candidates: alsPickerCandidates) { chosen in
+                showAlsPicker = false
+                loadNewFile(path: chosen.path)
+                if let folder = pendingDropFolder {
+                    loadStemsFromFolder(folder)
+                }
+            } onCancel: {
+                showAlsPicker = false
+                if let folder = pendingDropFolder {
+                    loadStemsFromFolder(folder)
+                }
+            }
         }
     }
 
@@ -681,19 +702,58 @@ struct ContentView: View {
 
     // MARK: Handle a dropped session folder — finds .als + stems subfolder
     private func handleFolderDrop(_ url: URL) {
+        let alsFiles = findALSFiles(in: url)
+
+        pendingDropFolder = url
+
+        if alsFiles.count == 1 {
+            loadNewFile(path: alsFiles[0].path)
+            loadStemsFromFolder(url)
+            pendingDropFolder = nil
+        } else if alsFiles.count > 1 {
+            alsPickerCandidates = alsFiles
+            showAlsPicker = true
+            // stems loaded after user picks (or cancels) in the sheet callback
+        } else {
+            // No .als found — load stems only
+            loadStemsFromFolder(url)
+            pendingDropFolder = nil
+        }
+    }
+
+    /// Recursively search `directory` for .als files, skipping any folder named "backups".
+    private func findALSFiles(in directory: URL) -> [URL] {
+        let fm = FileManager.default
+        var results: [URL] = []
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        for case let fileURL as URL in enumerator {
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: fileURL.path, isDirectory: &isDir)
+            if isDir.boolValue {
+                if fileURL.lastPathComponent.lowercased() == "backups" {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            if fileURL.pathExtension.lowercased() == "als" {
+                results.append(fileURL)
+            }
+        }
+        return results
+    }
+
+    /// Load stems from the first subfolder of `root` that contains .wav files.
+    private func loadStemsFromFolder(_ root: URL) {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(
-            at: url,
+            at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: .skipsHiddenFiles
         ) else { return }
-
-        // Load the first .als found at root
-        if let alsURL = items.first(where: { $0.pathExtension.lowercased() == "als" }) {
-            loadNewFile(path: alsURL.path)
-        }
-
-        // Find the first subdirectory that contains .wav files — treat it as the stems folder
         let subfolders = items.filter { item in
             var isDir: ObjCBool = false
             fm.fileExists(atPath: item.path, isDirectory: &isDir)
@@ -1487,5 +1547,66 @@ struct ContentView: View {
                     .overlay(RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.border, lineWidth: 1))
             )
+    }
+}
+
+// MARK: - ALS file picker sheet (shown when folder drop contains multiple .als files)
+
+struct AlsPickerSheet: View {
+    let candidates: [URL]
+    let onSelect: (URL) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Multiple .als files found")
+                .font(.horizon(size: 13))
+                .foregroundColor(.fgBright)
+                .padding(.bottom, 4)
+            Text("Choose which session to load:")
+                .font(.lato(size: 11))
+                .foregroundColor(.fgMid)
+                .padding(.bottom, 12)
+
+            ScrollView {
+                VStack(spacing: 4) {
+                    ForEach(candidates, id: \.path) { url in
+                        Button {
+                            onSelect(url)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(url.lastPathComponent)
+                                    .font(.lato(size: 12, weight: .bold))
+                                    .foregroundColor(.fgBright)
+                                Text(url.deletingLastPathComponent().path)
+                                    .font(.lato(size: 10))
+                                    .foregroundColor(.fgMid)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.border.opacity(0.25))
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 300)
+
+            HStack {
+                Spacer()
+                Button("Load Stems Only") { onCancel() }
+                    .font(.lato(size: 11))
+                    .foregroundColor(.fgMid)
+                    .buttonStyle(.plain)
+            }
+            .padding(.top, 12)
+        }
+        .padding(20)
+        .frame(width: 400)
+        .background(Color.bgCard)
     }
 }

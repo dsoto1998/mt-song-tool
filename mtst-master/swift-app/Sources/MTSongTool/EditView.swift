@@ -12,6 +12,8 @@ struct EditView: View {
     @ObservedObject var analyzer: AudioAnalyzerService
     let parsedResult: ParsedResult?
     var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
+    var onSaveEdits: (String) -> Void = { _ in }
+    var alsFullPath: String? = nil   // full .als path for Save Session (parsedResult.file is basename only)
     var mtCompleteMode: Bool = false
     var onFolderDrop: ((URL) -> Void)? = nil
 
@@ -31,13 +33,18 @@ struct EditView: View {
     @State private var canvasRightPadding: Double = 0   // extra seconds grown when user scrolls near right edge
     @State private var isFolderDropTargeted: Bool = false
 
-    // Commit state
-    @State private var isCommitting: Bool = false
+    // Export state
+    @State private var isExporting: Bool = false
+    @State private var exportError: String? = nil
+    @State private var showExportError: Bool = false
 
-    @State private var commitError: String? = nil
-    @State private var showCommitError: Bool = false
-    @State private var showLargeOffsetWarning: Bool = false
-    @State private var largeOffsetSeconds: Double = 0
+    // Save session state
+    @State private var isSaving: Bool = false
+    @State private var saveError: String? = nil
+    @State private var showSaveError: Bool = false
+
+    // Stem removal confirmation (protected stems require dialog)
+    @State private var confirmRemoveStemURLs: [URL] = []
 
     // MARK: - Computed helpers
 
@@ -45,34 +52,41 @@ struct EditView: View {
     /// each time — ignores any saved value in the .als XML.
     private var loopBracket: (endBeat: Double, endSeconds: Double, bar: Int)? {
         let allMarkers = parsedResult?.markers ?? []
-        guard let ns = allMarkers.first(where: { $0.text.uppercased() == "NEXT SONG" }) else { return nil }
-        let nsBeat: Double
-        if let ov = editPlayer.locatorOverrides[ns.alsId], let b = ov.beat {
-            nsBeat = b
-        } else if let b = ns.beat {
-            nsBeat = b
+        let endBeat: Double
+
+        if let ns = allMarkers.first(where: { $0.text.uppercased() == "NEXT SONG" }) {
+            // Derive loop end from NEXT SONG position minus one bar (medley sessions)
+            let nsBeat: Double
+            if let ov = editPlayer.locatorOverrides[ns.alsId], let b = ov.beat {
+                nsBeat = b
+            } else if let b = ns.beat {
+                nsBeat = b
+            } else {
+                let schedule = metronome.beatSchedule
+                guard let secs = markerTimeToSeconds(ns.time), !schedule.isEmpty else { return nil }
+                let closest = schedule.min(by: { abs($0.timeSeconds - secs) < abs($1.timeSeconds - secs) })
+                nsBeat = closest?.absoluteBeat ?? 0
+            }
+            let timeSigs = parsedResult?.timeSignatures ?? []
+            let ts = timeSigs.filter { ($0.beat ?? 0) <= nsBeat }.last ?? timeSigs.first
+            let parts = ts?.sig.split(separator: "/") ?? []
+            let num = Double(parts.first.map(String.init) ?? "4") ?? 4
+            let den = Double(parts.last.map(String.init)  ?? "4") ?? 4
+            let beatsPerBar = num * (4.0 / den)
+            let candidate = nsBeat - beatsPerBar
+            guard candidate > 0 else { return nil }
+            endBeat = candidate
+        } else if let lb = parsedResult?.loopEndBeat, lb > 0 {
+            // MT Complete (no NEXT SONG) — use Ableton transport loop bracket directly
+            endBeat = lb
         } else {
-            // Fallback: derive beat from time string via beatSchedule (works without rebuilt parser)
-            let schedule = metronome.beatSchedule
-            guard let secs = markerTimeToSeconds(ns.time), !schedule.isEmpty else { return nil }
-            let closest = schedule.min(by: { abs($0.timeSeconds - secs) < abs($1.timeSeconds - secs) })
-            nsBeat = closest?.absoluteBeat ?? 0
+            return nil
         }
 
-        let timeSigs = parsedResult?.timeSignatures ?? []
-        let ts = timeSigs.filter { ($0.beat ?? 0) <= nsBeat }.last ?? timeSigs.first
-        let parts = ts?.sig.split(separator: "/") ?? []
-        let num = Double(parts.first.map(String.init) ?? "4") ?? 4
-        let den = Double(parts.last.map(String.init)  ?? "4") ?? 4
-        let beatsPerBar = num * (4.0 / den)
-
-        let loopEndBeat = nsBeat - beatsPerBar
-        guard loopEndBeat > 0 else { return nil }
-
         let schedule = metronome.beatSchedule
-        let secs = editBeatToSeconds(loopEndBeat, schedule: schedule)
-        let bar = schedule.filter { $0.isDownbeat && $0.absoluteBeat <= loopEndBeat + 0.01 }.last?.bar ?? 1
-        return (loopEndBeat, secs, bar)
+        let secs = editBeatToSeconds(endBeat, schedule: schedule)
+        let bar = schedule.filter { $0.isDownbeat && $0.absoluteBeat <= endBeat + 0.01 }.last?.bar ?? 1
+        return (endBeat, secs, bar)
     }
 
     private func markerTimeToSeconds(_ time: String) -> Double? {
@@ -106,6 +120,23 @@ struct EditView: View {
         Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
     }
 
+    private func triggerRemoveStem(_ url: URL) {
+        if isProtectedStemURL(url) {
+            confirmRemoveStemURLs = [url]
+        } else {
+            editPlayer.removeStem(url)
+            selectedURLs.remove(url)
+        }
+    }
+
+    private func triggerRemoveStems(_ urls: [URL]) {
+        var safe: [URL] = []
+        var protected_: [URL] = []
+        for url in urls { isProtectedStemURL(url) ? protected_.append(url) : safe.append(url) }
+        for url in safe { editPlayer.removeStem(url); selectedURLs.remove(url) }
+        if !protected_.isEmpty { confirmRemoveStemURLs = protected_ }
+    }
+
     /// CLICK TRACK → GUIDE → ORIGINAL SONG pinned to top; remainder alphabetical.
     /// Excludes stems marked isExcluded (deleted via Delete key, restorable via undo).
     private var sortedStemURLs: [URL] {
@@ -135,14 +166,19 @@ struct EditView: View {
 
     /// Build the beat schedule and extend it to cover the full canvas (audio + 10 empty bars).
     /// Called whenever the session or stems change so the grid fills the entire scrollable area.
+    /// Uses editableTempoEvents (user-edited) when available, falls back to parsedResult events.
     private func rebuildBeatSchedule() {
         guard let result = parsedResult else { return }
         let audioDur = result.expectedDuration ?? editPlayer.totalDuration
         guard audioDur > 0 else { return }
+        let tempoEvs = editPlayer.editableTempoEvents.isEmpty ? result.tempoEvents : editPlayer.editableTempoEvents
+        let timeSigsToUse: [TimeSig] = editPlayer.timeSigOverrides.isEmpty
+            ? result.timeSignatures
+            : editPlayer.timeSigOverrides.map { ev in TimeSig(time: "", sig: ev.sig, beat: ev.beat) }
         // First pass: build up to audio end so lastBarSeconds is accurate.
         metronome.buildSchedule(
-            tempoEvents: result.tempoEvents,
-            timeSigs: result.timeSignatures,
+            tempoEvents: tempoEvs,
+            timeSigs: timeSigsToUse,
             totalDuration: audioDur,
             staticBPM: result.bpm
         )
@@ -150,8 +186,8 @@ struct EditView: View {
         let extendedDur = canvasDuration
         guard extendedDur > audioDur else { return }
         metronome.buildSchedule(
-            tempoEvents: result.tempoEvents,
-            timeSigs: result.timeSignatures,
+            tempoEvents: tempoEvs,
+            timeSigs: timeSigsToUse,
             totalDuration: extendedDur,
             staticBPM: result.bpm
         )
@@ -226,6 +262,14 @@ struct EditView: View {
             if editPlayer.stemURLs.isEmpty || editPlayer.stemURLs != stemURLs {
                 editPlayer.loadStems(stemURLs)
             }
+            // Seed editable tempo events from parse result (deduplicates Ableton's 2-per-step pairs)
+            if let result = parsedResult, editPlayer.editableTempoEvents.isEmpty {
+                editPlayer.seedTempoEvents(result.tempoEvents)
+            }
+            // Seed time sig overrides from parse result
+            if let result = parsedResult, editPlayer.timeSigOverrides.isEmpty {
+                editPlayer.seedTimeSigEvents(result.timeSignatures)
+            }
             // Build metronome beat schedule from parsed session
             rebuildBeatSchedule()
         }
@@ -270,21 +314,97 @@ struct EditView: View {
             canvasRightPadding = 0
             selectedClipIDs = []
             editPlayer.loadStems(newURLs)
+            if let result = parsedResult {
+                editPlayer.seedTempoEvents(result.tempoEvents)
+                editPlayer.seedTimeSigEvents(result.timeSignatures)
+            }
             rebuildBeatSchedule()
         }
-        .alert("Commit Error", isPresented: $showCommitError) {
+        .onChange(of: editPlayer.editableTempoEvents) { _ in
+            rebuildBeatSchedule()
+        }
+        .onChange(of: editPlayer.timeSigOverrides) { _ in
+            rebuildBeatSchedule()
+        }
+        .confirmationDialog(
+            confirmRemoveStemURLs.count == 1
+                ? "\(confirmRemoveStemURLs[0].deletingPathExtension().lastPathComponent) is a protected stem."
+                : "These are protected stems: \(confirmRemoveStemURLs.map { $0.deletingPathExtension().lastPathComponent }.joined(separator: ", "))",
+            isPresented: Binding(
+                get: { !confirmRemoveStemURLs.isEmpty },
+                set: { if !$0 { confirmRemoveStemURLs = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            let urls = confirmRemoveStemURLs
+            Button("Remove from Session", role: .destructive) {
+                for url in urls { editPlayer.removeStem(url); selectedURLs.remove(url) }
+                confirmRemoveStemURLs = []
+            }
+            Button("Cancel", role: .cancel) { confirmRemoveStemURLs = [] }
+        }
+        .alert("Export Error", isPresented: $showExportError) {
             Button("OK") {}
         } message: {
-            Text(commitError ?? "Unknown error")
+            Text(exportError ?? "Unknown error")
         }
-        .alert("Large Stem Offset", isPresented: $showLargeOffsetWarning) {
-            Button("Commit Anyway", role: .destructive) { performCommit() }
-            Button("Cancel", role: .cancel) {}
+        .alert("Save Error", isPresented: $showSaveError) {
+            Button("OK") {}
         } message: {
-            let mins = Int(largeOffsetSeconds) / 60
-            let secs = Int(largeOffsetSeconds) % 60
-            let formatted = mins > 0 ? "\(mins)m \(secs)s" : "\(secs)s"
-            Text("One or more stems are offset by \(formatted). Committing will prepend that much silence to the output file. Are you sure?")
+            Text(saveError ?? "Unknown error")
+        }
+    }
+
+    // MARK: - Save Session
+
+    private func saveSession() async {
+        guard let path = alsFullPath, !path.isEmpty else { return }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            let newPath = try await ParserService.saveAlsEdits(
+                alsPath: path,
+                tempoEvents: editPlayer.editableTempoEvents,
+                timeSigEvents: editPlayer.timeSigOverrides,
+                locatorOverrides: editPlayer.locatorOverrides
+            )
+            editPlayer.locatorOverrides = [:]
+            editPlayer.isSessionDirty = false
+            onSaveEdits(newPath)
+        } catch {
+            saveError = error.localizedDescription
+            showSaveError = true
+        }
+    }
+
+    private func saveSessionAs() async {
+        guard let path = alsFullPath, !path.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "als")!]
+        panel.nameFieldStringValue = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        panel.directoryURL = URL(fileURLWithPath: path).deletingLastPathComponent()
+        panel.title = "Save Session As"
+        panel.prompt = "Save"
+        guard await panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.mainWindow ?? NSWindow()) == .OK,
+              let outputURL = panel.url else { return }
+        var outputPath = outputURL.path
+        if !outputPath.hasSuffix(".als") { outputPath += ".als" }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            let newPath = try await ParserService.saveAlsEdits(
+                alsPath: path,
+                tempoEvents: editPlayer.editableTempoEvents,
+                timeSigEvents: editPlayer.timeSigOverrides,
+                locatorOverrides: editPlayer.locatorOverrides,
+                outputPath: outputPath
+            )
+            editPlayer.locatorOverrides = [:]
+            editPlayer.isSessionDirty = false
+            onSaveEdits(newPath)
+        } catch {
+            saveError = error.localizedDescription
+            showSaveError = true
         }
     }
 
@@ -408,19 +528,61 @@ struct EditView: View {
 
             Divider().frame(height: 18)
 
-            // Commit Changes
-            if isCommitting {
+            // Save Session / Save As
+            if isSaving {
+                HStack(spacing: 4) {
+                    ProgressView().scaleEffect(0.7).tint(Color.accent)
+                    Text("Saving…")
+                        .font(.lato(size: 11, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                }
+            } else {
+                Button {
+                    Task { await saveSession() }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("Save Session")
+                        if editPlayer.isSessionDirty && parsedResult != nil {
+                            Circle()
+                                .fill(Color.accent)
+                                .frame(width: 5, height: 5)
+                        }
+                    }
+                }
+                .font(.lato(size: 11, weight: .semibold))
+                .foregroundColor(editPlayer.isSessionDirty && parsedResult != nil ? Color.accent : Color.fgMid)
+                .buttonStyle(.plain)
+                .disabled(!editPlayer.isSessionDirty || parsedResult == nil)
+                .help("Write tempo map, time signatures, and locator edits back to the .als file  ⌘S")
+                .keyboardShortcut("s", modifiers: .command)
+
+                Button("Save As…") {
+                    Task { await saveSessionAs() }
+                }
+                .font(.lato(size: 11, weight: .semibold))
+                .foregroundColor(parsedResult != nil ? Color.fgMid : Color.fgMid.opacity(0.4))
+                .buttonStyle(.plain)
+                .disabled(parsedResult == nil)
+                .help("Export a copy of the session to a new file  ⌘⇧S")
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+            }
+
+            Divider().frame(height: 18)
+
+            // Export Stems
+            if isExporting {
                 ProgressView()
                     .scaleEffect(0.7)
                     .tint(Color.accent)
             } else {
-                Button("Commit Changes") {
-                    commitChanges()
+                let canExport = loopBracket != nil && !analyzer.stemURLs.isEmpty
+                Button("Export Stems") {
+                    startExport()
                 }
                 .font(.lato(size: 11, weight: .semibold))
-                .foregroundColor(editPlayer.hasAnyEdits ? Color.accent : Color.fgMid)
+                .foregroundColor(canExport ? Color.accent : Color.fgMid)
                 .buttonStyle(.plain)
-                .disabled(!editPlayer.hasAnyEdits)
+                .disabled(!canExport)
             }
         }
     }
@@ -464,7 +626,7 @@ struct EditView: View {
                 // Left column: track headers — anchored, never scrolls horizontally
                 VStack(spacing: 0) {
                     Color.bgCard
-                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.tempoLaneHeight + WaveformScrollHost.timeSigLaneHeight)
                     Divider().foregroundColor(Color.border)
                     ForEach(sortedStemURLs, id: \.self) { url in
                         let state = editPlayer.stemStates[url] ?? StemState()
@@ -513,10 +675,7 @@ struct EditView: View {
                             onRename: { newName in
                                 analyzer.renameStem(oldFilename: url.lastPathComponent, newStemName: newName)
                             },
-                            onRemoveStem: isProtectedStemURL(url) ? nil : {
-                                editPlayer.removeStem(url)
-                                selectedURLs.remove(url)
-                            }
+                            onRemoveStem: { triggerRemoveStem(url) }
                         )
 
                         Divider().foregroundColor(Color.border)
@@ -590,10 +749,8 @@ struct EditView: View {
                             stemSelections = [:]
                         },
                         onRemoveStem: {
-                            let toRemove = selectedURLs.filter { !isProtectedStemURL($0) }
-                            guard !toRemove.isEmpty else { return }
-                            for url in toRemove { editPlayer.removeStem(url) }
-                            selectedURLs.subtract(toRemove)
+                            guard !selectedURLs.isEmpty else { return }
+                            triggerRemoveStems(Array(selectedURLs))
                         },
                         selectedURLs: selectedURLs,
                         onLocatorFix: onLocatorFix,
@@ -628,9 +785,28 @@ struct EditView: View {
                                 ? selectedClipIDs : Set([id])
                             editPlayer.trimSegmentsRight(ids: ids, delta: delta)
                         },
-                        onRemoveStemByURL: { url in
-                            editPlayer.removeStem(url)
-                            selectedURLs.remove(url)
+                        onRemoveStemByURL: { url in triggerRemoveStem(url) },
+                        editableTempoEvents: editPlayer.editableTempoEvents,
+                        onTempoAdd: { beat, bpm in editPlayer.addTempoEvent(atBeat: beat, bpm: bpm) },
+                        onTempoDelete: { idx in editPlayer.deleteTempoEvent(at: idx) },
+                        onTempoDeleteMultiple: { indices in editPlayer.deleteTempoEvents(at: indices) },
+                        onTempoCommitDrag: { idx, beat, bpm in editPlayer.updateTempoEvent(at: idx, beat: beat, bpm: bpm) },
+                        timeSigOverrides: editPlayer.timeSigOverrides,
+                        onTimeSigAdd: { tapSecs, num, den in
+                            let db = metronome.beatSchedule.filter { $0.isDownbeat }
+                            guard !db.isEmpty else { return }
+                            let nearest = db.min(by: { abs($0.timeSeconds - tapSecs) < abs($1.timeSeconds - tapSecs) })!
+                            guard nearest.absoluteBeat > 0.001 else { return }
+                            editPlayer.addTimeSig(atBeat: nearest.absoluteBeat, numerator: num, denominator: den)
+                        },
+                        onTimeSigDelete: { idx in editPlayer.deleteTimeSig(at: idx) },
+                        onTimeSigChange: { idx, num, den in editPlayer.updateTimeSig(at: idx, numerator: num, denominator: den) },
+                        onTimeSigMove: { idx, beat in editPlayer.moveTimeSig(at: idx, toBeat: beat) },
+                        onTimeSigSnapToDownbeat: { rawSecs in
+                            let db = metronome.beatSchedule.filter { $0.isDownbeat }
+                            guard !db.isEmpty else { return (rawSecs, 0) }
+                            let nearest = db.min(by: { abs($0.timeSeconds - rawSecs) < abs($1.timeSeconds - rawSecs) })!
+                            return (nearest.timeSeconds, nearest.absoluteBeat)
                         }
                     )
 
@@ -639,7 +815,7 @@ struct EditView: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: sortedStemURLs.reduce(CGFloat(0)) {
                     $0 + (rowHeights[$1] ?? defaultRowHeight) + 1
-                } + WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+                } + WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.tempoLaneHeight + WaveformScrollHost.timeSigLaneHeight)
                 .background(GeometryReader { geo in
                     Color.clear
                         .onAppear { viewportWidth = geo.size.width }
@@ -725,37 +901,36 @@ struct EditView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: - Commit
+    // MARK: - Export
 
-    private func commitChanges() {
-        // Warn if any stem has been dragged more than 30 seconds right — commit will
-        // prepend that much silence to the output file.
-        let maxOffset = editPlayer.stemStates.values
-            .compactMap { $0.segments.min(by: { $0.sessionStart < $1.sessionStart })?.sessionStart }
-            .max() ?? 0
-        if maxOffset > 30 {
-            largeOffsetSeconds = maxOffset
-            showLargeOffsetWarning = true
-            return
-        }
-        performCommit()
-    }
+    private func startExport() {
+        guard let lb = loopBracket else { return }
 
-    private func performCommit() {
-        isCommitting = true
+        let panel = NSOpenPanel()
+        panel.title = "Choose Export Folder"
+        panel.message = "Stems will be written into the selected folder."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Export Here"
+
+        guard panel.runModal() == .OK, let outputFolder = panel.url else { return }
+
+        isExporting = true
         editPlayer.stop()
         metronome.stop()
-        analyzer.applyEdits(
+
+        analyzer.exportStems(
+            outputFolder: outputFolder,
+            loopEndSeconds: lb.endSeconds,
             stemStates: editPlayer.stemStates,
             autoFadeCuts: userSettings.autoFadeCuts
         ) { error in
-            isCommitting = false
+            isExporting = false
             if let error {
-                commitError = error
-                showCommitError = true
-            } else {
-                // Reload the edit player with the new folder
-                editPlayer.loadStems(analyzer.stemURLs)
+                exportError = error
+                showExportError = true
             }
         }
     }
@@ -881,55 +1056,67 @@ struct EditTrackSidebar: View {
                     .cornerRadius(3)
                     .buttonStyle(.plain)
 
-                // Peak dBFS meter
+                // Peak dBFS meter + peak dB number immediately to its right
                 StemPeakMeter(peakDB: meterDB)
                     .frame(width: 50, height: 8)
 
-                Spacer()
-
-                // Locked stems (OG/Guide/Click) get peak-hold meter in remaining space
                 if isLockedStem {
                     LockedStemMeter(peakDB: meterDB, allTimePeak: allTimePeak) {
                         allTimePeak = -96
                     }
                 }
+
+                Spacer()
             }
             .onChange(of: meterDB) { db in
                 if isLockedStem, db > allTimePeak { allTimePeak = db }
             }
 
             // Gain (dB: -60 to +60, 0 dB = neutral)
-            HStack(spacing: 4) {
-                Text("Gain")
-                    .font(.lato(size: 10))
-                    .foregroundColor(Color.fgMid)
-                Slider(value: Binding(
-                    get: { Double(max(-60, min(60, linearToDb(state.gain)))) },
-                    set: { onGainChange(dbToLinear(Float($0))) }
-                ), in: -60...60)
-                .frame(width: 70)
-                if isEditingGain {
-                    TextField("", text: $gainEditText)
-                        .font(.lato(size: 10))
-                        .foregroundColor(Color.fgBright)
-                        .monospacedDigit()
-                        .frame(width: 46)
-                        .textFieldStyle(.plain)
-                        .background(Color.border.opacity(0.3))
-                        .cornerRadius(3)
-                        .onSubmit { commitGainEdit() }
-                        .onExitCommand { isEditingGain = false }
-                } else {
+            if isLockedStem {
+                HStack(spacing: 4) {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.fgMid)
                     let db = linearToDb(state.gain)
-                    Text(db >= 0 ? String(format: "+%.1f", db) : String(format: "%.1f", db))
+                    Text(db >= 0 ? String(format: "+%.1f dB", db) : String(format: "%.1f dB", db))
                         .font(.lato(size: 10))
-                        .foregroundColor(db == 0 ? Color.fgMid : Color.accent)
+                        .foregroundColor(db == 0 ? Color.fgMid : Color.accent2)
                         .monospacedDigit()
-                        .frame(width: 46)
-                        .onTapGesture(count: 2) {
-                            gainEditText = String(format: "%.1f", db)
-                            isEditingGain = true
-                        }
+                }
+            } else {
+                HStack(spacing: 4) {
+                    Text("Gain")
+                        .font(.lato(size: 10))
+                        .foregroundColor(Color.fgMid)
+                    Slider(value: Binding(
+                        get: { Double(max(-60, min(60, linearToDb(state.gain)))) },
+                        set: { onGainChange(dbToLinear(Float($0))) }
+                    ), in: -60...60)
+                    .frame(width: 70)
+                    if isEditingGain {
+                        TextField("", text: $gainEditText)
+                            .font(.lato(size: 10))
+                            .foregroundColor(Color.fgBright)
+                            .monospacedDigit()
+                            .frame(width: 46)
+                            .textFieldStyle(.plain)
+                            .background(Color.border.opacity(0.3))
+                            .cornerRadius(3)
+                            .onSubmit { commitGainEdit() }
+                            .onExitCommand { isEditingGain = false }
+                    } else {
+                        let db = linearToDb(state.gain)
+                        Text(db >= 0 ? String(format: "+%.1f", db) : String(format: "%.1f", db))
+                            .font(.lato(size: 10))
+                            .foregroundColor(db == 0 ? Color.fgMid : Color.accent2)
+                            .monospacedDigit()
+                            .frame(width: 46)
+                            .onTapGesture(count: 2) {
+                                gainEditText = String(format: "%.1f", db)
+                                isEditingGain = true
+                            }
+                    }
                 }
             }
         }
@@ -1371,15 +1558,32 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onTrimRightEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onRemoveStemByURL: ((URL) -> Void)? = nil
 
+    // Tempo lane
+    var editableTempoEvents: [TempoEvent] = []
+    var onTempoAdd: (Double, Double) -> Void = { _, _ in }
+    var onTempoDelete: (Int) -> Void = { _ in }
+    var onTempoDeleteMultiple: ([Int]) -> Void = { _ in }
+    var onTempoCommitDrag: (Int, Double, Double) -> Void = { _, _, _ in }
+
+    // Time signature lane
+    var timeSigOverrides: [TimeSigEvent] = []
+    var onTimeSigAdd: (Double, Int, Int) -> Void = { _, _, _ in }
+    var onTimeSigDelete: (Int) -> Void = { _ in }
+    var onTimeSigChange: (Int, Int, Int) -> Void = { _, _, _ in }
+    var onTimeSigMove: (Int, Double) -> Void = { _, _ in }
+    var onTimeSigSnapToDownbeat: (Double) -> (Double, Double) = { s in (s, 0) }
+
     private static let protectedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
     private func isProtectedURL(_ url: URL) -> Bool {
         Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
     }
 
-    // 24px bar-number ruler + 20px locator lane
+    // 24px bar-number ruler + 20px locator lane + 28px tempo lane + 20px time sig lane
     static let rulerLaneHeight: CGFloat = 24
     static let locatorLaneHeight: CGFloat = 20
-    private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight
+    static let tempoLaneHeight: CGFloat = 28
+    static let timeSigLaneHeight: CGFloat = 20
+    private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.tempoLaneHeight + WaveformScrollHost.timeSigLaneHeight
 
     // MARK: - Time helper
     private static func markerSeconds(_ time: String) -> Double? {
@@ -1412,6 +1616,7 @@ struct WaveformScrollHost: NSViewRepresentable {
         var gridSubdivLayer: CAShapeLayer?
         var rulerBarNumberLayer: CALayer?   // container for bar number CATextLayers
         var locatorLineLayer: CAShapeLayer? // vertical lines through tracks at each locator
+        var tempoStaircaseLayer: CAShapeLayer? // BPM staircase line in tempo lane
         var waveformContainer: CALayer?    // container for per-stem waveform + outline layers
         var lastContentVersion: Int = -1
         var keyMonitor: Any?
@@ -1511,6 +1716,10 @@ struct WaveformScrollHost: NSViewRepresentable {
         for (alsId, ov) in locatorOverrides.sorted(by: { $0.key < $1.key }) {
             h.combine(alsId); h.combine(ov.beat)
         }
+        h.combine(editableTempoEvents.count)
+        for ev in editableTempoEvents { h.combine(ev.beat); h.combine(ev.bpm) }
+        h.combine(timeSigOverrides.count)
+        for ev in timeSigOverrides { h.combine(ev.beat); h.combine(ev.numerator); h.combine(ev.denominator) }
         return h.finalize()
     }
 
@@ -1619,6 +1828,16 @@ struct WaveformScrollHost: NSViewRepresentable {
         locatorLines.zPosition = 1
         hv.layer?.addSublayer(locatorLines)
 
+        // CALayer tempo staircase — BPM line in the tempo lane strip (vector, no texture size limit)
+        let tempoLaneY = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight
+        let tempoStaircase = CAShapeLayer()
+        tempoStaircase.strokeColor = NSColor(Color.fgMid).withAlphaComponent(0.55).cgColor
+        tempoStaircase.lineWidth = 1.5
+        tempoStaircase.fillColor = nil
+        tempoStaircase.frame = CGRect(x: 0, y: tempoLaneY, width: documentSize.width, height: WaveformScrollHost.tempoLaneHeight)
+        tempoStaircase.zPosition = 2
+        hv.layer?.addSublayer(tempoStaircase)
+
         // CALayer waveform container — per-stem waveform fills + segment outlines
         let waveformContainer = CALayer()
         waveformContainer.anchorPoint = CGPoint(x: 0, y: 0)
@@ -1647,6 +1866,7 @@ struct WaveformScrollHost: NSViewRepresentable {
         context.coordinator.gridSubdivLayer = gridSubdiv
         context.coordinator.rulerBarNumberLayer = rulerBarNumbers
         context.coordinator.locatorLineLayer = locatorLines
+        context.coordinator.tempoStaircaseLayer = tempoStaircase
         context.coordinator.waveformContainer = waveformContainer
 
         // Observe live scroll to grow the canvas when the user approaches the right edge.
@@ -1812,6 +2032,51 @@ struct WaveformScrollHost: NSViewRepresentable {
                     CATransaction.commit()
                 }
 
+            }
+
+            // Rebuild tempo staircase CAShapeLayer — vector path, no texture size limit
+            if let staircaseLayer = context.coordinator.tempoStaircaseLayer {
+                let tLaneY = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight
+                let tLaneH = WaveformScrollHost.tempoLaneHeight
+                staircaseLayer.frame = CGRect(x: 0, y: tLaneY, width: ds.width, height: tLaneH)
+                if !editableTempoEvents.isEmpty, totalDuration > 0 {
+                    let bpms = editableTempoEvents.map { $0.bpm }
+                    let lo = max(1.0, ((bpms.min()! - 20)).rounded())
+                    let hi = ((bpms.max()! + 20)).rounded()
+                    let span = max(hi - lo, 20.0)
+                    let mid = (lo + hi) / 2
+                    let rLo = max(1.0, mid - span / 2)
+                    let rHi = mid + span / 2
+                    func stairY(_ bpm: Double) -> CGFloat {
+                        let frac = CGFloat((bpm - rLo) / (rHi - rLo)).clamped(to: 0...1)
+                        return (tLaneH - 4) - frac * (tLaneH - 8)
+                    }
+                    func stairX(_ beat: Double) -> CGFloat {
+                        guard !beatSchedule.isEmpty else { return 0 }
+                        var prev = beatSchedule[0]
+                        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+                        return CGFloat(prev.timeSeconds / totalDuration) * ds.width
+                    }
+                    let stairPath = CGMutablePath()
+                    var prevY = stairY(editableTempoEvents[0].bpm)
+                    stairPath.move(to: CGPoint(x: 0, y: prevY))
+                    for i in 1..<editableTempoEvents.count {
+                        let ev = editableTempoEvents[i]
+                        let x = stairX(ev.beat)
+                        let y = stairY(ev.bpm)
+                        stairPath.addLine(to: CGPoint(x: x, y: prevY))
+                        stairPath.addLine(to: CGPoint(x: x, y: y))
+                        prevY = y
+                    }
+                    stairPath.addLine(to: CGPoint(x: ds.width, y: prevY))
+                    CATransaction.begin(); CATransaction.setDisableActions(true)
+                    staircaseLayer.path = stairPath
+                    CATransaction.commit()
+                } else {
+                    CATransaction.begin(); CATransaction.setDisableActions(true)
+                    staircaseLayer.path = nil
+                    CATransaction.commit()
+                }
             }
 
             // Rebuild per-stem waveform CAShapeLayers — during pinch zoom, scale the container
@@ -2100,6 +2365,32 @@ struct WaveformScrollHost: NSViewRepresentable {
                     onLocatorMove: onLocatorMove
                 )
                 .frame(height: WaveformScrollHost.locatorLaneHeight)
+
+                // Tempo lane — staircase BPM visualization with drag-to-edit
+                EditTempoLane(
+                    events: editableTempoEvents,
+                    totalDuration: totalDuration,
+                    beatSchedule: beatSchedule,
+                    onAdd: onTempoAdd,
+                    onDelete: onTempoDelete,
+                    onDeleteMultiple: onTempoDeleteMultiple,
+                    onCommitDrag: onTempoCommitDrag
+                )
+                .frame(height: WaveformScrollHost.tempoLaneHeight)
+
+                // Time signature lane — flags at each change point, click-to-add/edit/drag
+                EditTimeSigLane(
+                    events: timeSigOverrides,
+                    totalDuration: totalDuration,
+                    beatSchedule: beatSchedule,
+                    onAdd: onTimeSigAdd,
+                    onDelete: onTimeSigDelete,
+                    onChange: onTimeSigChange,
+                    onMove: onTimeSigMove,
+                    onSnapToDownbeat: onTimeSigSnapToDownbeat
+                )
+                .frame(height: WaveformScrollHost.timeSigLaneHeight)
+
                 let allHeights = stemURLs.map { rowHeights[$0] ?? defaultRowHeight }
                 ForEach(Array(stemURLs.enumerated()), id: \.element) { (idx, url) in
                     let state = stemStates[url] ?? StemState()
@@ -2139,7 +2430,7 @@ struct WaveformScrollHost: NSViewRepresentable {
                             onSetMultiStemSelection(covered, range)
                         },
                         onBeginInteraction: { editPlayer.saveUndoSnapshot() },
-                        onRemoveStem: (!isProtectedURL(url) && onRemoveStemByURL != nil) ? { onRemoveStemByURL?(url) } : nil
+                        onRemoveStem: onRemoveStemByURL != nil ? { onRemoveStemByURL?(url) } : nil
                     )
                     .frame(height: height)
 
@@ -2174,31 +2465,13 @@ struct LockedStemMeter: View {
     }
 
     var body: some View {
-        HStack(spacing: 4) {
-            Canvas { ctx, size in
-                ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 2),
-                         with: .color(Color.border.opacity(0.4)))
-                let w = size.width * meterFraction(peakDB)
-                if w > 0 {
-                    ctx.fill(Path(roundedRect: CGRect(x: 0, y: 0, width: w, height: size.height), cornerRadius: 2),
-                             with: .color(meterBarColor(peakDB)))
-                }
-                if allTimePeak > -96 {
-                    let tx = max(0, size.width * meterFraction(allTimePeak) - 1)
-                    ctx.fill(Path(CGRect(x: tx, y: 0, width: 1, height: size.height)),
-                             with: .color(meterBarColor(allTimePeak)))
-                }
-            }
-            .frame(width: 38, height: 6)
-
-            Text(peakLabel)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(allTimePeak > 0 ? .red : allTimePeak >= 0 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
-                .frame(width: 32, alignment: .trailing)
-                .onTapGesture { onReset() }
-                .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
-                .help("Peak hold — click to reset")
-        }
+        Text(peakLabel)
+            .font(.system(size: 9, design: .monospaced))
+            .foregroundColor(allTimePeak > 0 ? .red : allTimePeak >= 0 ? Color(red: 1, green: 0.8, blue: 0) : .fgMid)
+            .frame(width: 32, alignment: .leading)
+            .onTapGesture { onReset() }
+            .onHover { h in h ? NSCursor.pointingHand.set() : NSCursor.arrow.set() }
+            .help("Peak hold — click to reset")
     }
 }
 
@@ -2633,6 +2906,619 @@ struct EditLocatorLane: View {
 extension View {
     @ViewBuilder func `if`(_ condition: Bool, transform: (Self) -> some View) -> some View {
         if condition { transform(self) } else { self }
+    }
+}
+
+// MARK: - Tempo Lane (Edit tab)
+
+/// Interactive BPM staircase lane rendered below the locator lane.
+/// Each event is a draggable handle: left/right = reposition beat (snap to beat),
+/// up/down = change BPM (1 BPM snap; 0.01 with ⇧). Click empty space = add event.
+/// × button on hover (non-beat-0) = delete.
+struct EditTempoLane: View {
+    let events: [TempoEvent]
+    let totalDuration: Double
+    let beatSchedule: [BeatInfo]
+    let onAdd: (Double, Double) -> Void
+    let onDelete: (Int) -> Void
+    let onDeleteMultiple: ([Int]) -> Void
+    let onCommitDrag: (Int, Double, Double) -> Void   // (index, newBeat, newBpm)
+
+    private let handleR: CGFloat = 4.5
+    private let hitPad: CGFloat = 10    // extra hit radius around handle
+
+    @State private var dragIdx: Int? = nil
+    @State private var dragStartBeat: Double = 0
+    @State private var dragStartBPM: Double = 0
+    @State private var dragCurrentBeat: Double = 0
+    @State private var dragCurrentBPM: Double = 0
+    @State private var hoveredIdx: Int? = nil
+    @State private var selectedTempoIndices: Set<Int> = []
+
+    private func selectAll() {
+        selectedTempoIndices = Set(events.indices.filter { $0 > 0 })
+    }
+
+    private func deleteSelected() {
+        guard !selectedTempoIndices.isEmpty else { return }
+        onDeleteMultiple(Array(selectedTempoIndices))
+        selectedTempoIndices = []
+    }
+
+    // BPM visual range: session range ± 20 BPM, minimum 20 BPM span
+    private var bpmRange: (min: Double, max: Double) {
+        let bpms = events.map { $0.bpm }
+        guard !bpms.isEmpty else { return (80, 200) }
+        let lo = (bpms.min()! - 20).rounded()
+        let hi = (bpms.max()! + 20).rounded()
+        let span = max(hi - lo, 20.0)
+        let mid = (lo + hi) / 2
+        return (max(1, mid - span / 2), mid + span / 2)
+    }
+
+    private func yForBPM(_ bpm: Double, h: CGFloat) -> CGFloat {
+        let (lo, hi) = bpmRange
+        let frac = CGFloat((bpm - lo) / (hi - lo)).clamped(to: 0...1)
+        return (h - 4) - frac * (h - 8)
+    }
+
+    private func bpmForY(_ y: CGFloat, h: CGFloat) -> Double {
+        let (lo, hi) = bpmRange
+        let frac = Double(((h - 4) - y) / (h - 8))
+        return lo + frac * (hi - lo)
+    }
+
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return beat }
+        var prev = beatSchedule[0]
+        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
+
+    private func snapToBeat(_ secs: Double) -> (seconds: Double, beat: Double) {
+        guard !beatSchedule.isEmpty else { return (secs, 0) }
+        let nearest = beatSchedule.min(by: { abs($0.timeSeconds - secs) < abs($1.timeSeconds - secs) })!
+        return (nearest.timeSeconds, nearest.absoluteBeat)
+    }
+
+    private func effectiveBeat(for idx: Int) -> Double {
+        dragIdx == idx ? dragCurrentBeat : events[idx].beat
+    }
+
+    private func effectiveBPM(for idx: Int) -> Double {
+        dragIdx == idx ? dragCurrentBPM : events[idx].bpm
+    }
+
+    private func prevailingBPM(atBeat beat: Double) -> Double {
+        var bpm = events.first?.bpm ?? 120
+        for ev in events { if ev.beat <= beat + 0.001 { bpm = ev.bpm } }
+        return bpm
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            tempoContent(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    @ViewBuilder
+    private func tempoContent(width: CGFloat, height: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            // Background — tap-to-add gesture (consumed by handle dragging when over a handle)
+            Color.bgCard
+                .frame(width: width, height: height)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onEnded { val in
+                            let moved = max(abs(val.translation.width), abs(val.translation.height))
+                            guard moved < 5, totalDuration > 0, width > 0 else { return }
+                            // Background tap clears selection if any is active
+                            if !selectedTempoIndices.isEmpty { selectedTempoIndices = []; return }
+                            let tapX = val.location.x
+                            // Don't add if within hit zone of existing handle
+                            for idx in events.indices {
+                                let secs = secondsForBeat(effectiveBeat(for: idx))
+                                let hx = CGFloat(secs / totalDuration) * width
+                                let hy = yForBPM(effectiveBPM(for: idx), h: height)
+                                if abs(tapX - hx) < hitPad + 4 && abs(val.location.y - hy) < hitPad + 4 { return }
+                            }
+                            let rawSecs = Double(tapX / width) * totalDuration
+                            let (_, beat) = snapToBeat(rawSecs)
+                            guard beat > 0.001 else { return }
+                            onAdd(beat, prevailingBPM(atBeat: beat))
+                        }
+                )
+                .contextMenu {
+                    Button("Select All Tempo Points") { selectAll() }
+                        .disabled(events.count <= 1)
+                    if !selectedTempoIndices.isEmpty {
+                        Button("Delete \(selectedTempoIndices.count) Selected") { deleteSelected() }
+                    }
+                    Divider()
+                    Button("Delete All Tempo Changes", role: .destructive) {
+                        let allNonAnchor = Array(events.indices.filter { $0 > 0 })
+                        onDeleteMultiple(allNonAnchor)
+                        selectedTempoIndices = []
+                    }
+                    .disabled(events.count <= 1)
+                }
+
+            if totalDuration > 0 && width > 0 {
+                // Staircase line is drawn as a CAShapeLayer in WaveformScrollHost (no texture size limit).
+
+                // Event handles — each is a hit-target rect positioned over the handle dot
+                ForEach(events.indices, id: \.self) { idx in
+                    let secs = secondsForBeat(effectiveBeat(for: idx))
+                    let x = CGFloat(secs / totalDuration) * width
+                    let y = yForBPM(effectiveBPM(for: idx), h: height)
+                    let isDragging = dragIdx == idx
+                    let isHovered = hoveredIdx == idx
+                    let isSelected = selectedTempoIndices.contains(idx)
+                    let isBeat0 = idx == 0
+
+                    // Visual dot (non-interactive, drawn in absolute ZStack space)
+                    ZStack {
+                        if isSelected {
+                            Circle()
+                                .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
+                                .frame(width: handleR * 2 + 4, height: handleR * 2 + 4)
+                        }
+                        Circle()
+                            .fill(isSelected ? Color.red.opacity(0.9) : (isDragging ? Color.accent : (isHovered ? Color.accent.opacity(0.9) : Color.accent.opacity(0.65))))
+                            .frame(width: handleR * 2, height: handleR * 2)
+                    }
+                    .allowsHitTesting(false)
+                    .offset(x: x - handleR, y: y - handleR)
+
+                    // BPM label on hover / drag
+                    if isHovered || isDragging {
+                        Text(String(format: "%.0f", effectiveBPM(for: idx)))
+                            .font(.lato(size: 8, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                            .padding(.horizontal, 3)
+                            .padding(.vertical, 1)
+                            .background(Color.bgCard.opacity(0.92))
+                            .cornerRadius(3)
+                            .allowsHitTesting(false)
+                            .offset(x: max(0, x - 16), y: max(2, y - 16))
+                    }
+
+                    // Hit target rect — click = delete (non-beat-0); drag = reposition/BPM
+                    Color.clear
+                        .frame(width: hitPad * 2, height: hitPad * 2)
+                        .contentShape(Rectangle())
+                        .offset(x: x - hitPad, y: y - hitPad)
+                        .onHover { h in
+                            withAnimation(.easeOut(duration: 0.08)) { hoveredIdx = h ? idx : nil }
+                            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                        }
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    let moved = max(abs(value.translation.width), abs(value.translation.height))
+                                    guard moved >= 4 else { return }  // ignore micro-movement before committing to drag
+                                    if dragIdx == nil {
+                                        dragIdx = idx
+                                        dragStartBeat = events[idx].beat
+                                        dragStartBPM = events[idx].bpm
+                                        dragCurrentBeat = events[idx].beat
+                                        dragCurrentBPM = events[idx].bpm
+                                    }
+                                    guard dragIdx == idx else { return }
+                                    // Horizontal → beat reposition (beat-0 locked)
+                                    if !isBeat0 {
+                                        let pps = width / CGFloat(totalDuration)
+                                        let rawSecs = secondsForBeat(dragStartBeat) + Double(value.translation.width / pps)
+                                        let (_, snappedBeat) = snapToBeat(max(0, min(totalDuration, rawSecs)))
+                                        let prevBeat = events[idx - 1].beat + 0.001
+                                        let nextBeat = idx < events.count - 1 ? events[idx + 1].beat - 0.001 : Double.infinity
+                                        dragCurrentBeat = max(prevBeat, min(nextBeat, snappedBeat))
+                                    }
+                                    // Vertical → BPM (drag up = increase); sensitivity 0.2 BPM/px, 0.02 with ⇧
+                                    let isShift = NSEvent.modifierFlags.contains(.shift)
+                                    let sens: Double = isShift ? 0.02 : 0.2
+                                    let snap: Double = isShift ? 0.01 : 1.0
+                                    let rawBPM = dragStartBPM + (-Double(value.translation.height) * sens)
+                                    dragCurrentBPM = max(1, (rawBPM / snap).rounded() * snap)
+                                }
+                                .onEnded { value in
+                                    let moved = max(abs(value.translation.width), abs(value.translation.height))
+                                    if moved < 4 {
+                                        // Click — toggle selection on non-beat-0 handles
+                                        // Cmd+click = add/remove from selection; plain click = exclusive select
+                                        if !isBeat0 {
+                                            let isCmdHeld = NSEvent.modifierFlags.contains(.command)
+                                            if isCmdHeld {
+                                                if selectedTempoIndices.contains(idx) {
+                                                    selectedTempoIndices.remove(idx)
+                                                } else {
+                                                    selectedTempoIndices.insert(idx)
+                                                }
+                                            } else {
+                                                // If already the only selected item, deselect
+                                                if selectedTempoIndices == [idx] {
+                                                    selectedTempoIndices = []
+                                                } else {
+                                                    selectedTempoIndices = [idx]
+                                                }
+                                            }
+                                        }
+                                    } else if dragIdx != nil {
+                                        onCommitDrag(dragIdx!, dragCurrentBeat, dragCurrentBPM)
+                                    }
+                                    dragIdx = nil
+                                }
+                        )
+                        .contextMenu {
+                            if !isBeat0 {
+                                Button(selectedTempoIndices.contains(idx) ? "Deselect" : "Select") {
+                                    if selectedTempoIndices.contains(idx) {
+                                        selectedTempoIndices.remove(idx)
+                                    } else {
+                                        selectedTempoIndices.insert(idx)
+                                    }
+                                }
+                                Button("Select All") { selectAll() }
+                                Divider()
+                                Button("Delete", role: .destructive) {
+                                    if selectedTempoIndices.contains(idx) {
+                                        deleteSelected()
+                                    } else {
+                                        onDelete(idx)
+                                    }
+                                }
+                            }
+                        }
+                }
+
+                // Drag guide line at current drag beat position
+                if dragIdx != nil {
+                    let secs = secondsForBeat(dragCurrentBeat)
+                    Rectangle()
+                        .fill(Color.accent.opacity(0.6))
+                        .frame(width: 1)
+                        .frame(maxHeight: .infinity)
+                        .offset(x: CGFloat(secs / totalDuration) * width, y: 0)
+                }
+
+                // "Delete selected" pill — appears when selection is non-empty
+                if !selectedTempoIndices.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 9, weight: .medium))
+                        Text("Delete \(selectedTempoIndices.count)")
+                            .font(.lato(size: 9, weight: .semibold))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.red.opacity(0.85))
+                    .cornerRadius(4)
+                    .padding(.trailing, 6)
+                    .padding(.top, 4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .allowsHitTesting(true)
+                    .onTapGesture { deleteSelected() }
+                }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Divider().foregroundColor(Color.border)
+        }
+    }
+}
+
+extension CGFloat {
+    func clamped(to range: ClosedRange<CGFloat>) -> CGFloat {
+        Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+// MARK: - Time Signature Lane (Edit tab)
+
+/// Compact time signature picker popover — numerator (1-16) + denominator (2/4/8/16).
+struct TimeSigPickerPopover: View {
+    @Binding var numerator: Int
+    @Binding var denominator: Int
+    var title: String = "Time Signature"
+    var confirmLabel: String = "Add"
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    private let validDenominators = [2, 4, 8, 16]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.lato(size: 11, weight: .semibold))
+                .foregroundColor(Color.fgBright)
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Beats per bar")
+                        .font(.lato(size: 9))
+                        .foregroundColor(Color.fgMid)
+                    HStack(spacing: 6) {
+                        Button { numerator = max(1, numerator - 1) } label: {
+                            Image(systemName: "minus").font(.system(size: 10)).foregroundColor(Color.fgMid)
+                        }
+                        .buttonStyle(.plain)
+                        Text("\(numerator)")
+                            .font(.lato(size: 15, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                            .monospacedDigit()
+                            .frame(width: 26, alignment: .center)
+                        Button { numerator = min(16, numerator + 1) } label: {
+                            Image(systemName: "plus").font(.system(size: 10)).foregroundColor(Color.fgMid)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Beat unit")
+                        .font(.lato(size: 9))
+                        .foregroundColor(Color.fgMid)
+                    HStack(spacing: 3) {
+                        ForEach(validDenominators, id: \.self) { d in
+                            Button("\(d)") { denominator = d }
+                                .font(.lato(size: 11, weight: denominator == d ? .bold : .regular))
+                                .foregroundColor(denominator == d ? .white : Color.fgMid)
+                                .frame(width: 26, height: 22)
+                                .background(denominator == d ? Color.accent.opacity(0.8) : Color.border.opacity(0.3))
+                                .cornerRadius(4)
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            Text("Preview: \(numerator)/\(denominator)")
+                .font(.lato(size: 10))
+                .foregroundColor(Color.fgMid)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .font(.lato(size: 11)).foregroundColor(Color.fgMid).buttonStyle(.plain)
+                Button(confirmLabel, action: onConfirm)
+                    .font(.lato(size: 11, weight: .semibold)).foregroundColor(Color.accent).buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .frame(width: 220)
+    }
+}
+
+/// Interactive time signature lane rendered below the tempo lane.
+/// Flags at each change point: drag to reposition, tap to change value, × to delete.
+/// Beat-0 flag is immovable and undeletable.
+/// Click empty space → picker opens → place on confirm (snaps to bar downbeat).
+struct EditTimeSigLane: View {
+    let events: [TimeSigEvent]
+    let totalDuration: Double
+    let beatSchedule: [BeatInfo]
+    let onAdd: (Double, Int, Int) -> Void
+    let onDelete: (Int) -> Void
+    let onChange: (Int, Int, Int) -> Void
+    let onMove: (Int, Double) -> Void
+    var onSnapToDownbeat: (Double) -> (Double, Double) = { s in (s, 0) }
+
+    @State private var addBeat: Double? = nil
+    @State private var addX: CGFloat = 0
+    @State private var addNum: Int = 4
+    @State private var addDen: Int = 4
+
+    @State private var changeIdx: Int? = nil
+    @State private var changeX: CGFloat = 0
+    @State private var changeNum: Int = 4
+    @State private var changeDen: Int = 4
+
+    @State private var dragIdx: Int? = nil
+    @State private var dragStartBeat: Double = 0
+    @State private var dragCurrentBeat: Double = 0
+
+    @State private var hoveredIdx: Int? = nil
+
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return beat }
+        var prev = beatSchedule[0]
+        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
+
+    private func snapToDownbeat(_ seconds: Double) -> (Double, Double) {
+        let db = beatSchedule.filter { $0.isDownbeat }
+        guard !db.isEmpty else { return (seconds, 0) }
+        let nearest = db.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!
+        return (nearest.timeSeconds, nearest.absoluteBeat)
+    }
+
+    private func prevailingSig(atBeat beat: Double) -> (Int, Int) {
+        var num = 4, den = 4
+        for ev in events { if ev.beat <= beat + 0.001 { num = ev.numerator; den = ev.denominator } }
+        return (num, den)
+    }
+
+    private func prevailingSig(atSeconds secs: Double) -> (Int, Int) {
+        var num = 4, den = 4
+        for ev in events { if secondsForBeat(ev.beat) <= secs + 0.001 { num = ev.numerator; den = ev.denominator } }
+        return (num, den)
+    }
+
+    private func effectiveBeat(for idx: Int) -> Double {
+        dragIdx == idx ? dragCurrentBeat : events[idx].beat
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            content(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    @ViewBuilder
+    private func content(width: CGFloat, height: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            // Background — tap to add (blocked near existing flags)
+            Color.bgCard
+                .frame(width: width, height: height)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).onEnded { val in
+                    let moved = max(abs(val.translation.width), abs(val.translation.height))
+                    guard moved < 5, totalDuration > 0, width > 0 else { return }
+                    let tapX = val.location.x
+                    for idx in events.indices {
+                        let ex = CGFloat(secondsForBeat(effectiveBeat(for: idx)) / totalDuration) * width
+                        if abs(tapX - ex) < 20 { return }
+                    }
+                    let rawSecs = Double(tapX / width) * totalDuration
+                    guard rawSecs > 0.001 else { return }
+                    let (n, d) = prevailingSig(atSeconds: rawSecs)
+                    addX = tapX; addBeat = rawSecs; addNum = n; addDen = d
+                })
+
+            if totalDuration > 0 && width > 0 {
+                ForEach(events.indices, id: \.self) { idx in
+                    let ev = events[idx]
+                    let effBeat = effectiveBeat(for: idx)
+                    let x = CGFloat(secondsForBeat(effBeat) / totalDuration) * width
+                    let isBeat0 = idx == 0
+                    let isHov = hoveredIdx == idx
+                    let isDragging = dragIdx == idx
+
+                    ZStack(alignment: .leading) {
+                        Color(white: 0.12).opacity(isDragging ? 1.0 : 0.85)
+                            .frame(height: height - 2)
+                            .cornerRadius(2)
+                        Rectangle()
+                            .fill(isDragging ? Color.accent : Color.accent.opacity(0.6))
+                            .frame(width: isDragging ? 2 : 1, height: height - 2)
+                        HStack(spacing: 2) {
+                            Text(ev.sig)
+                                .font(.lato(size: 8, weight: .bold))
+                                .foregroundColor(isDragging ? Color.accent : Color.accent.opacity(0.85))
+                                .padding(.leading, 3)
+                                .padding(.trailing, !isBeat0 && isHov && !isDragging ? 0 : 3)
+                            if !isBeat0 && isHov && !isDragging {
+                                Button { onDelete(idx) } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 6, weight: .bold))
+                                        .foregroundColor(Color.red)
+                                        .frame(width: 10, height: 10)
+                                }
+                                .buttonStyle(.plain)
+                                .padding(.trailing, 2)
+                                .transition(.opacity)
+                            }
+                        }
+                    }
+                    .frame(width: 40, height: height - 2)
+                    .offset(x: max(0, x + 1), y: 1)
+                    .onHover { h in
+                        withAnimation(.easeOut(duration: 0.08)) { hoveredIdx = h ? idx : nil }
+                        if h { (isBeat0 ? NSCursor.pointingHand : NSCursor.openHand).set() }
+                        else { NSCursor.arrow.set() }
+                    }
+                    .highPriorityGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let moved = max(abs(value.translation.width), abs(value.translation.height))
+                                guard moved >= 3, !isBeat0 else { return }
+                                if dragIdx == nil {
+                                    dragIdx = idx
+                                    dragStartBeat = events[idx].beat
+                                    dragCurrentBeat = events[idx].beat
+                                }
+                                guard dragIdx == idx else { return }
+                                let pps = width / CGFloat(totalDuration)
+                                let rawSecs = secondsForBeat(dragStartBeat) + Double(value.translation.width / pps)
+                                let (_, snappedBeat) = onSnapToDownbeat(max(0, min(totalDuration, rawSecs)))
+                                let prevBeat = events[idx - 1].beat + 0.5
+                                let nextBeat = idx < events.count - 1 ? events[idx + 1].beat - 0.5 : Double.infinity
+                                dragCurrentBeat = max(prevBeat, min(nextBeat, snappedBeat))
+                            }
+                            .onEnded { value in
+                                let moved = max(abs(value.translation.width), abs(value.translation.height))
+                                if moved < 3 {
+                                    // Tap — open change picker
+                                    let sx = CGFloat(secondsForBeat(events[idx].beat) / totalDuration) * width
+                                    changeX = sx; changeNum = ev.numerator; changeDen = ev.denominator; changeIdx = idx
+                                } else if dragIdx == idx {
+                                    onMove(idx, dragCurrentBeat)
+                                }
+                                dragIdx = nil
+                            }
+                    )
+                }
+
+                // Drag guide line
+                if let di = dragIdx {
+                    let secs = secondsForBeat(dragCurrentBeat)
+                    Rectangle()
+                        .fill(Color.accent.opacity(0.7))
+                        .frame(width: 1)
+                        .frame(maxHeight: .infinity)
+                        .offset(x: CGFloat(secs / totalDuration) * width, y: 0)
+                        .allowsHitTesting(false)
+                    // Beat tooltip above guide line
+                    let db = beatSchedule.filter { $0.isDownbeat }
+                    let bar = db.filter { $0.absoluteBeat <= dragCurrentBeat + 0.01 }.last?.bar ?? 1
+                    Text("bar \(bar)")
+                        .font(.lato(size: 8, weight: .bold))
+                        .foregroundColor(Color.fgBright)
+                        .padding(.horizontal, 3).padding(.vertical, 1)
+                        .background(Color.bgCard.opacity(0.92))
+                        .cornerRadius(3)
+                        .allowsHitTesting(false)
+                        .offset(x: max(0, CGFloat(secs / totalDuration) * width - 18), y: 1)
+                    let _ = di  // suppress unused warning
+                }
+
+                // Change picker anchor
+                Color.clear
+                    .frame(width: 1, height: height)
+                    .offset(x: max(0, changeX))
+                    .popover(isPresented: Binding(
+                        get: { changeIdx != nil },
+                        set: { if !$0 { changeIdx = nil } }
+                    ), arrowEdge: .bottom) {
+                        if let idx = changeIdx {
+                            TimeSigPickerPopover(
+                                numerator: $changeNum,
+                                denominator: $changeDen,
+                                title: "Change Time Signature",
+                                confirmLabel: "Save",
+                                onConfirm: { onChange(idx, changeNum, changeDen); changeIdx = nil },
+                                onCancel: { changeIdx = nil }
+                            )
+                        }
+                    }
+
+                // Add picker anchor
+                Color.clear
+                    .frame(width: 1, height: height)
+                    .offset(x: max(0, addX))
+                    .popover(isPresented: Binding(
+                        get: { addBeat != nil },
+                        set: { if !$0 { addBeat = nil } }
+                    ), arrowEdge: .bottom) {
+                        if let beat = addBeat {
+                            TimeSigPickerPopover(
+                                numerator: $addNum,
+                                denominator: $addDen,
+                                title: "Add Time Signature",
+                                confirmLabel: "Add",
+                                onConfirm: { onAdd(beat, addNum, addDen); addBeat = nil },
+                                onCancel: { addBeat = nil }
+                            )
+                        }
+                    }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Divider().foregroundColor(Color.border)
+        }
+        .cursor(.crosshair)
     }
 }
 

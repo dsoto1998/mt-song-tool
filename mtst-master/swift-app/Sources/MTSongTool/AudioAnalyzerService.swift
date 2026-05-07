@@ -66,6 +66,10 @@ class AudioAnalyzerService: ObservableObject {
     @Published var isConverting = false
     @Published var conversionProgress: (current: Int, total: Int) = (0, 0)
     @Published var conversionErrors: [String] = []
+
+    // Export state
+    @Published var isExporting = false
+    @Published var exportProgress: (current: Int, total: Int) = (0, 0)
     private(set) var lastScannedFolder: URL? = nil
 
     /// Full URLs for all scanned stems (folder + filename). Empty if no folder loaded.
@@ -889,6 +893,134 @@ class AudioAnalyzerService: ObservableObject {
             }
 
             self.analyze(folder: folderToScan)
+        }
+    }
+
+    /// Exports all non-excluded stems to `outputFolder`, each padded/trimmed to exactly
+    /// `loopEndSeconds`. Current gain applied; mute state ignored. 44.1 kHz / 16-bit PCM.
+    func exportStems(
+        outputFolder: URL,
+        loopEndSeconds: Double,
+        stemStates: [URL: StemState],
+        autoFadeCuts: Bool,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard let sourceFolder = lastScannedFolder else {
+            completion("No stem folder loaded.")
+            return
+        }
+        guard let ffmpeg = Self.ffmpegPath() else {
+            completion("FFmpeg not found. Re-run make_swift_app.sh to bundle it.")
+            return
+        }
+
+        let durStr = String(format: "%.9f", loopEndSeconds)
+
+        isExporting = true
+        let exportableResults = results.filter { r in
+            let url = sourceFolder.appendingPathComponent(r.filename)
+            return stemStates[url]?.isExcluded != true
+        }
+        exportProgress = (0, exportableResults.count)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            do {
+                try FileManager.default.createDirectory(
+                    at: outputFolder, withIntermediateDirectories: true, attributes: nil)
+            } catch {
+                DispatchQueue.main.async {
+                    self.isExporting = false
+                    completion("Could not create output folder: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            var errors: [String] = []
+
+            for (i, result) in exportableResults.enumerated() {
+                DispatchQueue.main.async { self.exportProgress = (i + 1, exportableResults.count) }
+
+                let source = sourceFolder.appendingPathComponent(result.filename)
+                let dest   = outputFolder.appendingPathComponent(result.filename)
+                let state  = stemStates[source] ?? StemState()
+
+                let hasSegmentEdits = state.segments.count > 1 ||
+                    (state.segments.first.map { $0.sessionStart != 0 } ?? false)
+                let hasGain = state.gain != 1.0
+
+                if hasSegmentEdits {
+                    // Multi-segment bake: assemble pieces with silence gaps, apply gain, pad to loop end.
+                    let sorted = state.segments.sorted { $0.sessionStart < $1.sessionStart }
+                    var filterParts: [String] = []
+                    var concatInputs: [String] = []
+                    var pieceIdx = 0
+                    var cursor = 0.0
+
+                    for (segI, seg) in sorted.enumerated() {
+                        let gapDur = seg.sessionStart - cursor
+                        if gapDur > 0.001 {
+                            filterParts.append("aevalsrc=0:d=\(String(format: "%.9f", gapDur))[g\(pieceIdx)]")
+                            concatInputs.append("[g\(pieceIdx)]")
+                            pieceIdx += 1
+                        }
+                        var trimFilter = "[0:a]atrim=start=\(String(format: "%.9f", seg.sourceStart)):end=\(String(format: "%.9f", seg.sourceEnd)),asetpts=PTS-STARTPTS"
+                        if autoFadeCuts && segI > 0 { trimFilter += ",afade=t=in:st=0:d=0.01" }
+                        trimFilter += "[s\(pieceIdx)]"
+                        filterParts.append(trimFilter)
+                        concatInputs.append("[s\(pieceIdx)]")
+                        cursor = seg.sessionEnd
+                        pieceIdx += 1
+                    }
+
+                    let n = concatInputs.count
+                    var postConcat = ""
+                    if hasGain { postConcat += "volume=\(state.gain)," }
+                    postConcat += "apad=whole_dur=\(durStr)"
+                    let concatFilter = concatInputs.joined() + "concat=n=\(n):v=0:a=1[assembled];[assembled]\(postConcat)[out]"
+                    filterParts.append(concatFilter)
+
+                    let args: [String] = [
+                        "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", source.path,
+                        "-filter_complex", filterParts.joined(separator: ";"),
+                        "-map", "[out]",
+                        "-t", durStr,
+                        "-c:a", "pcm_s16le", "-ar", "44100",
+                        dest.path
+                    ]
+                    let (ok, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
+                    if !ok { errors.append(result.filename + ": " + errMsg) }
+                } else {
+                    // Simple path: trim / offset / gain / pad.
+                    var filters: [String] = []
+                    var args: [String] = ["-hide_banner", "-loglevel", "error", "-y"]
+
+                    let trimStart = state.trimIn > 0 ? state.trimIn : 0.0
+                    if trimStart > 0 { args += ["-ss", String(trimStart)] }
+                    args += ["-i", source.path]
+                    if let trimOut = state.trimOut { args += ["-to", String(trimOut)] }
+
+                    if state.offset > 0 {
+                        let ms = Int(state.offset * 1000)
+                        filters.append("adelay=\(ms)|\(ms)")
+                    }
+                    if hasGain { filters.append("volume=\(state.gain)") }
+                    filters.append("apad=whole_dur=\(durStr)")
+
+                    args += ["-af", filters.joined(separator: ",")]
+                    args += ["-t", durStr, "-c:a", "pcm_s16le", "-ar", "44100", dest.path]
+
+                    let (ok, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
+                    if !ok { errors.append(result.filename + ": " + errMsg) }
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.isExporting = false
+                completion(errors.isEmpty ? nil : errors.joined(separator: "\n"))
+            }
         }
     }
 
