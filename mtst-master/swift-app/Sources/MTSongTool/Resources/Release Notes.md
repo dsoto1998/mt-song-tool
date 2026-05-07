@@ -1,4 +1,4 @@
-# MT Song Tool — v1.4.1
+# MT Song Tool — v1.6.0
 
 ## Features
 
@@ -11,7 +11,7 @@
 - **Stem audio preview** — Inline per-stem playback with waveform seek view; click to seek, drag to scrub
 - **Locator section preview** — Play ORIGINAL SONG from any locator's start time directly from the Locators panel
 - **AudioShake tab** — AI-powered stem separation via the AudioShake API; drop any mixed audio file, select from 15 stem models (vocals, lead/backing, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download separated stems with inline playback
-- **Edit tab** — Multi-stem timeline with transport (play/pause/stop), pinch-to-zoom, drag-to-nudge, region select/delete/move, cut/split, trim, per-stem gain and peak metering, mute/solo, and FFmpeg bake-out
+- **Edit tab** — Multi-stem timeline with transport, pinch-to-zoom, region select/delete/move, cut/split, per-stem gain, mute/solo, and FFmpeg bake-out. Interactive tempo lane and time signature lane. Locator drag-to-reposition with live loop bracket. Stem deletion. Gain-locked reference stems (CLICK TRACK, GUIDE, ORIGINAL SONG) with per-stem peak-hold meters. Master meter with all-time peak hold. Export Stems to 44.1 kHz / 16-bit PCM. Build Session generates a complete `.als` from scratch. Suggest Locators from a lyric sheet or Genius/AZLyrics URL via Whisper alignment.
 - **Metronome** — Tempo-synced click track with mute toggle, subdivision modes (quarter/eighth), and real-time volume control
 - **Live 12 detection** — Loading a Live 12 session prompts conversion to Live 11 before QA; old Ableton (v10 and earlier) sessions show an alert with an "Open in Ableton 11" option
 - **Quick Check mode** — Removes the requirement to have both an `.als` and stems before proceeding
@@ -22,6 +22,13 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.6.0 — May 2026
+
+#### Edit Tab
+
+- **Time signature lane redesign** — The time signature lane now uses horizontal chips instead of flags. Each chip spans the full duration of its time sig region, making the layout immediately readable. Tap anywhere inside a chip to open the numerator/denominator picker; the picker shows the bar number where the change takes effect and snaps the insertion to the nearest downbeat using the live beat schedule. Hover a non-initial chip and click × to remove it. The beat-0 chip cannot be removed.
+- **Time sig edits now undoable** — Time signature overrides are tracked in a dedicated undo/redo stack that runs parallel to the stem state stack. ⌘Z and ⌘⇧Z fully restore both stem edits and time sig edits together.
 
 ### v1.4.1 — April 15, 2026
 

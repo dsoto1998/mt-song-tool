@@ -9,7 +9,7 @@
 
 | Phase | Goal | Status |
 |---|---|---|
-| 1 | Core editing parity (locator drag, loop bracket, stem deletion, tempo lane, time sig lane, gain lock) | 🔲 Not started |
+| 1 | Core editing parity (locator drag, loop bracket, stem deletion, tempo lane, time sig lane, gain lock) | 🔄 In progress |
 | 2 | Guardrails + alignment (pre-export validation gate, alignment check/auto-correct) | 🔲 Not started |
 | 3 | Automation (click track MIDI-derived, guide track, export) | 🔲 Not started |
 | 4 | Dynamic cues (placement UI, anti-collision, multi-language) | 🔲 Not started |
@@ -307,12 +307,14 @@ Parser:         mtst-master/parse_als.py
 **Phase 1 items in order:**
 1a. ✅ Locator drag-to-reposition — DONE 2026-04-18
 1b. ✅ Loop bracket auto-set + display — DONE 2026-04-18
-1c. Stem deletion from session ← NEXT
-1d. Tempo lane rebuild (confirmed missing from codebase)
-1e. Time signature lane (new)
+1c. ✅ Stem deletion from session — DONE 2026-05-07
+1d. ✅ Tempo lane rebuild — DONE
+1e. ✅ Time signature lane (new) — DONE 2026-05-07
 1f. Gain lock for CLICK TRACK / GUIDE / ORIGINAL SONG (confirmed missing)
 1g. Build Session re-add (confirmed missing from codebase)
-+ Save / Save As UI + dirty indicator + post-save QA flash + unsaved-changes alert
++ ✅ Save / Save As UI — DONE
++ ✅ Dirty indicator — DONE (accent dot right of "Save Session" text)
++ Post-save QA flash + unsaved-changes alert
 
 **What was built in the 2026-04-18 session:**
 - `Marker.beat: Double?` — Ableton beat position, populated from Python `locator_data[i][1]`

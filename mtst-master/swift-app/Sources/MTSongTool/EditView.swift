@@ -139,10 +139,14 @@ struct EditView: View {
         guard let result = parsedResult else { return }
         let audioDur = result.expectedDuration ?? editPlayer.totalDuration
         guard audioDur > 0 else { return }
+        // Use time sig overrides if initialized; fall back to parsed time sigs.
+        let timeSigs: [TimeSig] = editPlayer.timeSigOverrides.isEmpty
+            ? result.timeSignatures
+            : editPlayer.timeSigOverrides.map { TimeSig(time: "", sig: $0.sig, beat: $0.beat) }
         // First pass: build up to audio end so lastBarSeconds is accurate.
         metronome.buildSchedule(
             tempoEvents: result.tempoEvents,
-            timeSigs: result.timeSignatures,
+            timeSigs: timeSigs,
             totalDuration: audioDur,
             staticBPM: result.bpm
         )
@@ -151,7 +155,7 @@ struct EditView: View {
         guard extendedDur > audioDur else { return }
         metronome.buildSchedule(
             tempoEvents: result.tempoEvents,
-            timeSigs: result.timeSignatures,
+            timeSigs: timeSigs,
             totalDuration: extendedDur,
             staticBPM: result.bpm
         )
@@ -226,7 +230,20 @@ struct EditView: View {
             if editPlayer.stemURLs.isEmpty || editPlayer.stemURLs != stemURLs {
                 editPlayer.loadStems(stemURLs)
             }
+            // Initialize time sig overrides from parsed result if not yet set
+            if let result = parsedResult, editPlayer.timeSigOverrides.isEmpty {
+                editPlayer.initTimeSigs(from: result.timeSignatures)
+            }
             // Build metronome beat schedule from parsed session
+            rebuildBeatSchedule()
+        }
+        .onChange(of: parsedResult?.file) { _ in
+            if let result = parsedResult {
+                editPlayer.initTimeSigs(from: result.timeSignatures)
+                rebuildBeatSchedule()
+            }
+        }
+        .onChange(of: editPlayer.timeSigOverrides) { _ in
             rebuildBeatSchedule()
         }
         .onChange(of: editPlayer.playAnchor) { anchor in
@@ -464,7 +481,7 @@ struct EditView: View {
                 // Left column: track headers — anchored, never scrolls horizontally
                 VStack(spacing: 0) {
                     Color.bgCard
-                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.timeSigLaneHeight)
                     Divider().foregroundColor(Color.border)
                     ForEach(sortedStemURLs, id: \.self) { url in
                         let state = editPlayer.stemStates[url] ?? StemState()
@@ -631,6 +648,19 @@ struct EditView: View {
                         onRemoveStemByURL: { url in
                             editPlayer.removeStem(url)
                             selectedURLs.remove(url)
+                        },
+                        timeSigs: editPlayer.timeSigOverrides,
+                        onTimeSigAdd: { tapSecs, num, den in
+                            // Snap using LIVE metronome.beatSchedule — never stale unlike chip's frozen copy
+                            let downbeats = metronome.beatSchedule.filter { $0.isDownbeat }
+                            guard !downbeats.isEmpty else { return }
+                            let nearest = downbeats.min(by: {
+                                abs($0.timeSeconds - tapSecs) < abs($1.timeSeconds - tapSecs)
+                            })!
+                            editPlayer.addOrUpdateTimeSig(beat: nearest.absoluteBeat, numerator: num, denominator: den)
+                        },
+                        onTimeSigRemove: { beat in
+                            editPlayer.removeTimeSig(beat: beat)
                         }
                     )
 
@@ -639,7 +669,7 @@ struct EditView: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: sortedStemURLs.reduce(CGFloat(0)) {
                     $0 + (rowHeights[$1] ?? defaultRowHeight) + 1
-                } + WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+                } + WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.timeSigLaneHeight)
                 .background(GeometryReader { geo in
                     Color.clear
                         .onAppear { viewportWidth = geo.size.width }
@@ -705,7 +735,7 @@ struct EditView: View {
     /// Lives outside the NSScrollView so horizontal scroll doesn't carry them away.
     private var waveformNameOverlay: some View {
         VStack(spacing: 0) {
-            Color.clear.frame(height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+            Color.clear.frame(height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.timeSigLaneHeight)
             ForEach(sortedStemURLs, id: \.self) { url in
                 let h = rowHeights[url] ?? defaultRowHeight
                 Color.clear
@@ -1370,16 +1400,20 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onTrimLeftEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onTrimRightEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onRemoveStemByURL: ((URL) -> Void)? = nil
+    var timeSigs: [TimeSigOverride] = []
+    var onTimeSigAdd: (Double, Int, Int) -> Void = { _, _, _ in }   // (tapSeconds, num, den)
+    var onTimeSigRemove: (Double) -> Void = { _ in }               // (beat)
 
     private static let protectedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
     private func isProtectedURL(_ url: URL) -> Bool {
         Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
     }
 
-    // 24px bar-number ruler + 20px locator lane
+    // 24px bar-number ruler + 20px locator lane + 18px time sig lane
     static let rulerLaneHeight: CGFloat = 24
     static let locatorLaneHeight: CGFloat = 20
-    private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight
+    static let timeSigLaneHeight: CGFloat = 18
+    private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.timeSigLaneHeight
 
     // MARK: - Time helper
     private static func markerSeconds(_ time: String) -> Double? {
@@ -1487,6 +1521,9 @@ struct WaveformScrollHost: NSViewRepresentable {
             h.combine(url); h.combine(r.lowerBound); h.combine(r.upperBound)
         }
         h.combine(beatSchedule.count)
+        if let first = beatSchedule.first { h.combine(first.timeSeconds.bitPattern) }
+        if beatSchedule.count > 1 { h.combine(beatSchedule[beatSchedule.count / 2].timeSeconds.bitPattern) }
+        if let last = beatSchedule.last { h.combine(last.timeSeconds.bitPattern) }
         h.combine(totalDuration)
         for url in stemURLs {
             let s = stemStates[url]
@@ -1511,6 +1548,8 @@ struct WaveformScrollHost: NSViewRepresentable {
         for (alsId, ov) in locatorOverrides.sorted(by: { $0.key < $1.key }) {
             h.combine(alsId); h.combine(ov.beat)
         }
+        h.combine(timeSigs.count)
+        for ts in timeSigs { h.combine(ts.beat); h.combine(ts.numerator); h.combine(ts.denominator) }
         return h.finalize()
     }
 
@@ -2100,6 +2139,15 @@ struct WaveformScrollHost: NSViewRepresentable {
                     onLocatorMove: onLocatorMove
                 )
                 .frame(height: WaveformScrollHost.locatorLaneHeight)
+                // Time signature lane — tap to add/edit, × to delete
+                EditTimeSigLane(
+                    timeSigs: timeSigs,
+                    totalDuration: totalDuration,
+                    beatSchedule: beatSchedule,
+                    onAdd: onTimeSigAdd,
+                    onRemove: onTimeSigRemove
+                )
+                .frame(height: WaveformScrollHost.timeSigLaneHeight)
                 let allHeights = stemURLs.map { rowHeights[$0] ?? defaultRowHeight }
                 ForEach(Array(stemURLs.enumerated()), id: \.element) { (idx, url) in
                     let state = stemStates[url] ?? StemState()
@@ -2741,5 +2789,245 @@ extension View {
         } else {
             self.onDeleteCommand(perform: action)
         }
+    }
+}
+
+// MARK: - Edit Tab Time Signature Lane
+
+struct EditTimeSigLane: View {
+    let timeSigs: [TimeSigOverride]
+    let totalDuration: Double
+    let beatSchedule: [BeatInfo]
+    let onAdd: (Double, Int, Int) -> Void   // (tapSeconds, num, den) — snap handled upstream
+    let onRemove: (Double) -> Void          // (beat)
+
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return 0 }
+        var prev = beatSchedule[0]
+        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            laneContent(width: geo.size.width)
+        }
+    }
+
+    @ViewBuilder
+    private func laneContent(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(width: width, height: WaveformScrollHost.timeSigLaneHeight)
+
+            if totalDuration > 0, width > 0, !timeSigs.isEmpty {
+                let sorted = timeSigs.sorted { $0.beat < $1.beat }
+                ForEach(Array(sorted.enumerated()), id: \.element.beat) { i, ts in
+                    let startSecs = secondsForBeat(ts.beat)
+                    let endSecs: Double = i + 1 < sorted.count
+                        ? secondsForBeat(sorted[i + 1].beat) : totalDuration
+                    let x = CGFloat(startSecs / totalDuration) * width
+                    let nextX = CGFloat(endSecs / totalDuration) * width
+                    let chipW = max(0, nextX - x)
+
+                    EditTimeSigChip(
+                        ts: ts,
+                        chipWidth: chipW,
+                        chipStartSecs: startSecs,
+                        chipEndSecs: endSecs,
+                        beatSchedule: beatSchedule,
+                        isRemovable: ts.beat > 0.001,
+                        onConfirm: { secs, num, den in
+                            // Pass seconds through — snap handled at EditView level with live schedule
+                            onAdd(secs, num, den)
+                        },
+                        onRemove: ts.beat > 0.001 ? { onRemove(ts.beat) } : nil
+                    )
+                    .frame(width: max(chipW, 1), height: WaveformScrollHost.timeSigLaneHeight)
+                    .offset(x: max(0, x), y: 0)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Edit Tab Time Signature Chip
+
+struct EditTimeSigChip: View {
+    let ts: TimeSigOverride
+    let chipWidth: CGFloat
+    let chipStartSecs: Double
+    let chipEndSecs: Double
+    let beatSchedule: [BeatInfo]
+    let isRemovable: Bool
+    /// Callback passes tapped SECONDS (not pre-snapped beat) — snap happens at EditView level
+    /// using the live metronome.beatSchedule so it's never stale.
+    let onConfirm: (Double, Int, Int) -> Void   // (tapSecs, num, den)
+    let onRemove: (() -> Void)?
+
+    @State private var pickerOpen = false
+    @State private var pickerNum: Int = 4
+    @State private var pickerDen: Int = 4
+    @State private var tapSecs: Double = 0
+    @State private var snappedBar: Int = 1   // best-effort display; computed from frozen beatSchedule
+    @State private var tapXFraction: CGFloat = 0
+    @State private var isHovering = false
+
+    // Best-effort bar number for picker display — uses the chip's (possibly frozen) beat schedule.
+    // If schedule is empty, shows bar 1 (harmless display artifact).
+    private func estimateBar(_ seconds: Double) -> Int {
+        let downbeats = beatSchedule.filter { $0.isDownbeat }
+        guard !downbeats.isEmpty else { return 1 }
+        return downbeats.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!.bar
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            chipBody(w: geo.size.width)
+        }
+    }
+
+    @ViewBuilder
+    private func chipBody(w: CGFloat) -> some View {
+        let h = WaveformScrollHost.timeSigLaneHeight
+        // attachmentAnchor uses UnitPoint evaluated at render time — both tapXFraction and
+        // pickerOpen batch into the same render cycle, so the anchor is already correct when
+        // the popover opens. No layout-timing tricks needed.
+        Color(white: 0.18).opacity(0.95)
+            .overlay(alignment: .leading) {
+                Color.white.opacity(0.35).frame(width: 1)
+            }
+            .overlay {
+                HStack(spacing: 0) {
+                    Text(ts.sig)
+                        .font(.lato(size: 8, weight: .bold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.leading, 4)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if isRemovable && isHovering {
+                        Button {
+                            onRemove?()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundColor(.white.opacity(0.7))
+                                .padding(.trailing, 4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(height: h)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onEnded { value in
+                        let frac = max(0, min(1, value.location.x / max(1, w)))
+                        tapXFraction = frac
+                        let range = chipEndSecs - chipStartSecs
+                        let t = chipStartSecs + Double(frac) * max(0, range)
+                        tapSecs = t
+                        snappedBar = estimateBar(t)  // display only
+                        pickerNum = ts.numerator
+                        pickerDen = ts.denominator
+                        pickerOpen = true
+                    }
+            )
+            .onHover { isHovering = $0 }
+            .popover(isPresented: $pickerOpen,
+                     attachmentAnchor: .point(UnitPoint(x: tapXFraction, y: 0)),
+                     arrowEdge: .bottom) {
+                TimeSigPickerPopover(
+                    barNumber: snappedBar,
+                    numerator: $pickerNum,
+                    denominator: $pickerDen,
+                    onConfirm: {
+                        // Pass seconds — snap to live beat schedule happens at EditView level
+                        onConfirm(tapSecs, pickerNum, pickerDen)
+                        pickerOpen = false
+                    },
+                    onCancel: { pickerOpen = false }
+                )
+            }
+            .frame(width: w, height: h)
+    }
+}
+
+// MARK: - Time Signature Picker Popover
+
+struct TimeSigPickerPopover: View {
+    let barNumber: Int          // bar where the change takes effect
+    @Binding var numerator: Int
+    @Binding var denominator: Int
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    private let denominators = [2, 4, 8, 16]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Time Signature")
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.fgBright)
+                Text("Starting at bar \(barNumber)")
+                    .font(.lato(size: 9, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+            }
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Numerator")
+                        .font(.lato(size: 9, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                    Stepper(value: $numerator, in: 1...16) {
+                        Text("\(numerator)")
+                            .font(.lato(size: 14, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                            .frame(minWidth: 28, alignment: .center)
+                    }
+                    .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Denominator")
+                        .font(.lato(size: 9, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                    HStack(spacing: 4) {
+                        ForEach(denominators, id: \.self) { d in
+                            Button("\(d)") { denominator = d }
+                                .font(.lato(size: 11, weight: denominator == d ? .bold : .regular))
+                                .foregroundColor(denominator == d ? .white : Color.fgMid)
+                                .frame(width: 30, height: 26)
+                                .background(denominator == d ? Color.accent : Color.border.opacity(0.4))
+                                .cornerRadius(4)
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            Divider().foregroundColor(Color.border)
+
+            HStack {
+                Button("Cancel") { onCancel() }
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+                    .buttonStyle(.plain)
+                Spacer()
+                Text("\(numerator)/\(denominator)")
+                    .font(.lato(size: 13, weight: .bold))
+                    .foregroundColor(Color.fgBright)
+                Spacer()
+                Button("Set") { onConfirm() }
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.accent)
+                    .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .frame(width: 280)
+        .background(Color.bgCard)
     }
 }
