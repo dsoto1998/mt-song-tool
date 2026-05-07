@@ -195,6 +195,273 @@ def _extract_locator_data(path):
         return []
 
 
+def _encode_ts(numerator, denominator):
+    """Inverse of decode_ts used in parse_time_signatures.
+    numerator: int (1-based), denominator: power of 2 (1, 2, 4, 8, 16, 32)
+    Returns the Ableton EnumEvent Value integer.
+    """
+    import math
+    denom_index = int(round(math.log2(max(1, denominator))))
+    return (numerator - 1) + (denom_index * 99)
+
+
+def _patch_tempo_events_in_content(content, tempo_events):
+    """Replace the FloatEvent block inside the tempo AutomationEnvelope.
+
+    tempo_events: list of {"beat": float, "bpm": float}, sorted, all beats >= 0.
+    Step changes are encoded as two consecutive FloatEvents at the same beat:
+    the first with the previous BPM (end of prior segment), the second with
+    the new BPM (start of new segment) — matching Ableton's own convention.
+    A phantom event at beat -63072000 is always prepended with the initial BPM.
+    Returns the patched content string (unchanged if tempo envelope not found).
+    """
+    # Step 1: find the Tempo AutomationTarget Id (at LiveSet level, not track level).
+    tempo_target_m = re.search(
+        r"<Tempo\b[^>]*>.*?<AutomationTarget\s+Id=\"(\d+)\"",
+        content, re.DOTALL
+    )
+    if not tempo_target_m:
+        return content
+
+    tempo_target_id = tempo_target_m.group(1)
+    events_sorted = sorted(tempo_events, key=lambda e: float(e["beat"]))
+    if not events_sorted:
+        return content
+
+    initial_bpm = float(events_sorted[0]["bpm"])
+
+    # Build new FloatEvents XML lines.
+    lines = []
+    eid = 0
+
+    def fe(time_val, bpm_val):
+        nonlocal eid
+        line = (f'<FloatEvent Id="{eid}" Time="{time_val}" Value="{bpm_val}" '
+                f'CurveControl1X="0.5" CurveControl1Y="0.5" '
+                f'CurveControl2X="0.5" CurveControl2Y="0.5"/>')
+        eid += 1
+        return line
+
+    # Phantom anchor that Ableton always writes before the timeline origin.
+    lines.append(fe(-63072000, initial_bpm))
+
+    for i, ev in enumerate(events_sorted):
+        beat = float(ev["beat"])
+        bpm  = float(ev["bpm"])
+        if i > 0:
+            # Step change: emit hold event at this beat with previous BPM first.
+            prev_bpm = float(events_sorted[i - 1]["bpm"])
+            lines.append(fe(beat, prev_bpm))
+        lines.append(fe(beat, bpm))
+
+    new_events_xml = "\n                  ".join(lines)
+
+    # Step 2: find the AutomationEnvelope with this PointeeId inside
+    # MainTrack or MasterTrack and replace its <Events>…</Events> block.
+    envelope_pattern = r"(<AutomationEnvelope[^>]*>)(.*?)(</AutomationEnvelope>)"
+
+    for track_tag in ("MainTrack", "MasterTrack"):
+        t_start = content.find(f"<{track_tag}")
+        if t_start == -1:
+            continue
+        end_tag = f"</{track_tag}>"
+        t_end = content.find(end_tag, t_start)
+        if t_end == -1:
+            continue
+        t_end_full = t_end + len(end_tag)
+        track_content = content[t_start:t_end_full]
+
+        replaced = [False]
+
+        def maybe_replace(m, _tid=tempo_target_id, _xml=new_events_xml, _r=replaced):
+            env_inner = m.group(2)
+            pid_m = re.search(r'<PointeeId\s+Value="(\d+)"', env_inner)
+            if not pid_m or pid_m.group(1) != _tid:
+                return m.group(0)
+            new_inner = re.sub(
+                r'<Events>.*?</Events>',
+                f'<Events>\n                  {_xml}\n                </Events>',
+                env_inner,
+                flags=re.DOTALL
+            )
+            _r[0] = True
+            return m.group(1) + new_inner + m.group(3)
+
+        new_track = re.sub(envelope_pattern, maybe_replace, track_content, flags=re.DOTALL)
+        if replaced[0]:
+            content = content[:t_start] + new_track + content[t_end_full:]
+            break
+
+    return content
+
+
+def _patch_time_sig_events_in_content(content, time_sig_events):
+    """Replace the EnumEvent block inside the time-signature AutomationEnvelope.
+
+    time_sig_events: list of {"beat": float, "numerator": int, "denominator": int}, sorted.
+    A phantom event at beat -63072000 is always prepended with the initial time sig.
+    Returns the patched content string (unchanged if time sig envelope not found).
+    """
+    import math
+
+    events_sorted = sorted(time_sig_events, key=lambda e: float(e["beat"]))
+    if not events_sorted:
+        return content
+
+    initial_val = _encode_ts(int(events_sorted[0]["numerator"]), int(events_sorted[0]["denominator"]))
+
+    envelope_pattern = r"(<AutomationEnvelope[^>]*>)(.*?)(</AutomationEnvelope>)"
+
+    for track_tag in ("MainTrack", "MasterTrack"):
+        t_start = content.find(f"<{track_tag}")
+        if t_start == -1:
+            continue
+        end_tag = f"</{track_tag}>"
+        t_end = content.find(end_tag, t_start)
+        if t_end == -1:
+            continue
+        t_end_full = t_end + len(end_tag)
+        track_content = content[t_start:t_end_full]
+
+        # Find the TimeSignature AutomationTarget Id inside this track.
+        ts_target_m = re.search(
+            r"<TimeSignature>.*?<AutomationTarget\s+Id=\"(\d+)\"",
+            track_content, re.DOTALL
+        )
+        if not ts_target_m:
+            continue
+
+        ts_target_id = ts_target_m.group(1)
+
+        # Build new EnumEvents XML.
+        lines = []
+        eid = 0
+
+        def ee(time_val, value):
+            nonlocal eid
+            line = f'<EnumEvent Id="{eid}" Time="{time_val}" Value="{value}"/>'
+            eid += 1
+            return line
+
+        lines.append(ee(-63072000, initial_val))
+        for ev in events_sorted:
+            beat = float(ev["beat"])
+            val  = _encode_ts(int(ev["numerator"]), int(ev["denominator"]))
+            lines.append(ee(beat, val))
+
+        new_events_xml = "\n                  ".join(lines)
+        replaced = [False]
+
+        def maybe_replace_ts(m, _tid=ts_target_id, _xml=new_events_xml, _r=replaced):
+            env_inner = m.group(2)
+            pid_m = re.search(r'<PointeeId\s+Value="(\d+)"', env_inner)
+            if not pid_m or pid_m.group(1) != _tid:
+                return m.group(0)
+            new_inner = re.sub(
+                r'<Events>.*?</Events>',
+                f'<Events>\n                  {_xml}\n                </Events>',
+                env_inner,
+                flags=re.DOTALL
+            )
+            _r[0] = True
+            return m.group(1) + new_inner + m.group(3)
+
+        new_track = re.sub(envelope_pattern, maybe_replace_ts, track_content, flags=re.DOTALL)
+        if replaced[0]:
+            content = content[:t_start] + new_track + content[t_end_full:]
+            break
+
+    return content
+
+
+def _save_als_edits(path, tempo_events, time_sig_events, locator_overrides, output_path=None):
+    """Patch tempo map, time signatures, and locator positions/names.
+
+    When output_path is None: backs up the original to OLD_<basename>.als and
+    overwrites the original (in-place save).
+    When output_path is provided: writes to output_path without touching the
+    original file (Save As).
+
+    tempo_events: list of {"beat": float, "bpm": float} — beats >= 0, sorted
+    time_sig_events: list of {"beat": float, "numerator": int, "denominator": int}
+    locator_overrides: list of {"als_id": str, "beat": float|null, "name": str|null}
+
+    Returns {"ok": True, "new_path": "..."} or {"error": "..."}.
+    """
+    import gzip, os
+
+    dir_name  = os.path.dirname(path)
+    base_name = os.path.basename(path)
+    old_path  = os.path.join(dir_name, "OLD_" + base_name)
+
+    try:
+        with gzip.open(path, "rb") as f:
+            content = f.read().decode("utf-8")
+
+        # 1. Tempo map
+        if tempo_events:
+            content = _patch_tempo_events_in_content(content, tempo_events)
+
+        # 2. Time signatures
+        if time_sig_events:
+            content = _patch_time_sig_events_in_content(content, time_sig_events)
+
+        # 3. Locator positions and/or names
+        for ov in locator_overrides:
+            als_id = re.escape(str(ov["als_id"]))
+            beat   = ov.get("beat")
+            name   = ov.get("name")
+            if beat is None and name is None:
+                continue
+
+            def patch_locator(m, _beat=beat, _name=name):
+                block = m.group(0)
+                if _beat is not None:
+                    block = re.sub(
+                        r'(<Time\s+Value=")[^"]*(")',
+                        rf'\g<1>{_beat}\g<2>',
+                        block
+                    )
+                if _name is not None:
+                    escaped_name = str(_name).replace("&", "&amp;").replace('"', "&quot;")
+                    block = re.sub(
+                        r'(<Name\s+Value=")[^"]*(")',
+                        rf'\g<1>{escaped_name}\g<2>',
+                        block
+                    )
+                return block
+
+            content = re.sub(
+                rf'<Locator\s+Id="{als_id}".*?</Locator>',
+                patch_locator,
+                content,
+                flags=re.DOTALL,
+            )
+
+        # Write patched content
+        if output_path:
+            # Save As: write to new location, leave original untouched
+            with gzip.open(output_path, "wb") as f:
+                f.write(content.encode("utf-8"))
+            return {"ok": True, "new_path": output_path}
+        else:
+            # In-place save: backup then overwrite
+            os.rename(path, old_path)
+            try:
+                with gzip.open(path, "wb") as f:
+                    f.write(content.encode("utf-8"))
+            except Exception as e:
+                try:
+                    os.rename(old_path, path)
+                except Exception:
+                    pass
+                return {"error": str(e)}
+            return {"ok": True, "new_path": path}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _fix_locators(path, fixes):
     """
     Patch locator names in-place, keeping the original filename.
@@ -273,8 +540,7 @@ def _downgrade_to_live11(path):
                      r'\1MinorVersion="11.0_11300"', content)
     content = re.sub(r'(<Ableton\b[^>]*?)Creator="[^"]*"',
                      r'\1Creator="Ableton Live 11.3.43"', content)
-    content = re.sub(r'(<Ableton\b[^>]*?)SchemaChangeCount="[^"]*"',
-                     r'\1SchemaChangeCount="7"', content)
+    content = re.sub(r'\s*SchemaChangeCount="[^"]*"', '', content)
 
     # 2. MainTrack → MasterTrack (rename tag, strip Live-12 attributes, fix EffectiveName)
     main_m = re.search(r'<MainTrack\b[^>]*>', content)
@@ -305,9 +571,7 @@ def _downgrade_to_live11(path):
         content = re.sub(rf'\s+{attr}="[^"]*"', '', content)
 
     # 6. Remove Live-12 clip fields unknown to Live 11
-    content = re.sub(r'\s*<IsInKey\s+Value="[^"]*"\s*/>', '', content)
-    content = re.sub(r'\s*<ScaleInformation>.*?</ScaleInformation>', '',
-                     content, flags=re.DOTALL)
+    # NOTE: IsInKey, ScaleInformation, ContentLanes, ExpressionLanes exist in Live 11 — do NOT strip those
     content = re.sub(r'\s*<AutoWarpPending\s+Value="[^"]*"\s*/>', '', content)
     content = re.sub(r'\s*<WasMuted\s+Value="[^"]*"\s*/>', '', content)
     content = re.sub(r'\s*<SamplesToAutoWarp\s+Value="[^"]*"\s*/>', '', content)
@@ -367,13 +631,220 @@ def _downgrade_to_live11(path):
         content
     )
 
-    # 13. Remove Live-12 MIDI editor expression/content lane elements
-    content = re.sub(r'\s*<ExpressionLanes>.*?</ExpressionLanes>', '',
+    # 13. Remove Live-12 track structure elements unknown to Live 11
+    # NOTE: <TakeLanes> is NOT stripped — it exists identically in Live 11 and is required.
+    # Only <TakeLanesListWrapper> (a Live-12 LOM wrapper) and <ArrangementClipsListWrapper> are new.
+    content = re.sub(r'\s*<TakeLanesListWrapper\b[^>]*/>', '', content)
+    content = re.sub(r'\s*<ArrangementClipsListWrapper\b[^>]*/>', '', content)
+
+    # 14. Remove Live-12 MIDI features
+    content = re.sub(r'\s*<NoteProbabilityGroups\s*/>', '', content)
+    content = re.sub(r'\s*<ProbabilityGroupIdGenerator>.*?</ProbabilityGroupIdGenerator>', '',
                      content, flags=re.DOTALL)
-    content = re.sub(r'\s*<ContentLanes>.*?</ContentLanes>', '',
-                     content, flags=re.DOTALL)
-    content = re.sub(r'\s*<IsContentSplitterOpen\s+Value="[^"]*"\s*/>', '', content)
-    content = re.sub(r'\s*<IsExpressionSplitterOpen\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<NoteAlgorithms>.*?</NoteAlgorithms>', '', content, flags=re.DOTALL)
+    content = re.sub(r'\s*<MpePitchBendUsesTuning\s+Value="[^"]*"\s*/>', '', content)
+
+    # 14b. Strip Live-12 MidiClip / AudioClip clip-level additions unknown to Live 11.
+    # ExpressionGrid — Live 12 MPE expression lane data; Live 11 has no such stream type,
+    # triggering "Unknown Compound Stream Type" when Live 11 tries to deserialise it.
+    content = re.sub(r'\s*<ExpressionGrid>.*?</ExpressionGrid>', '', content, flags=re.DOTALL)
+    # ScaleInformation inside AudioClip — Live 12 added per-clip scale data to audio clips;
+    # Live 11 crashes (EXC_BAD_ACCESS at +8) when it finds ScaleInformation in an AudioClip.
+    # MidiClip ScaleInformation is KEPT — Live 11 expects it in MidiClips (removing it causes
+    # the same null-deref crash). Steps 21+22 below handle Root→RootNote rename and int→string
+    # Name conversion for all remaining ScaleInformation blocks (LiveSet + MidiClip).
+    content = re.sub(
+        r'(<AudioClip\b[^>]*>)(.*?)(</AudioClip>)',
+        lambda m: m.group(1)
+            + re.sub(r'\s*<ScaleInformation>.*?</ScaleInformation>', '', m.group(2), flags=re.DOTALL)
+            + m.group(3),
+        content, flags=re.DOTALL,
+    )
+    # AccidentalSpellingPreference / PreferFlatRootNote — Live 12 MidiClip view fields.
+    content = re.sub(r'\s*<AccidentalSpellingPreference\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<PreferFlatRootNote\s+Value="[^"]*"\s*/>', '', content)
+    # NoteEditorFold* — Live 12 piano-roll fold view state fields not present in Live 11.
+    content = re.sub(r'\s*<NoteEditorFold\w+\s+Value="[^"]*"\s*/>', '', content)
+
+    # 15. Remove Live-12 device/modulation fields
+    content = re.sub(r'\s*<BreakoutIsExpanded\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<EnabledByUser\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<IsTuned\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<KeepRecordMonitoringLatency\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<ComplexProEnvelopeModulationTarget\b.*?</ComplexProEnvelopeModulationTarget>',
+                     '', content, flags=re.DOTALL)
+    content = re.sub(r'\s*<ComplexProFormantsModulationTarget\b.*?</ComplexProFormantsModulationTarget>',
+                     '', content, flags=re.DOTALL)
+    content = re.sub(r'\s*<TransientEnvelopeModulationTarget\b.*?</TransientEnvelopeModulationTarget>',
+                     '', content, flags=re.DOTALL)
+    content = re.sub(r'\s*<SourceHint\b[^>]*/>', '', content)
+    content = re.sub(r'\s*<SourceHint\b.*?</SourceHint>', '', content, flags=re.DOTALL)
+
+    # 15b. Strip Live-12 ViewData from inside Mixer/MainSequencer/FreezeSequencer sub-nodes.
+    # In Live 12 these nodes gained a <ViewData Value="{...}" /> child immediately after
+    # <SourceContext>.  Live 11's deserializer has no field for it; when the object graph is
+    # later traversed Live 11 reads an uninitialised pointer → EXC_BAD_ACCESS at offset +8.
+    # The top-level track <ViewData> (which follows <ClipSlotsListWrapper>) is NOT stripped —
+    # it exists identically in Live 11 and must be kept.
+    content = re.sub(r'(</SourceContext>)\n([ \t]*)<ViewData\s+Value="[^"]*"\s*/>',
+                     r'\1', content)
+
+    # 15c. Strip <MidiControllerRange> from inside <CrossFadeState>.
+    # Live 12 added MidiControllerRange as a child of CrossFadeState; Live 11's CrossFadeState
+    # struct does not have this field — leaving it causes a null-deref crash on the MIDI
+    # controller map when Live 11 initialises the mixer.
+    content = re.sub(
+        r'(<CrossFadeState>.*?</AutomationTarget>)\s*<MidiControllerRange>.*?</MidiControllerRange>(\s*</CrossFadeState>)',
+        r'\1\2',
+        content, flags=re.DOTALL,
+    )
+
+    # 15d. Strip <IsInKey> from AudioClip — Live 12 addition, not present in Live 11 clips.
+    content = re.sub(r'\s*<IsInKey\s+Value="[^"]*"\s*/>', '', content)
+
+
+    # 15e. Strip <MidiControllerRange> from inside <TimeSignature> in MasterTrack Mixer.
+    # Live 12 added MidiControllerRange as a child of TimeSignature; Live 11's TimeSignature
+    # struct does not have this field.
+    content = re.sub(
+        r'(<TimeSignature>\s*<LomId[^/]*/>\s*<Manual[^/]*/>\s*<AutomationTarget\b[^>]*>.*?</AutomationTarget>)'
+        r'\s*<MidiControllerRange>.*?</MidiControllerRange>(\s*</TimeSignature>)',
+        r'\1\2',
+        content, flags=re.DOTALL,
+    )
+
+    # 15f. Strip <Mapping> from individual <Locator> elements.
+    # Live 12 added per-locator MIDI key mappings; Live 11 uses only the global
+    # NextLocatorMapping/PreviousLocatorMapping at the Locators level.
+    content = re.sub(r'\s*<Mapping>.*?</Mapping>', '', content, flags=re.DOTALL)
+
+    # 15g. Strip <NoteSpellingPreference> from LiveSet — Live 12 session-level addition.
+    content = re.sub(r'\s*<NoteSpellingPreference\s+Value="[^"]*"\s*/>', '', content)
+
+    # 16. Remove Live-12 top-level session fields
+    content = re.sub(r'\s*<SelectedDocumentViewInMainWindow\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<ShouldSceneTempoAndTimeSignatureBeVisible\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<WaveformVerticalZoomFactor\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<IsWaveformVerticalZoomActive\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<GroovesListWrapper\b[^>]*/>', '', content)
+    content = re.sub(r'\s*<DefaultGrooveId\s+Value="[^"]*"\s*/>', '', content)
+
+    # 17. Remove Live-12 locator key-mapping element (Live 11 uses Next/PreviousLocatorMapping)
+    content = re.sub(r'\s*<SetLocatorMapping>.*?</SetLocatorMapping>', '', content, flags=re.DOTALL)
+
+    # 18. Remove Live-12 ViewState dimension fields
+    content = re.sub(r'\s*<ViewStateArrangerMixerVolumeSectionHeight\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<ViewStateSessionMixerVolumeSectionHeight\s+Value="[^"]*"\s*/>', '', content)
+    content = re.sub(r'\s*<ViewStateSessionTrackWidth\s+Value="[^"]*"\s*/>', '', content)
+
+    # 19. Rename MidiEditorLaneModel → ExpressionLane (renamed in Live 12)
+    content = content.replace('<MidiEditorLaneModel ', '<ExpressionLane ')
+    content = content.replace('</MidiEditorLaneModel>', '</ExpressionLane>')
+
+    # 19b. Strip ExpressionLane entries with Type > 4 from ExpressionLanes/ContentLanes.
+    # Live 12 added Type=5 (Note Probability) to the expression lane enum. Live 11's enum
+    # only has types 0–4 (velocity + 4 MPE streams). Deserialising Type=5 returns a null
+    # lane object; calling a virtual method through it → PAC failure (pointer auth crash).
+    # Must run AFTER step 19 so the renamed <ExpressionLane> tags are in place.
+    def _strip_unknown_expression_lanes(block):
+        def _drop_lane(m):
+            lane_xml = m.group(0)
+            t = re.search(r'<Type Value="(\d+)"', lane_xml)
+            if t and int(t.group(1)) > 4:
+                return ''
+            return lane_xml
+        return re.sub(r'\s*<ExpressionLane\b[^>]*>.*?</ExpressionLane>', _drop_lane,
+                      block, flags=re.DOTALL)
+    content = re.sub(
+        r'(<(?:ExpressionLanes|ContentLanes)>)(.*?)(</(?:ExpressionLanes|ContentLanes)>)',
+        lambda m: m.group(1) + _strip_unknown_expression_lanes(m.group(2)) + m.group(3),
+        content, flags=re.DOTALL
+    )
+
+    # 20. Remove remaining Live-12 session fields
+    content = re.sub(r'\s*<SelectedBreakpointValue\s+Value="[^"]*"\s*/>', '', content)
+
+    # 21. Rename Root → RootNote inside ScaleInformation (tag renamed in Live 12)
+    content = content.replace('<Root Value=', '<RootNote Value=')
+    content = content.replace('</Root>', '</RootNote>')
+
+    # 22. Map ScaleInformation/Name integer index → string name.
+    # Live 12 stores scale mode as an integer (e.g. "0"); Live 11 stores a string (e.g. "Major").
+    # Live 11's parser does a string-table lookup; unrecognised value returns null → crash at +8.
+    _scale_names = [
+        "Major", "Minor", "Dorian", "Mixolydian", "Lydian", "Phrygian", "Locrian",
+        "Whole Tone", "Half-whole Dim.", "Whole-half Dim.", "Minor Blues",
+        "Minor Pentatonic", "Major Pentatonic", "Harmonic Minor", "Melodic Minor",
+        "Super Locrian", "Bhairav", "Hungarian Minor", "Minor Gypsy", "Hirajoshi",
+        "In-Sen", "Iwato", "Kumoi", "Pelog Selisir", "Pelog Tembung",
+        "Messiaen 3", "Messiaen 4", "Messiaen 5", "Messiaen 6", "Messiaen 7",
+        "Enigmatic", "Persian", "Arabian", "Japanese", "Egyptian", "Hawaiian",
+        "Spanish Gypsy", "Byzantine", "Leading Whole Tone", "Augmented",
+        "Neopolitan", "Neopolitan Minor", "Major Locrian", "Purvi Theta",
+        "Todi Theta", "Chinese",
+    ]
+    def _fix_scale_name_block(m):
+        block = m.group(0)
+        def _sub(m2):
+            val = m2.group(1)
+            if val.lstrip('-').isdigit():
+                idx = int(val)
+                name = _scale_names[idx] if 0 <= idx < len(_scale_names) else "Major"
+                return '<Name Value="{}" />'.format(name)
+            return m2.group(0)
+        return re.sub(r'<Name Value="([^"]*)" />', _sub, block)
+    content = re.sub(r'<ScaleInformation>.*?</ScaleInformation>',
+                     _fix_scale_name_block, content, flags=re.DOTALL)
+
+    # 23. Add <Active Value="true" /> to every TrackSendHolder.
+    # Live 12 dropped this element; Live 11 requires it — missing it leaves the active-target
+    # pointer uninitialised, causing a null-deref crash when Live 11 renders the mixer.
+    content = re.sub(
+        r'^([ \t]*)(</TrackSendHolder>)',
+        r'\1\t<Active Value="true" />\n\1\2',
+        content,
+        flags=re.MULTILINE,
+    )
+
+    # 24. Add <ChooserBar Value="0" /> after <CuePointsListWrapper> (present in Live 11, absent in Live 12)
+    content = re.sub(
+        r'(<CuePointsListWrapper\b[^>]*/>\n)',
+        r'\g<1>\t\t<ChooserBar Value="0" />\n',
+        content,
+        count=1,
+    )
+
+    # 25. Add <VelocityDetail Value="0" /> after <Freeze> (present in Live 11, absent in Live 12)
+    content = re.sub(
+        r'^([ \t]*)(<Freeze\s+Value="[^"]*"\s*/>)',
+        r'\1\2\n\1<VelocityDetail Value="0" />',
+        content,
+        flags=re.MULTILINE,
+    )
+
+    # 26. Add NextLocatorMapping / PreviousLocatorMapping after </Locators>
+    # (present in Live 11, replaced by SetLocatorMapping in Live 12 which we stripped in step 17)
+    _locator_mappings = (
+        '\n\t\t\t<NextLocatorMapping>\n'
+        '\t\t\t\t<PersistentKeyString Value="." />\n'
+        '\t\t\t\t<IsNote Value="false" />\n'
+        '\t\t\t\t<Channel Value="-1" />\n'
+        '\t\t\t\t<NoteOrController Value="-1" />\n'
+        '\t\t\t\t<LowerRangeNote Value="-1" />\n'
+        '\t\t\t\t<UpperRangeNote Value="-1" />\n'
+        '\t\t\t\t<ControllerMapMode Value="0" />\n'
+        '\t\t\t</NextLocatorMapping>\n'
+        '\t\t\t<PreviousLocatorMapping>\n'
+        '\t\t\t\t<PersistentKeyString Value="," />\n'
+        '\t\t\t\t<IsNote Value="false" />\n'
+        '\t\t\t\t<Channel Value="-1" />\n'
+        '\t\t\t\t<NoteOrController Value="-1" />\n'
+        '\t\t\t\t<LowerRangeNote Value="-1" />\n'
+        '\t\t\t\t<UpperRangeNote Value="-1" />\n'
+        '\t\t\t\t<ControllerMapMode Value="0" />\n'
+        '\t\t\t</PreviousLocatorMapping>'
+    )
+    content = content.replace('\t\t\t</Locators>', '\t\t\t</Locators>' + _locator_mappings, 1)
 
     # Write output
     dir_name  = os.path.dirname(path)
@@ -737,6 +1208,12 @@ def validate_session(path):
     # automation envelope correctly — so barline checks respect every time sig change.
     ts_events = _ts_events_from_content(raw_xml)
 
+    # ── BPM (for length tolerance) ──
+    # 1ms tolerance in beats = bpm / 60000.0
+    _bpm_m = re.search(rb"<Tempo\b[^>]*>.*?<Manual\s+Value=\"([^\"]+)\"", raw_xml, re.DOTALL)
+    _bpm = float(_bpm_m.group(1)) if _bpm_m else 120.0
+    _length_tol = _bpm / 12000.0  # 5ms expressed in beats
+
     # ── Tempo checks (independent of clips — run before any clip-related early returns) ──
     # 4. Tempo ramps — all changes must be step changes, not linear/curved ramps
     warnings.extend(_check_tempo_ramps(raw_xml))
@@ -780,9 +1257,9 @@ def validate_session(path):
             f"\"{ref_clip['name']}\" does not end on beat 1"
         )
 
-    # 3. Loop bracket and clip must match
+    # 3. Loop bracket and clip must match (1ms tolerance)
     diff = abs(ref_clip["end"] - loop_end)
-    if diff > 0.001:
+    if diff > _length_tol:
         warnings.append(
             f"Loop bracket and \"{ref_clip['name']}\" are not the same length"
         )
@@ -1000,6 +1477,15 @@ def run_server():
                     print(json.dumps(result), flush=True)
                 elif action == "detect_key":
                     result = _detect_key(cmd["path"])
+                    print(json.dumps(result), flush=True)
+                elif action == "save_als_edits":
+                    result = _save_als_edits(
+                        cmd["path"],
+                        cmd.get("tempo_events", []),
+                        cmd.get("time_sig_events", []),
+                        cmd.get("locator_overrides", []),
+                        cmd.get("output_path") or None,
+                    )
                     print(json.dumps(result), flush=True)
                 else:
                     print(json.dumps({"error": f"Unknown action: {action}"}), flush=True)

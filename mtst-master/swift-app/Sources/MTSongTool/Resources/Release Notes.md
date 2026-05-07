@@ -1,4 +1,4 @@
-# MT Song Tool — v1.4.1
+# MT Song Tool — v1.5.0
 
 ## Features
 
@@ -22,6 +22,23 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.5.0 — April 22, 2026
+
+#### Edit Tab
+
+- **Locator drag-to-reposition** — Locator flags in the timeline lane are now draggable. Dragging snaps to bar downbeats; a vertical guide line and bar tooltip track the drag position. COUNT OFF is locked; all other locators including NEXT SONG and ENDING are draggable. Loop bracket recalculates live as NEXT SONG moves.
+- **Loop bracket display** — An info strip above the timeline shows the session loop bracket (`Loop: bar 1 (0:00.000) → bar N (M:SS.mmm)`). Auto-calculated from NEXT SONG locator position; updates in real time when locators are dragged.
+- **Tempo lane — interactive BPM editing** — The tempo lane (below the locator lane) now fully supports editing. Drag a handle vertically to change BPM (1 BPM snap; hold ⇧ for 0.01 BPM precision). Drag horizontally to reposition (snaps to beats). Click empty space to add an event at the prevailing BPM. Click an existing handle to delete it. Beat-0 anchor is immovable. The bar grid recalculates forward from every change.
+- **Time signature lane** — New 20 px lane below the tempo lane showing a flag at each time signature change point. Drag a flag to reposition it (snaps to bar downbeats; beat-0 is immovable). Tap a flag to change its numerator/denominator via a compact picker popover. Hover a non-beat-0 flag to reveal a × delete button. Click empty space to add a new time signature change: a picker opens with the prevailing time sig pre-selected; confirm to place the flag. The bar grid recalculates forward from each change point, so locators and clip positions stay beat-locked through any time sig edit.
+- **Stem deletion** — Right-click a waveform clip to remove the stem from the session (disk file untouched). ⌦ Forward Delete removes the selected stem; ⌫ Delete removes a region selection if one is active, falling back to stem deletion. CLICK TRACK, GUIDE, and ORIGINAL SONG are excluded from keyboard and waveform deletion (still removable from the sidebar context menu).
+- **Per-stem peak-hold meters** — CLICK TRACK, GUIDE, and ORIGINAL SONG now show an all-time peak dB readout in the sidebar (e.g. `−3.2`). Tap the number to reset the hold. These stems bypass the collective master meter so the master meter reflects only the mix stems.
+- **Master meter — all-time peak hold** — A thin tick mark in the master meter shows the all-time peak level. The dB readout next to the bar turns red above 0 dBFS and yellow near clip. Tap the number to reset.
+- **Stem normalization accuracy** — Bus true-peak scan now uses 4× oversampling. ORIGINAL SONG normalizes to −6 dBFS from file true peak (independent of collective stems). Balance between collective stems is preserved.
+- **Gain lock for reference stems** — CLICK TRACK, GUIDE, and ORIGINAL SONG now show a lock icon in place of the gain slider. Gain is fixed at 0.0 dB; accidental adjustments are prevented. Normalize Stems still adjusts ORIGINAL SONG's gain automatically.
+- **Export Stems** — New toolbar button replaces "Commit Changes." Exports all session stems to a user-chosen folder, each padded or trimmed to exactly the loop bracket end (NEXT SONG − 1 bar). Segment edits and cuts are baked into a single file per stem; current gain is applied; mute state is ignored so all stems export at full signal. Output is 44.1 kHz / 16-bit PCM, conforming to QA tab standards. Excluded (deleted) stems are omitted.
+- **Sidebar widened to 220 px** — More room for longer stem names and the gain readout.
+- **Performance** — Meters use lock-free float atoms (no `Task` allocation per audio buffer). `StemPeakMeter` and `MasterPeakMeter` are Canvas-based (single GPU draw call per frame). Pinch-to-zoom no longer triggers a waveform path rebuild mid-gesture; CALayer scale transform is used instead, with a full rebuild only on gesture end.
 
 ### v1.4.1 — April 15, 2026
 
