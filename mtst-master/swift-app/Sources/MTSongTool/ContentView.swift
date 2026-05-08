@@ -54,6 +54,9 @@ struct ContentView: View {
     // Active app tab
     enum AppTab { case qa, edit, audioshake }
     @State private var activeTab: AppTab = .qa
+    @State private var qaTabFlash = false
+    @State private var showUnsavedAlert = false
+    @State private var showQuitAlert = false
 
     // AudioShake settings entry
     @State private var audioShakeKeyInput: String = ""
@@ -105,7 +108,7 @@ struct ContentView: View {
                         analyzer: audioAnalyzer,
                         parsedResult: parser.result,
                         onLocatorFix: { fixes in applyLocatorFixes(fixes) },
-                        onSaveEdits: { newPath in loadNewFile(path: newPath) },
+                        onSaveEdits: { newPath in loadNewFile(path: newPath); qaTabFlash = true },
                         alsFullPath: parser.alsPath,
                         mtCompleteMode: userSettings.mtCompleteMode,
                         onFolderDrop: { url in handleFolderDrop(url) },
@@ -148,7 +151,7 @@ struct ContentView: View {
                                 // Clear All only shown here in Quick Check Mode without a loaded file
                                 // (when a file is loaded, Clear All lives in the file bar)
                                 if parser.result == nil {
-                                    Button("Clear All") { clearAll() }
+                                    Button("Clear All") { clearAllGuarded() }
                                         .buttonStyle(SecondaryButtonStyle().hoverable())
                                 }
                             }
@@ -214,6 +217,13 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 680, minHeight: 680)
+        .onReceive(NotificationCenter.default.publisher(for: .mtst_appShouldQuit)) { _ in
+            if editPlayer.isSessionDirty {
+                showQuitAlert = true
+            } else {
+                NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            }
+        }
         .onChange(of: parser.isLoading) { isLoading in
             if !isLoading, let version = parser.result?.liveMajorVersion {
                 if version == 12 { showLive12Alert = true }
@@ -270,6 +280,47 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { clearAll() }
         } message: {
             Text("This .als is made for Ableton 12. Convert to Ableton 11?")
+        }
+        .alert("Unsaved Changes", isPresented: $showUnsavedAlert) {
+            Button("Save") {
+                Task {
+                    guard let path = parser.alsPath, !path.isEmpty else { clearAll(); return }
+                    _ = try? await ParserService.saveAlsEdits(
+                        alsPath: path,
+                        tempoEvents: editPlayer.editableTempoEvents,
+                        timeSigEvents: editPlayer.timeSigOverrides,
+                        locatorOverrides: editPlayer.locatorOverrides
+                    )
+                    clearAll()
+                }
+            }
+            Button("Discard", role: .destructive) { clearAll() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("You have unsaved edits in the Edit tab. Save before clearing?")
+        }
+        .alert("Unsaved Changes", isPresented: $showQuitAlert) {
+            Button("Save and Quit") {
+                Task {
+                    if let path = parser.alsPath, !path.isEmpty {
+                        _ = try? await ParserService.saveAlsEdits(
+                            alsPath: path,
+                            tempoEvents: editPlayer.editableTempoEvents,
+                            timeSigEvents: editPlayer.timeSigOverrides,
+                            locatorOverrides: editPlayer.locatorOverrides
+                        )
+                    }
+                    NSApplication.shared.reply(toApplicationShouldTerminate: true)
+                }
+            }
+            Button("Discard and Quit", role: .destructive) {
+                NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            }
+            Button("Cancel", role: .cancel) {
+                NSApplication.shared.reply(toApplicationShouldTerminate: false)
+            }
+        } message: {
+            Text("You have unsaved edits in the Edit tab. Save before quitting?")
         }
         .alert("Old Ableton Version", isPresented: $showOldVersionAlert) {
             if ableton11URL != nil {
@@ -616,19 +667,29 @@ struct ContentView: View {
 
     private func tabButton(label: String, tab: AppTab) -> some View {
         let isActive = activeTab == tab
+        let showFlash = tab == .qa && qaTabFlash
         return Button(label) {
             if tab != .qa { stemPlayer.stop() }
             if tab != .edit { editPlayer.stop() }
             if tab != .audioshake { audioShakePlayer.stop() }
             activeTab = tab
+            if tab == .qa { qaTabFlash = false }
         }
             .font(.lato(size: 12, weight: isActive ? .semibold : .regular))
-            .foregroundColor(isActive ? .accent : .fgMid)
+            .foregroundColor(isActive ? .accent : (showFlash ? .accent : .fgMid))
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
-            .background(isActive ? Color.accent.opacity(0.12) : Color.clear)
+            .background(isActive ? Color.accent.opacity(0.12) : (showFlash ? Color.accent.opacity(0.08) : Color.clear))
             .cornerRadius(6)
             .buttonStyle(.plain)
+            .overlay(alignment: .topTrailing) {
+                if showFlash {
+                    Circle()
+                        .fill(Color.accent)
+                        .frame(width: 6, height: 6)
+                        .offset(x: -2, y: 2)
+                }
+            }
     }
 
     // MARK: Header
@@ -1248,7 +1309,7 @@ struct ContentView: View {
                 Button("Convert to Live 11") { convertToLive11() }
                     .buttonStyle(FixedHeightSecondaryButtonStyle(height: 35).hoverable())
             }
-            Button("Clear All") { clearAll() }
+            Button("Clear All") { clearAllGuarded() }
                 .buttonStyle(FixedHeightSecondaryButtonStyle(height: 35).hoverable())
         }
     }
@@ -1314,6 +1375,14 @@ struct ContentView: View {
             } else {
                 showToastMessage(error ?? "Conversion failed", isError: true)
             }
+        }
+    }
+
+    private func clearAllGuarded() {
+        if editPlayer.isSessionDirty {
+            showUnsavedAlert = true
+        } else {
+            clearAll()
         }
     }
 

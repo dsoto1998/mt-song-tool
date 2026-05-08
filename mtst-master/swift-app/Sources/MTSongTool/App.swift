@@ -127,6 +127,7 @@ private struct RootView: View {
 
 extension Notification.Name {
     static let mtst_showReleaseNotes = Notification.Name("mtst.showReleaseNotes")
+    static let mtst_appShouldQuit = Notification.Name("mtst.appShouldQuit")
 }
 
 // MARK: - Window drag handle
@@ -214,6 +215,11 @@ struct WindowDragArea: NSViewRepresentable {
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        NotificationCenter.default.post(name: .mtst_appShouldQuit, object: nil)
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
