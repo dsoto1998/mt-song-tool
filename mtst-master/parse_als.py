@@ -846,14 +846,21 @@ def _downgrade_to_live11(path):
     )
     content = content.replace('\t\t\t</Locators>', '\t\t\t</Locators>' + _locator_mappings, 1)
 
-    # 27. Renumber low-range AutomationTarget/ModulationTarget IDs in MasterTrack
-    #     AND PreHearTrack to the high range, and bump NextPointeeId.
-    # Live 12 assigns small Pointee IDs (1–27) to MasterTrack/PreHearTrack mixer params.
-    # These collide in Live 11's global pointee namespace with AudioTrack track-IDs
-    # (which start at 8 and increase by 1 per track), causing a silent crash deep in
-    # deserialization (KERN_INVALID_ADDRESS, frames 2346044/2342340/...).
+    # 27. Fix Live 12 → 11 stem-track downgrade Crash C (Pointee-namespace ID collision).
+    #
+    # Live 12 assigns small Pointee IDs (1–27) to MasterTrack/PreHearTrack mixer
+    # AutomationTargets/ModulationTargets. In Live 11, AudioTrack IDs share the same
+    # Pointee namespace. SHAD-style stem sessions number AudioTracks starting at Id=8
+    # (one per track), so they collide with mixer-target IDs in MasterTrack and
+    # PreHearTrack. Live 11's deserializer crashes silently on the wrong-typed lookup
+    # (KERN_INVALID_ADDRESS, frames 2346044/2342340/...).
+    #
     # BB11 native Live 11 sessions don't have this problem because their MasterTrack
-    # AutomationTargets start at high IDs (5538+).
+    # AutomationTargets start at high IDs (5538+), placed after all AudioTracks.
+    #
+    # Fix: renumber MasterTrack AND PreHearTrack AT/MT IDs to a fresh high range
+    # (max_id+100..), update any <PointeeId Value="N"/> references to match, and bump
+    # <NextPointeeId> above the new max so Live 11's pointee allocator stays consistent.
     _target_tags = (
         'AutomationTarget',
         'ModulationTarget',
@@ -870,47 +877,74 @@ def _downgrade_to_live11(path):
     remap = {}
     target_re = re.compile(r'<(' + '|'.join(_target_tags) + r')\s+Id="(\d+)"')
 
-    def _renumber_in_block(block_xml):
-        """Renumber low-IDs in an XML block; updates `remap` and `next_id`."""
+    def _renumber(m):
         nonlocal next_id
-        def _sub(m):
-            nonlocal next_id
-            tag = m.group(1)
-            old = int(m.group(2))
-            if old < 30000 and old not in remap:
-                remap[old] = next_id
-                next_id += 1
-            new = remap.get(old, old)
-            return f'<{tag} Id="{new}"'
-        return target_re.sub(_sub, block_xml)
+        tag = m.group(1)
+        old = int(m.group(2))
+        if old < 30000 and old not in remap:
+            remap[old] = next_id
+            next_id += 1
+        return f'<{tag} Id="{remap.get(old, old)}"'
 
     # Apply to MasterTrack block.
     mt_match = re.search(r'<MasterTrack\b.*?</MasterTrack>', content, flags=re.DOTALL)
     if mt_match:
-        new_mt = _renumber_in_block(mt_match.group(0))
+        new_mt = target_re.sub(_renumber, mt_match.group(0))
         content = content[:mt_match.start()] + new_mt + content[mt_match.end():]
 
-    # Apply to PreHearTrack block (re-search since indices shifted).
+    # Apply to PreHearTrack block (re-search since indices shifted after MT replace).
     pht_match = re.search(r'<PreHearTrack\b.*?</PreHearTrack>', content, flags=re.DOTALL)
     if pht_match:
-        new_pht = _renumber_in_block(pht_match.group(0))
+        new_pht = target_re.sub(_renumber, pht_match.group(0))
         content = content[:pht_match.start()] + new_pht + content[pht_match.end():]
 
-    # Update <PointeeId Value="N"/> references across the whole document.
-    def _update_pointee(m):
-        old = int(m.group(1))
-        if old in remap:
-            return f'<PointeeId Value="{remap[old]}"/>'
-        return m.group(0)
-    content = re.sub(r'<PointeeId\s+Value="(\d+)"\s*/>', _update_pointee, content)
+    if remap:
+        # Update <PointeeId Value="N"/> references where N was remapped.
+        def _update_pointee(m):
+            old = int(m.group(1))
+            if old in remap:
+                return f'<PointeeId Value="{remap[old]}"/>'
+            return m.group(0)
+        content = re.sub(r'<PointeeId\s+Value="(\d+)"\s*/>', _update_pointee, content)
 
-    # Bump <NextPointeeId> to be safely above the new max.
-    content = re.sub(
-        r'(<NextPointeeId\s+Value=")\d+(")',
-        f'\\g<1>{next_id + 100}\\g<2>',
-        content,
-        count=1,
-    )
+        # Bump <NextPointeeId> safely above the new max.
+        content = re.sub(
+            r'(<NextPointeeId\s+Value=")\d+(")',
+            f'\\g<1>{next_id + 100}\\g<2>',
+            content,
+            count=1,
+        )
+
+    # 28. Fix Live 12 → 11 stem-track downgrade Crash A (null warp marker array).
+    #
+    # Live 12 SHAD-style sessions populate the MasterTrack's
+    # <FreezeSequencer><AudioSequencer><ClipSlotList> with N empty <ClipSlot> entries
+    # (one per AudioTrack). Each empty ClipSlot has <ClipSlot><Value /></ClipSlot> but
+    # no actual clip — yet on load Live 11 iterates these slots and tries to access a
+    # WarpMarker array that is never allocated, crashing on null+8 atomic refcount
+    # (KERN_INVALID_ADDRESS at 0x8, frames 21760912/21656556/...).
+    #
+    # BB11 native sessions have <ClipSlotList /> (empty) here, so they don't crash.
+    #
+    # Fix: replace the populated ClipSlotList inside MasterTrack/PreHearTrack
+    # FreezeSequencer with an empty <ClipSlotList />.
+    def _empty_freeze_clipslotlist(track_xml):
+        fs_match = re.search(r'<FreezeSequencer\b.*?</FreezeSequencer>', track_xml, flags=re.DOTALL)
+        if not fs_match:
+            return track_xml
+        new_fs = re.sub(
+            r'<ClipSlotList>.*?</ClipSlotList>',
+            '<ClipSlotList />',
+            fs_match.group(0),
+            flags=re.DOTALL,
+        )
+        return track_xml[:fs_match.start()] + new_fs + track_xml[fs_match.end():]
+
+    for track_tag in ('MasterTrack', 'PreHearTrack'):
+        m = re.search(rf'<{track_tag}\b.*?</{track_tag}>', content, flags=re.DOTALL)
+        if m:
+            new_block = _empty_freeze_clipslotlist(m.group(0))
+            content = content[:m.start()] + new_block + content[m.end():]
 
     # Write output
     dir_name  = os.path.dirname(path)
