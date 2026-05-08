@@ -268,7 +268,7 @@ struct EditView: View {
             }
             // Seed time sig overrides from parse result
             if let result = parsedResult, editPlayer.timeSigOverrides.isEmpty {
-                editPlayer.seedTimeSigEvents(result.timeSignatures)
+                editPlayer.initTimeSigs(from: result.timeSignatures)
             }
             // Build metronome beat schedule from parsed session
             rebuildBeatSchedule()
@@ -316,7 +316,7 @@ struct EditView: View {
             editPlayer.loadStems(newURLs)
             if let result = parsedResult {
                 editPlayer.seedTempoEvents(result.tempoEvents)
-                editPlayer.seedTimeSigEvents(result.timeSignatures)
+                editPlayer.initTimeSigs(from: result.timeSignatures)
             }
             rebuildBeatSchedule()
         }
@@ -791,22 +791,17 @@ struct EditView: View {
                         onTempoDelete: { idx in editPlayer.deleteTempoEvent(at: idx) },
                         onTempoDeleteMultiple: { indices in editPlayer.deleteTempoEvents(at: indices) },
                         onTempoCommitDrag: { idx, beat, bpm in editPlayer.updateTempoEvent(at: idx, beat: beat, bpm: bpm) },
-                        timeSigOverrides: editPlayer.timeSigOverrides,
+                        timeSigs: editPlayer.timeSigOverrides,
                         onTimeSigAdd: { tapSecs, num, den in
-                            let db = metronome.beatSchedule.filter { $0.isDownbeat }
-                            guard !db.isEmpty else { return }
-                            let nearest = db.min(by: { abs($0.timeSeconds - tapSecs) < abs($1.timeSeconds - tapSecs) })!
-                            guard nearest.absoluteBeat > 0.001 else { return }
-                            editPlayer.addTimeSig(atBeat: nearest.absoluteBeat, numerator: num, denominator: den)
+                            let downbeats = metronome.beatSchedule.filter { $0.isDownbeat }
+                            guard !downbeats.isEmpty else { return }
+                            let nearest = downbeats.min(by: {
+                                abs($0.timeSeconds - tapSecs) < abs($1.timeSeconds - tapSecs)
+                            })!
+                            editPlayer.addOrUpdateTimeSig(beat: nearest.absoluteBeat, numerator: num, denominator: den)
                         },
-                        onTimeSigDelete: { idx in editPlayer.deleteTimeSig(at: idx) },
-                        onTimeSigChange: { idx, num, den in editPlayer.updateTimeSig(at: idx, numerator: num, denominator: den) },
-                        onTimeSigMove: { idx, beat in editPlayer.moveTimeSig(at: idx, toBeat: beat) },
-                        onTimeSigSnapToDownbeat: { rawSecs in
-                            let db = metronome.beatSchedule.filter { $0.isDownbeat }
-                            guard !db.isEmpty else { return (rawSecs, 0) }
-                            let nearest = db.min(by: { abs($0.timeSeconds - rawSecs) < abs($1.timeSeconds - rawSecs) })!
-                            return (nearest.timeSeconds, nearest.absoluteBeat)
+                        onTimeSigRemove: { beat in
+                            editPlayer.removeTimeSig(beat: beat)
                         }
                     )
 
@@ -1566,23 +1561,20 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onTempoCommitDrag: (Int, Double, Double) -> Void = { _, _, _ in }
 
     // Time signature lane
-    var timeSigOverrides: [TimeSigEvent] = []
-    var onTimeSigAdd: (Double, Int, Int) -> Void = { _, _, _ in }
-    var onTimeSigDelete: (Int) -> Void = { _ in }
-    var onTimeSigChange: (Int, Int, Int) -> Void = { _, _, _ in }
-    var onTimeSigMove: (Int, Double) -> Void = { _, _ in }
-    var onTimeSigSnapToDownbeat: (Double) -> (Double, Double) = { s in (s, 0) }
+    var timeSigs: [TimeSigOverride] = []
+    var onTimeSigAdd: (Double, Int, Int) -> Void = { _, _, _ in }   // (tapSeconds, num, den)
+    var onTimeSigRemove: (Double) -> Void = { _ in }               // (beat)
 
     private static let protectedStemNames: Set<String> = ["CLICK TRACK", "GUIDE", "ORIGINAL SONG"]
     private func isProtectedURL(_ url: URL) -> Bool {
         Self.protectedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
     }
 
-    // 24px bar-number ruler + 20px locator lane + 28px tempo lane + 20px time sig lane
+    // 24px bar-number ruler + 20px locator lane + 28px tempo lane + 18px time sig lane
     static let rulerLaneHeight: CGFloat = 24
     static let locatorLaneHeight: CGFloat = 20
     static let tempoLaneHeight: CGFloat = 28
-    static let timeSigLaneHeight: CGFloat = 20
+    static let timeSigLaneHeight: CGFloat = 18
     private let rulerHeight: CGFloat = WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.tempoLaneHeight + WaveformScrollHost.timeSigLaneHeight
 
     // MARK: - Time helper
@@ -1718,8 +1710,8 @@ struct WaveformScrollHost: NSViewRepresentable {
         }
         h.combine(editableTempoEvents.count)
         for ev in editableTempoEvents { h.combine(ev.beat); h.combine(ev.bpm) }
-        h.combine(timeSigOverrides.count)
-        for ev in timeSigOverrides { h.combine(ev.beat); h.combine(ev.numerator); h.combine(ev.denominator) }
+        h.combine(timeSigs.count)
+        for ev in timeSigs { h.combine(ev.beat); h.combine(ev.numerator); h.combine(ev.denominator) }
         return h.finalize()
     }
 
@@ -2378,16 +2370,13 @@ struct WaveformScrollHost: NSViewRepresentable {
                 )
                 .frame(height: WaveformScrollHost.tempoLaneHeight)
 
-                // Time signature lane — flags at each change point, click-to-add/edit/drag
+                // Time signature lane — chips spanning each region, tap to edit, hover × to remove
                 EditTimeSigLane(
-                    events: timeSigOverrides,
+                    timeSigs: timeSigs,
                     totalDuration: totalDuration,
                     beatSchedule: beatSchedule,
                     onAdd: onTimeSigAdd,
-                    onDelete: onTimeSigDelete,
-                    onChange: onTimeSigChange,
-                    onMove: onTimeSigMove,
-                    onSnapToDownbeat: onTimeSigSnapToDownbeat
+                    onRemove: onTimeSigRemove
                 )
                 .frame(height: WaveformScrollHost.timeSigLaneHeight)
 
@@ -3215,57 +3204,206 @@ extension CGFloat {
     }
 }
 
-// MARK: - Time Signature Lane (Edit tab)
+// MARK: - Edit Tab Time Signature Lane
 
-/// Compact time signature picker popover — numerator (1-16) + denominator (2/4/8/16).
-struct TimeSigPickerPopover: View {
-    @Binding var numerator: Int
-    @Binding var denominator: Int
-    var title: String = "Time Signature"
-    var confirmLabel: String = "Add"
-    let onConfirm: () -> Void
-    let onCancel: () -> Void
+struct EditTimeSigLane: View {
+    let timeSigs: [TimeSigOverride]
+    let totalDuration: Double
+    let beatSchedule: [BeatInfo]
+    let onAdd: (Double, Int, Int) -> Void   // (tapSeconds, num, den) — snap handled upstream
+    let onRemove: (Double) -> Void          // (beat)
 
-    private let validDenominators = [2, 4, 8, 16]
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return 0 }
+        var prev = beatSchedule[0]
+        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.lato(size: 11, weight: .semibold))
-                .foregroundColor(Color.fgBright)
+        GeometryReader { geo in
+            laneContent(width: geo.size.width)
+        }
+    }
 
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Beats per bar")
-                        .font(.lato(size: 9))
-                        .foregroundColor(Color.fgMid)
-                    HStack(spacing: 6) {
-                        Button { numerator = max(1, numerator - 1) } label: {
-                            Image(systemName: "minus").font(.system(size: 10)).foregroundColor(Color.fgMid)
-                        }
-                        .buttonStyle(.plain)
-                        Text("\(numerator)")
-                            .font(.lato(size: 15, weight: .bold))
-                            .foregroundColor(Color.fgBright)
-                            .monospacedDigit()
-                            .frame(width: 26, alignment: .center)
-                        Button { numerator = min(16, numerator + 1) } label: {
-                            Image(systemName: "plus").font(.system(size: 10)).foregroundColor(Color.fgMid)
+    @ViewBuilder
+    private func laneContent(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(width: width, height: WaveformScrollHost.timeSigLaneHeight)
+
+            if totalDuration > 0, width > 0, !timeSigs.isEmpty {
+                let sorted = timeSigs.sorted { $0.beat < $1.beat }
+                ForEach(Array(sorted.enumerated()), id: \.element.beat) { i, ts in
+                    let startSecs = secondsForBeat(ts.beat)
+                    let endSecs: Double = i + 1 < sorted.count
+                        ? secondsForBeat(sorted[i + 1].beat) : totalDuration
+                    let x = CGFloat(startSecs / totalDuration) * width
+                    let nextX = CGFloat(endSecs / totalDuration) * width
+                    let chipW = max(0, nextX - x)
+
+                    EditTimeSigChip(
+                        ts: ts,
+                        chipWidth: chipW,
+                        chipStartSecs: startSecs,
+                        chipEndSecs: endSecs,
+                        beatSchedule: beatSchedule,
+                        isRemovable: ts.beat > 0.001,
+                        onConfirm: { secs, num, den in
+                            onAdd(secs, num, den)
+                        },
+                        onRemove: ts.beat > 0.001 ? { onRemove(ts.beat) } : nil
+                    )
+                    .frame(width: max(chipW, 1), height: WaveformScrollHost.timeSigLaneHeight)
+                    .offset(x: max(0, x), y: 0)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Edit Tab Time Signature Chip
+
+struct EditTimeSigChip: View {
+    let ts: TimeSigOverride
+    let chipWidth: CGFloat
+    let chipStartSecs: Double
+    let chipEndSecs: Double
+    let beatSchedule: [BeatInfo]
+    let isRemovable: Bool
+    let onConfirm: (Double, Int, Int) -> Void   // (tapSecs, num, den)
+    let onRemove: (() -> Void)?
+
+    @State private var pickerOpen = false
+    @State private var pickerNum: Int = 4
+    @State private var pickerDen: Int = 4
+    @State private var tapSecs: Double = 0
+    @State private var snappedBar: Int = 1
+    @State private var tapXFraction: CGFloat = 0
+    @State private var isHovering = false
+
+    private func estimateBar(_ seconds: Double) -> Int {
+        let downbeats = beatSchedule.filter { $0.isDownbeat }
+        guard !downbeats.isEmpty else { return 1 }
+        return downbeats.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!.bar
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            chipBody(w: geo.size.width)
+        }
+    }
+
+    @ViewBuilder
+    private func chipBody(w: CGFloat) -> some View {
+        let h = WaveformScrollHost.timeSigLaneHeight
+        Color(white: 0.18).opacity(0.95)
+            .overlay(alignment: .leading) {
+                Color.white.opacity(0.35).frame(width: 1)
+            }
+            .overlay {
+                HStack(spacing: 0) {
+                    Text(ts.sig)
+                        .font(.lato(size: 8, weight: .bold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.leading, 4)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if isRemovable && isHovering {
+                        Button {
+                            onRemove?()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundColor(.white.opacity(0.7))
+                                .padding(.trailing, 4)
                         }
                         .buttonStyle(.plain)
                     }
                 }
+                .frame(height: h)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onEnded { value in
+                        let frac = max(0, min(1, value.location.x / max(1, w)))
+                        tapXFraction = frac
+                        let range = chipEndSecs - chipStartSecs
+                        let t = chipStartSecs + Double(frac) * max(0, range)
+                        tapSecs = t
+                        snappedBar = estimateBar(t)
+                        pickerNum = ts.numerator
+                        pickerDen = ts.denominator
+                        pickerOpen = true
+                    }
+            )
+            .onHover { isHovering = $0 }
+            .popover(isPresented: $pickerOpen,
+                     attachmentAnchor: .point(UnitPoint(x: tapXFraction, y: 0)),
+                     arrowEdge: .bottom) {
+                TimeSigPickerPopover(
+                    barNumber: snappedBar,
+                    numerator: $pickerNum,
+                    denominator: $pickerDen,
+                    onConfirm: {
+                        onConfirm(tapSecs, pickerNum, pickerDen)
+                        pickerOpen = false
+                    },
+                    onCancel: { pickerOpen = false }
+                )
+            }
+            .frame(width: w, height: h)
+    }
+}
+
+// MARK: - Time Signature Picker Popover
+
+struct TimeSigPickerPopover: View {
+    let barNumber: Int
+    @Binding var numerator: Int
+    @Binding var denominator: Int
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    private let denominators = [2, 4, 8, 16]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Time Signature")
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.fgBright)
+                Text("Starting at bar \(barNumber)")
+                    .font(.lato(size: 9, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+            }
+
+            HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Beat unit")
-                        .font(.lato(size: 9))
+                    Text("Numerator")
+                        .font(.lato(size: 9, weight: .regular))
                         .foregroundColor(Color.fgMid)
-                    HStack(spacing: 3) {
-                        ForEach(validDenominators, id: \.self) { d in
+                    Stepper(value: $numerator, in: 1...16) {
+                        Text("\(numerator)")
+                            .font(.lato(size: 14, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                            .frame(minWidth: 28, alignment: .center)
+                    }
+                    .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Denominator")
+                        .font(.lato(size: 9, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                    HStack(spacing: 4) {
+                        ForEach(denominators, id: \.self) { d in
                             Button("\(d)") { denominator = d }
                                 .font(.lato(size: 11, weight: denominator == d ? .bold : .regular))
                                 .foregroundColor(denominator == d ? .white : Color.fgMid)
-                                .frame(width: 26, height: 22)
-                                .background(denominator == d ? Color.accent.opacity(0.8) : Color.border.opacity(0.3))
+                                .frame(width: 30, height: 26)
+                                .background(denominator == d ? Color.accent : Color.border.opacity(0.4))
                                 .cornerRadius(4)
                                 .buttonStyle(.plain)
                         }
@@ -3273,252 +3411,27 @@ struct TimeSigPickerPopover: View {
                 }
             }
 
-            Text("Preview: \(numerator)/\(denominator)")
-                .font(.lato(size: 10))
-                .foregroundColor(Color.fgMid)
+            Divider().foregroundColor(Color.border)
 
             HStack {
+                Button("Cancel") { onCancel() }
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+                    .buttonStyle(.plain)
                 Spacer()
-                Button("Cancel", action: onCancel)
-                    .font(.lato(size: 11)).foregroundColor(Color.fgMid).buttonStyle(.plain)
-                Button(confirmLabel, action: onConfirm)
-                    .font(.lato(size: 11, weight: .semibold)).foregroundColor(Color.accent).buttonStyle(.plain)
+                Text("\(numerator)/\(denominator)")
+                    .font(.lato(size: 13, weight: .bold))
+                    .foregroundColor(Color.fgBright)
+                Spacer()
+                Button("Set") { onConfirm() }
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.accent)
+                    .buttonStyle(.plain)
             }
         }
         .padding(12)
-        .frame(width: 220)
-    }
-}
-
-/// Interactive time signature lane rendered below the tempo lane.
-/// Flags at each change point: drag to reposition, tap to change value, × to delete.
-/// Beat-0 flag is immovable and undeletable.
-/// Click empty space → picker opens → place on confirm (snaps to bar downbeat).
-struct EditTimeSigLane: View {
-    let events: [TimeSigEvent]
-    let totalDuration: Double
-    let beatSchedule: [BeatInfo]
-    let onAdd: (Double, Int, Int) -> Void
-    let onDelete: (Int) -> Void
-    let onChange: (Int, Int, Int) -> Void
-    let onMove: (Int, Double) -> Void
-    var onSnapToDownbeat: (Double) -> (Double, Double) = { s in (s, 0) }
-
-    @State private var addBeat: Double? = nil
-    @State private var addX: CGFloat = 0
-    @State private var addNum: Int = 4
-    @State private var addDen: Int = 4
-
-    @State private var changeIdx: Int? = nil
-    @State private var changeX: CGFloat = 0
-    @State private var changeNum: Int = 4
-    @State private var changeDen: Int = 4
-
-    @State private var dragIdx: Int? = nil
-    @State private var dragStartBeat: Double = 0
-    @State private var dragCurrentBeat: Double = 0
-
-    @State private var hoveredIdx: Int? = nil
-
-    private func secondsForBeat(_ beat: Double) -> Double {
-        guard !beatSchedule.isEmpty else { return beat }
-        var prev = beatSchedule[0]
-        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
-        return prev.timeSeconds
-    }
-
-    private func snapToDownbeat(_ seconds: Double) -> (Double, Double) {
-        let db = beatSchedule.filter { $0.isDownbeat }
-        guard !db.isEmpty else { return (seconds, 0) }
-        let nearest = db.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!
-        return (nearest.timeSeconds, nearest.absoluteBeat)
-    }
-
-    private func prevailingSig(atBeat beat: Double) -> (Int, Int) {
-        var num = 4, den = 4
-        for ev in events { if ev.beat <= beat + 0.001 { num = ev.numerator; den = ev.denominator } }
-        return (num, den)
-    }
-
-    private func prevailingSig(atSeconds secs: Double) -> (Int, Int) {
-        var num = 4, den = 4
-        for ev in events { if secondsForBeat(ev.beat) <= secs + 0.001 { num = ev.numerator; den = ev.denominator } }
-        return (num, den)
-    }
-
-    private func effectiveBeat(for idx: Int) -> Double {
-        dragIdx == idx ? dragCurrentBeat : events[idx].beat
-    }
-
-    var body: some View {
-        GeometryReader { geo in
-            content(width: geo.size.width, height: geo.size.height)
-        }
-    }
-
-    @ViewBuilder
-    private func content(width: CGFloat, height: CGFloat) -> some View {
-        ZStack(alignment: .topLeading) {
-            // Background — tap to add (blocked near existing flags)
-            Color.bgCard
-                .frame(width: width, height: height)
-                .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onEnded { val in
-                    let moved = max(abs(val.translation.width), abs(val.translation.height))
-                    guard moved < 5, totalDuration > 0, width > 0 else { return }
-                    let tapX = val.location.x
-                    for idx in events.indices {
-                        let ex = CGFloat(secondsForBeat(effectiveBeat(for: idx)) / totalDuration) * width
-                        if abs(tapX - ex) < 20 { return }
-                    }
-                    let rawSecs = Double(tapX / width) * totalDuration
-                    guard rawSecs > 0.001 else { return }
-                    let (n, d) = prevailingSig(atSeconds: rawSecs)
-                    addX = tapX; addBeat = rawSecs; addNum = n; addDen = d
-                })
-
-            if totalDuration > 0 && width > 0 {
-                ForEach(events.indices, id: \.self) { idx in
-                    let ev = events[idx]
-                    let effBeat = effectiveBeat(for: idx)
-                    let x = CGFloat(secondsForBeat(effBeat) / totalDuration) * width
-                    let isBeat0 = idx == 0
-                    let isHov = hoveredIdx == idx
-                    let isDragging = dragIdx == idx
-
-                    ZStack(alignment: .leading) {
-                        Color(white: 0.12).opacity(isDragging ? 1.0 : 0.85)
-                            .frame(height: height - 2)
-                            .cornerRadius(2)
-                        Rectangle()
-                            .fill(isDragging ? Color.accent : Color.accent.opacity(0.6))
-                            .frame(width: isDragging ? 2 : 1, height: height - 2)
-                        HStack(spacing: 2) {
-                            Text(ev.sig)
-                                .font(.lato(size: 8, weight: .bold))
-                                .foregroundColor(isDragging ? Color.accent : Color.accent.opacity(0.85))
-                                .padding(.leading, 3)
-                                .padding(.trailing, !isBeat0 && isHov && !isDragging ? 0 : 3)
-                            if !isBeat0 && isHov && !isDragging {
-                                Button { onDelete(idx) } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 6, weight: .bold))
-                                        .foregroundColor(Color.red)
-                                        .frame(width: 10, height: 10)
-                                }
-                                .buttonStyle(.plain)
-                                .padding(.trailing, 2)
-                                .transition(.opacity)
-                            }
-                        }
-                    }
-                    .frame(width: 40, height: height - 2)
-                    .offset(x: max(0, x + 1), y: 1)
-                    .onHover { h in
-                        withAnimation(.easeOut(duration: 0.08)) { hoveredIdx = h ? idx : nil }
-                        if h { (isBeat0 ? NSCursor.pointingHand : NSCursor.openHand).set() }
-                        else { NSCursor.arrow.set() }
-                    }
-                    .highPriorityGesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { value in
-                                let moved = max(abs(value.translation.width), abs(value.translation.height))
-                                guard moved >= 3, !isBeat0 else { return }
-                                if dragIdx == nil {
-                                    dragIdx = idx
-                                    dragStartBeat = events[idx].beat
-                                    dragCurrentBeat = events[idx].beat
-                                }
-                                guard dragIdx == idx else { return }
-                                let pps = width / CGFloat(totalDuration)
-                                let rawSecs = secondsForBeat(dragStartBeat) + Double(value.translation.width / pps)
-                                let (_, snappedBeat) = onSnapToDownbeat(max(0, min(totalDuration, rawSecs)))
-                                let prevBeat = events[idx - 1].beat + 0.5
-                                let nextBeat = idx < events.count - 1 ? events[idx + 1].beat - 0.5 : Double.infinity
-                                dragCurrentBeat = max(prevBeat, min(nextBeat, snappedBeat))
-                            }
-                            .onEnded { value in
-                                let moved = max(abs(value.translation.width), abs(value.translation.height))
-                                if moved < 3 {
-                                    // Tap — open change picker
-                                    let sx = CGFloat(secondsForBeat(events[idx].beat) / totalDuration) * width
-                                    changeX = sx; changeNum = ev.numerator; changeDen = ev.denominator; changeIdx = idx
-                                } else if dragIdx == idx {
-                                    onMove(idx, dragCurrentBeat)
-                                }
-                                dragIdx = nil
-                            }
-                    )
-                }
-
-                // Drag guide line
-                if let di = dragIdx {
-                    let secs = secondsForBeat(dragCurrentBeat)
-                    Rectangle()
-                        .fill(Color.accent.opacity(0.7))
-                        .frame(width: 1)
-                        .frame(maxHeight: .infinity)
-                        .offset(x: CGFloat(secs / totalDuration) * width, y: 0)
-                        .allowsHitTesting(false)
-                    // Beat tooltip above guide line
-                    let db = beatSchedule.filter { $0.isDownbeat }
-                    let bar = db.filter { $0.absoluteBeat <= dragCurrentBeat + 0.01 }.last?.bar ?? 1
-                    Text("bar \(bar)")
-                        .font(.lato(size: 8, weight: .bold))
-                        .foregroundColor(Color.fgBright)
-                        .padding(.horizontal, 3).padding(.vertical, 1)
-                        .background(Color.bgCard.opacity(0.92))
-                        .cornerRadius(3)
-                        .allowsHitTesting(false)
-                        .offset(x: max(0, CGFloat(secs / totalDuration) * width - 18), y: 1)
-                    let _ = di  // suppress unused warning
-                }
-
-                // Change picker anchor
-                Color.clear
-                    .frame(width: 1, height: height)
-                    .offset(x: max(0, changeX))
-                    .popover(isPresented: Binding(
-                        get: { changeIdx != nil },
-                        set: { if !$0 { changeIdx = nil } }
-                    ), arrowEdge: .bottom) {
-                        if let idx = changeIdx {
-                            TimeSigPickerPopover(
-                                numerator: $changeNum,
-                                denominator: $changeDen,
-                                title: "Change Time Signature",
-                                confirmLabel: "Save",
-                                onConfirm: { onChange(idx, changeNum, changeDen); changeIdx = nil },
-                                onCancel: { changeIdx = nil }
-                            )
-                        }
-                    }
-
-                // Add picker anchor
-                Color.clear
-                    .frame(width: 1, height: height)
-                    .offset(x: max(0, addX))
-                    .popover(isPresented: Binding(
-                        get: { addBeat != nil },
-                        set: { if !$0 { addBeat = nil } }
-                    ), arrowEdge: .bottom) {
-                        if let beat = addBeat {
-                            TimeSigPickerPopover(
-                                numerator: $addNum,
-                                denominator: $addDen,
-                                title: "Add Time Signature",
-                                confirmLabel: "Add",
-                                onConfirm: { onAdd(beat, addNum, addDen); addBeat = nil },
-                                onCancel: { addBeat = nil }
-                            )
-                        }
-                    }
-            }
-        }
-        .overlay(alignment: .bottom) {
-            Divider().foregroundColor(Color.border)
-        }
-        .cursor(.crosshair)
+        .frame(width: 280)
+        .background(Color.bgCard)
     }
 }
 

@@ -1,4 +1,4 @@
-# MT Song Tool — v1.5.0
+# MT Song Tool — v1.6.0
 
 ## Features
 
@@ -22,6 +22,13 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.6.0 — May 2026
+
+#### Edit Tab
+
+- **Time signature lane redesign** — The time signature lane now uses horizontal chips instead of flags. Each chip spans the full duration of its time sig region, making the layout immediately readable. Tap anywhere inside a chip to open the numerator/denominator picker; the picker shows the bar number where the change takes effect and snaps the insertion to the nearest downbeat using the live beat schedule. Hover a non-initial chip and click × to remove it. The beat-0 chip cannot be removed.
+- **Time sig edits now undoable** — Time signature overrides are tracked in a dedicated undo/redo stack that runs parallel to the stem state stack. ⌘Z and ⌘⇧Z fully restore both stem edits and time sig edits together.
 
 ### v1.5.0 — April 22, 2026
 

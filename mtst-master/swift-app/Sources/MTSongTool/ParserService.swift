@@ -295,7 +295,7 @@ class ParserService: ObservableObject {
     static func saveAlsEdits(
         alsPath: String,
         tempoEvents: [TempoEvent],
-        timeSigEvents: [TimeSigEvent],
+        timeSigEvents: [TimeSigOverride],
         locatorOverrides: [String: LocatorOverride],
         outputPath: String? = nil
     ) async throws -> String {

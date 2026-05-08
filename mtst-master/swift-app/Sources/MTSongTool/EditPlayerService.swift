@@ -86,7 +86,7 @@ struct LocatorOverride {
     var beat: Double?
 }
 
-struct TimeSigEvent: Equatable {
+struct TimeSigOverride: Equatable {
     var beat: Double
     var numerator: Int
     var denominator: Int
@@ -109,7 +109,7 @@ class EditPlayerService: ObservableObject {
     @Published var locatorOverrides: [String: LocatorOverride] = [:]
     @Published var isSessionDirty: Bool = false
     @Published var editableTempoEvents: [TempoEvent] = []
-    @Published var timeSigOverrides: [TimeSigEvent] = []
+    @Published var timeSigOverrides: [TimeSigOverride] = []
 
     func moveLocator(alsId: String, toBeat beat: Double) {
         var override = locatorOverrides[alsId] ?? LocatorOverride()
@@ -125,8 +125,34 @@ class EditPlayerService: ObservableObject {
         isSessionDirty = true
     }
 
+    /// Initializes time sig overrides from the parsed result. Does NOT set isSessionDirty.
+    func initTimeSigs(from timeSigs: [TimeSig]) {
+        timeSigOverrides = timeSigs.compactMap { ts in
+            let parts = ts.sig.split(separator: "/")
+            guard parts.count == 2,
+                  let num = Int(parts[0]), let den = Int(parts[1]) else { return nil }
+            return TimeSigOverride(beat: ts.beat ?? 0, numerator: num, denominator: den)
+        }.sorted { $0.beat < $1.beat }
+    }
+
+    func addOrUpdateTimeSig(beat: Double, numerator: Int, denominator: Int) {
+        saveUndoSnapshot()
+        timeSigOverrides.removeAll { abs($0.beat - beat) < 0.001 }
+        timeSigOverrides.append(TimeSigOverride(beat: beat, numerator: numerator, denominator: denominator))
+        timeSigOverrides.sort { $0.beat < $1.beat }
+        isSessionDirty = true
+    }
+
+    func removeTimeSig(beat: Double) {
+        guard beat > 0.001 else { return }
+        saveUndoSnapshot()
+        timeSigOverrides.removeAll { abs($0.beat - beat) < 0.001 }
+        isSessionDirty = true
+    }
+
     func clearSession() {
         locatorOverrides = [:]
+        timeSigOverrides = []
         isSessionDirty = false
     }
 
@@ -177,19 +203,19 @@ class EditPlayerService: ObservableObject {
 
     /// Seed time sig overrides from parse result — falls back to 4/4 at beat 0 if empty.
     func seedTimeSigEvents(_ timeSigs: [TimeSig]) {
-        let parsed: [TimeSigEvent] = timeSigs.compactMap { ts in
+        let parsed: [TimeSigOverride] = timeSigs.compactMap { ts in
             let parts = ts.sig.split(separator: "/")
             guard parts.count == 2,
                   let n = Int(parts[0]), let d = Int(parts[1]) else { return nil }
-            return TimeSigEvent(beat: ts.beat ?? 0, numerator: n, denominator: d)
+            return TimeSigOverride(beat: ts.beat ?? 0, numerator: n, denominator: d)
         }.sorted { $0.beat < $1.beat }
-        timeSigOverrides = parsed.isEmpty ? [TimeSigEvent(beat: 0, numerator: 4, denominator: 4)] : parsed
+        timeSigOverrides = parsed.isEmpty ? [TimeSigOverride(beat: 0, numerator: 4, denominator: 4)] : parsed
     }
 
     /// Add a new time sig event. No-op if within 0.5 beats of an existing event.
     func addTimeSig(atBeat beat: Double, numerator: Int, denominator: Int) {
         guard !timeSigOverrides.contains(where: { abs($0.beat - beat) < 0.5 }) else { return }
-        timeSigOverrides.append(TimeSigEvent(beat: beat, numerator: numerator, denominator: denominator))
+        timeSigOverrides.append(TimeSigOverride(beat: beat, numerator: numerator, denominator: denominator))
         timeSigOverrides.sort { $0.beat < $1.beat }
         isSessionDirty = true
     }
@@ -244,13 +270,18 @@ class EditPlayerService: ObservableObject {
     @Published var canRedo: Bool = false
     private var undoStack: [[URL: StemState]] = []
     private var redoStack: [[URL: StemState]] = []
+    private var timeSigUndoStack: [[TimeSigOverride]] = []
+    private var timeSigRedoStack: [[TimeSigOverride]] = []
     private let maxUndoSteps = 30
 
     /// Call before any mutating edit operation to save a restorable snapshot.
     func saveUndoSnapshot() {
         undoStack.append(stemStates)
+        timeSigUndoStack.append(timeSigOverrides)
         if undoStack.count > maxUndoSteps { undoStack.removeFirst() }
+        if timeSigUndoStack.count > maxUndoSteps { timeSigUndoStack.removeFirst() }
         redoStack = []
+        timeSigRedoStack = []
         canUndo = true
         canRedo = false
     }
@@ -260,6 +291,9 @@ class EditPlayerService: ObservableObject {
         if isPlaying { stop() }
         redoStack.append(stemStates)
         stemStates = snapshot
+        let tsSnapshot = timeSigUndoStack.popLast() ?? timeSigOverrides
+        timeSigRedoStack.append(timeSigOverrides)
+        timeSigOverrides = tsSnapshot
         canUndo = !undoStack.isEmpty
         canRedo = true
     }
@@ -269,6 +303,9 @@ class EditPlayerService: ObservableObject {
         if isPlaying { stop() }
         undoStack.append(stemStates)
         stemStates = snapshot
+        let tsSnapshot = timeSigRedoStack.popLast() ?? timeSigOverrides
+        timeSigUndoStack.append(timeSigOverrides)
+        timeSigOverrides = tsSnapshot
         canUndo = true
         canRedo = !redoStack.isEmpty
     }
