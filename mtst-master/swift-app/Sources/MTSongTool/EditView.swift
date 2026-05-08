@@ -252,22 +252,7 @@ struct EditView: View {
                 .animation(.easeOut(duration: 0.12), value: isFolderDropTargeted)
         )
         .onDrop(of: [UTType.fileURL, .folder], isTargeted: $isFolderDropTargeted) { providers in
-            guard let onFolderDrop, let provider = providers.first else { return false }
-            let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-                ? UTType.fileURL.identifier : "public.folder"
-            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
-                DispatchQueue.main.async {
-                    var url: URL?
-                    if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                    else if let u = item as? NSURL { url = u as URL }
-                    else if let u = item as? URL { url = u }
-                    guard let url else { return }
-                    var isDir: ObjCBool = false
-                    FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                    if isDir.boolValue { onFolderDrop(url) }
-                }
-            }
-            return true
+            handleFolderDropProviders(providers)
         }
         .onAppear {
             // Share edit engine with metronome for sample-accurate click sync
@@ -879,6 +864,28 @@ struct EditView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    // MARK: - Drop Handling
+
+    @discardableResult
+    private func handleFolderDropProviders(_ providers: [NSItemProvider]) -> Bool {
+        guard let onFolderDrop, let provider = providers.first else { return false }
+        let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            ? UTType.fileURL.identifier : "public.folder"
+        provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
+            DispatchQueue.main.async {
+                var url: URL?
+                if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                else if let u = item as? NSURL { url = u as URL }
+                else if let u = item as? URL { url = u }
+                guard let url else { return }
+                var isDir: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                if isDir.boolValue { onFolderDrop(url) }
+            }
+        }
+        return true
+    }
+
     // MARK: - Empty State
 
     private var emptyState: some View {
@@ -944,6 +951,12 @@ struct EditView: View {
             }
         }
         .animation(.easeOut(duration: 0.12), value: buildPanelExpanded)
+        // Native NSTextField/Picker controls intercept drags before the parent VStack's .onDrop
+        // handler fires. Register a duplicate drop target directly on this panel so folder drops
+        // over the form area are caught even when hovering over input fields.
+        .onDrop(of: [UTType.fileURL, .folder], isTargeted: $isFolderDropTargeted) { providers in
+            handleFolderDropProviders(providers)
+        }
     }
 
     private var buildSessionForm: some View {
