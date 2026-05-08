@@ -57,11 +57,15 @@ struct AlignmentService {
     // ±300ms search range
     private static let maxOffsetSeconds: Double = 0.3  // 13230 samples each side
 
-    // Peak/RMS confidence ratio — below this, return .unableToDetermine
-    private static let confidenceThreshold: Float = 4.0
+    // Peak/RMS confidence ratio — below this, try next window (or return .unableToDetermine)
+    private static let confidenceThreshold: Float = 2.5
 
     // Min RMS to consider signal has content
     private static let minRMS: Float = 1e-4
+
+    // Probe spacing and maximum — cover full song, not just first 2 min
+    private static let probeStep: Double = 5.0
+    private static let probeMaxSeconds: Double = 360.0  // up to 6 min
 
     static func check(
         url: URL,
@@ -98,8 +102,7 @@ struct AlignmentService {
         // Probe windows spaced 10s apart until both signals have content.
         // Skip first second (may be silence/count-off). Cap at 120s.
         let probeStart: Double = 1.0
-        let probeStep:  Double = 10.0
-        let probeMax:   Double = min(refFileDur, fileDur, 120.0)
+        let probeMax:   Double = min(refFileDur, fileDur, probeMaxSeconds)
 
         var windowStart = probeStart
         while windowStart + refWindowSeconds <= probeMax {
