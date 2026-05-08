@@ -405,12 +405,20 @@ struct EditView: View {
         } message: {
             Text(saveError ?? "Unknown error")
         }
-        .sheet(isPresented: $showExportValidation) {
-            ExportValidationSheet(
-                checks: pendingExportChecks,
-                onExport: { showExportValidation = false; openSavePanel() },
-                onDismiss: { showExportValidation = false }
-            )
+        .overlay {
+            if showExportValidation {
+                ZStack {
+                    Color.black.opacity(0.45)
+                        .ignoresSafeArea()
+                    ExportValidationSheet(
+                        checks: pendingExportChecks,
+                        onExport: { showExportValidation = false; openSavePanel() },
+                        onDismiss: { showExportValidation = false }
+                    )
+                    .cornerRadius(12)
+                    .shadow(color: .black.opacity(0.4), radius: 24, x: 0, y: 8)
+                }
+            }
         }
     }
 
