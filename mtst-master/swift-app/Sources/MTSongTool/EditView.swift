@@ -37,6 +37,7 @@ struct EditView: View {
     @State private var viewportWidth: CGFloat = 0
     @State private var canvasRightPadding: Double = 0   // extra seconds grown when user scrolls near right edge
     @State private var isFolderDropTargeted: Bool = false
+    @State private var spaceBarMonitor: Any?
 
     // Export state
     @State private var isExporting: Bool = false
@@ -255,6 +256,20 @@ struct EditView: View {
             handleFolderDropProviders(providers)
         }
         .onAppear {
+            // Intercept spacebar when an NSTextView (SwiftUI TextField) has focus so it
+            // plays/pauses instead of inserting a space into the focused field.
+            if spaceBarMonitor == nil {
+                let player = editPlayer
+                let metro = metronome
+                spaceBarMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard event.keyCode == 49,
+                          NSApp.keyWindow?.firstResponder is NSTextView else { return event }
+                    NSApp.keyWindow?.makeFirstResponder(nil)
+                    if player.isPlaying { player.pause(); metro.stop() } else { player.play() }
+                    return nil
+                }
+            }
+
             // Share edit engine with metronome for sample-accurate click sync
             metronome.attachToEngine(editPlayer.engine)
 
@@ -330,6 +345,9 @@ struct EditView: View {
         }
         .onChange(of: editPlayer.editableTempoEvents) { _ in
             rebuildBeatSchedule()
+        }
+        .onDisappear {
+            if let m = spaceBarMonitor { NSEvent.removeMonitor(m); spaceBarMonitor = nil }
         }
         .confirmationDialog(
             confirmRemoveStemURLs.count == 1
