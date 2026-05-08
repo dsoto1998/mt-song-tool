@@ -581,6 +581,11 @@ struct EditView: View {
 
             Divider().frame(height: 18)
 
+            // Alignment Check
+            alignmentCheckToolbarItem
+
+            Divider().frame(height: 18)
+
             // Master peak meter
             MasterPeakMeter(peakDB: editPlayer.masterPeakDB)
                 .frame(height: 10)
@@ -646,6 +651,51 @@ struct EditView: View {
                 .buttonStyle(.plain)
                 .disabled(!canExport)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var alignmentCheckToolbarItem: some View {
+        if editPlayer.isCheckingAlignment {
+            HStack(spacing: 4) {
+                ProgressView().scaleEffect(0.7).tint(Color.accent)
+                Text("Checking…")
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+            }
+        } else if let result = editPlayer.busAlignmentResult {
+            HStack(spacing: 6) {
+                if result.isInSync {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.green)
+                }
+                Text(result.isInSync ? "In sync" : result.displayText)
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(result.isInSync ? Color.green : (result.isActionable ? Color.red : Color.fgMid))
+                if result.isActionable {
+                    Button("Correct") { editPlayer.applyAllAlignmentCorrections() }
+                        .font(.lato(size: 11, weight: .semibold))
+                        .foregroundColor(Color.accent)
+                        .buttonStyle(.plain)
+                }
+                Button {
+                    editPlayer.runAlignmentCheck()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.fgMid)
+                }
+                .buttonStyle(.plain)
+                .help("Re-check alignment")
+            }
+        } else {
+            Button("Check Alignment") { editPlayer.runAlignmentCheck() }
+                .font(.lato(size: 11, weight: .regular))
+                .foregroundColor(editPlayer.hasAlignmentReference ? Color.fgBright : Color.fgMid)
+                .buttonStyle(.plain)
+                .disabled(!editPlayer.hasAlignmentReference)
+                .help("Cross-correlate stem bus against ORIGINAL SONG to detect timing offset")
         }
     }
 

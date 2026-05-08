@@ -102,6 +102,8 @@ class EditPlayerService: ObservableObject {
     @Published var meterLevels: [URL: Float] = [:]   // per-stem peak dBFS — updated at ~43 Hz, separate from stemStates
     @Published var totalDuration: Double = 0
     @Published var isNormalizing: Bool = false
+    @Published var isCheckingAlignment: Bool = false
+    @Published var busAlignmentResult: AlignmentResult? = nil
     /// Published whenever playback (re)starts — EditView observes this to re-anchor the metronome.
     @Published var playAnchor: PlayAnchor? = nil
 
@@ -1067,6 +1069,64 @@ class EditPlayerService: ObservableObject {
                 self.isNormalizing = false
             }
         }
+    }
+
+    // MARK: - Alignment Check
+
+    var hasAlignmentReference: Bool {
+        let hasOG = stemURLs.contains {
+            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
+            && stemStates[$0]?.isExcluded != true
+        }
+        return hasOG && !collectiveURLs.isEmpty
+    }
+
+    /// Cross-correlates the summed collective stem bus against ORIGINAL SONG.
+    /// Single global result — all collective stems share the same offset.
+    func runAlignmentCheck() {
+        guard !isCheckingAlignment, hasAlignmentReference else { return }
+
+        let collective = collectiveURLs
+        guard let refURL = stemURLs.first(where: {
+            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
+            && stemStates[$0]?.isExcluded != true
+        }) else { return }
+
+        let snapshot = stemStates
+        let refState = snapshot[refURL] ?? StemState()
+        let collectiveStates = Dictionary(uniqueKeysWithValues: collective.compactMap { url -> (URL, StemState)? in
+            guard let s = snapshot[url] else { return nil }
+            return (url, s)
+        })
+
+        isCheckingAlignment = true
+        busAlignmentResult = nil
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let result = await AlignmentService.checkBus(
+                stemURLs: collective,
+                stemStates: collectiveStates,
+                referenceURL: refURL,
+                referenceState: refState
+            )
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.busAlignmentResult = result
+                self.isCheckingAlignment = false
+            }
+        }
+    }
+
+    /// Shifts all collective stems by the inverse of the detected bus offset.
+    func applyAllAlignmentCorrections() {
+        guard case .aligned(_, let samples) = busAlignmentResult else { return }
+        let delta = -Double(samples) / AlignmentService.sampleRate
+        saveUndoSnapshot()
+        for url in collectiveURLs {
+            shiftAllSegments(url, delta: delta)
+        }
+        busAlignmentResult = nil
     }
 
     // MARK: - Helpers
