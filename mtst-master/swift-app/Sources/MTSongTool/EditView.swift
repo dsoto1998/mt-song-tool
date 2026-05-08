@@ -286,11 +286,17 @@ struct EditView: View {
             }
             // Build metronome beat schedule from parsed session
             rebuildBeatSchedule()
+            if parsedResult != nil {
+                populateBuildSession()
+                buildPanelExpanded = true
+            }
         }
         .onChange(of: parsedResult?.file) { _ in
             if let result = parsedResult {
                 editPlayer.initTimeSigs(from: result.timeSignatures)
                 rebuildBeatSchedule()
+                populateBuildSession()
+                buildPanelExpanded = true
             }
         }
         .onChange(of: editPlayer.timeSigOverrides) { _ in
@@ -937,25 +943,10 @@ struct EditView: View {
                 Image(systemName: buildPanelExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(Color.fgMid)
-                Text("Build Session")
+                Text(parsedResult != nil ? "Session Details" : "Build Session")
                     .font(.lato(size: 12, weight: .semibold))
                     .foregroundColor(Color.fgBright)
                 Spacer()
-                if parsedResult != nil && !buildPanelExpanded {
-                    Button("Populate") {
-                        populateBuildSession()
-                        buildPanelExpanded = true
-                    }
-                    .font(.lato(size: 11))
-                    .foregroundColor(Color.accent)
-                    .buttonStyle(.plain)
-                }
-                if buildPanelExpanded && parsedResult != nil {
-                    Button("Populate") { populateBuildSession() }
-                        .font(.lato(size: 11))
-                        .foregroundColor(Color.accent)
-                        .buttonStyle(.plain)
-                }
             }
             .contentShape(Rectangle())
             .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { buildPanelExpanded.toggle() } }
