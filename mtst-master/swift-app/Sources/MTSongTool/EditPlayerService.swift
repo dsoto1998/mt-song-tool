@@ -724,10 +724,13 @@ class EditPlayerService: ObservableObject {
     }
 
     /// Shifts all segments of the given stem by `delta` seconds.
-    func shiftAllSegments(_ url: URL, delta: Double) {
+    /// `clampToZero`: when true (default), segments cannot go before session time 0.
+    /// Pass false for alignment corrections where pre-roll before beat 1 is intentional.
+    func shiftAllSegments(_ url: URL, delta: Double, clampToZero: Bool = true) {
         guard var state = stemStates[url] else { return }
         for i in state.segments.indices {
-            state.segments[i].sessionStart = max(0, state.segments[i].sessionStart + delta)
+            let newStart = state.segments[i].sessionStart + delta
+            state.segments[i].sessionStart = clampToZero ? max(0, newStart) : newStart
         }
         stemStates[url] = state
         // Grow totalDuration if this stem now ends past it — canvas extends automatically.
@@ -1118,13 +1121,15 @@ class EditPlayerService: ObservableObject {
         }
     }
 
-    /// Shifts all collective stems by the inverse of the detected bus offset.
+    /// Corrects the detected bus offset. ORIGINAL SONG stays anchored.
+    /// Stems late (positive lag): shift collective stems earlier — may go negative (pre-roll before beat 1).
+    /// Stems early (negative lag): shift collective stems later.
     func applyAllAlignmentCorrections() {
-        guard case .aligned(_, let samples) = busAlignmentResult else { return }
+        guard case .aligned(_, let samples) = busAlignmentResult, samples != 0 else { return }
         let delta = -Double(samples) / AlignmentService.sampleRate
         saveUndoSnapshot()
         for url in collectiveURLs {
-            shiftAllSegments(url, delta: delta)
+            shiftAllSegments(url, delta: delta, clampToZero: false)
         }
         busAlignmentResult = nil
     }
