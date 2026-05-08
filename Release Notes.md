@@ -1,4 +1,4 @@
-# MT Song Tool — v1.6.1
+# MT Song Tool — v1.6.2
 
 ## Features
 
@@ -22,6 +22,15 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.6.2 — May 2026
+
+#### Live 12 → 11 downgrade
+
+- **Stem-track sessions now downgrade cleanly** — Live 12 sessions with unwarped stem clips (e.g. SHADRACH-style 14-track stem packages) previously caused Live 11 to crash silently on load after the downgrade. Two distinct crashes are now fixed in the parser:
+  - **Pointee-namespace ID collision** — Live 12 assigns small Pointee IDs (1–27) to MasterTrack/PreHearTrack mixer targets, which collide in Live 11's global Pointee namespace with AudioTrack IDs (numbered from 8). Downgrade now renumbers MasterTrack and PreHearTrack AutomationTarget/ModulationTarget IDs to a fresh high range, updates `<PointeeId>` references, and bumps `<NextPointeeId>` so Live 11's allocator stays consistent.
+  - **Null warp marker array on FreezeSequencer ClipSlots** — Live 12 populates the MasterTrack/PreHearTrack `<FreezeSequencer><ClipSlotList>` with one empty `<ClipSlot>` per AudioTrack. Live 11 iterates these slots on load and dereferences a WarpMarker array that is never allocated, hitting a null-pointer atomic refcount. Downgrade now clears that ClipSlotList during conversion.
+- Verified end-to-end: full 14-track SHAD stem session now opens in Live 11.3.43 after downgrade.
 
 ### v1.6.1 — May 2026
 
