@@ -85,80 +85,92 @@ struct AlignmentService {
         url: URL, state: StemState,
         refURL: URL, refState: StemState
     ) -> AlignmentResult {
-        let sr = sampleRate
-        let refLen    = Int(refWindowSeconds * sr)     // 88200
-        let maxOff    = Int(maxOffsetSeconds * sr)     // 13230
-        let stemStart = max(0.0, refStartSeconds - maxOffsetSeconds)  // 0.7s
-        let stemLen   = refLen + 2 * maxOff            // 114660
+        guard let refFile  = try? AVAudioFile(forReading: refURL),
+              let stemFile = try? AVAudioFile(forReading: url) else { return .unableToDetermine }
 
-        guard let refBuf  = renderMono(url: refURL, state: refState,
-                                        fromSeconds: refStartSeconds, length: refLen),
-              let stemBuf = renderMono(url: url,    state: state,
-                                        fromSeconds: stemStart, length: stemLen)
-        else { return .unableToDetermine }
+        let sr         = sampleRate
+        let refLen     = Int(refWindowSeconds * sr)    // 88200
+        let maxOff     = Int(maxOffsetSeconds * sr)    // 13230
+        let stemLen    = refLen + 2 * maxOff           // 114660
+        let fileDur    = Double(stemFile.length) / sr
+        let refFileDur = Double(refFile.length)  / sr
 
-        // Abort on silent signals
-        var refRms: Float = 0
-        vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(refLen))
-        guard refRms > minRMS else { return .unableToDetermine }
+        // Probe windows spaced 10s apart until both signals have content.
+        // Skip first second (may be silence/count-off). Cap at 120s.
+        let probeStart: Double = 1.0
+        let probeStep:  Double = 10.0
+        let probeMax:   Double = min(refFileDur, fileDur, 120.0)
 
-        var stemRms: Float = 0
-        vDSP_rmsqv(stemBuf, 1, &stemRms, vDSP_Length(stemLen))
-        guard stemRms > minRMS else { return .unableToDetermine }
+        var windowStart = probeStart
+        while windowStart + refWindowSeconds <= probeMax {
+            let stemWindowStart = max(0, windowStart - maxOffsetSeconds)
 
-        // Cross-correlation via vDSP_conv.
-        // With B pointer at last element and stride -1:
-        //   C[n] = sum_{p=0}^{P-1} A[n+p] * refBuf[p]
-        // This is true cross-correlation (not convolution).
-        let outputLen = stemLen - refLen + 1   // 2*maxOff + 1 = 26461
-        var correlation = [Float](repeating: 0, count: outputLen)
+            guard let refBuf  = renderMono(url: refURL,  state: refState,
+                                            fromSeconds: windowStart,      length: refLen,  file: refFile),
+                  let stemBuf = renderMono(url: url,     state: state,
+                                            fromSeconds: stemWindowStart,  length: stemLen, file: stemFile)
+            else { windowStart += probeStep; continue }
 
-        stemBuf.withUnsafeBufferPointer { stemPtr in
-            refBuf.withUnsafeBufferPointer { refPtr in
-                vDSP_conv(
-                    stemPtr.baseAddress!, 1,
-                    refPtr.baseAddress!.advanced(by: refLen - 1), -1,
-                    &correlation, 1,
-                    vDSP_Length(outputLen), vDSP_Length(refLen)
-                )
+            var refRms: Float = 0
+            vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(refLen))
+            var stemRms: Float = 0
+            vDSP_rmsqv(stemBuf, 1, &stemRms, vDSP_Length(stemLen))
+
+            guard refRms > minRMS, stemRms > minRMS else {
+                windowStart += probeStep; continue
             }
+
+            // Cross-correlation via vDSP_conv.
+            // With B pointer at last element and stride -1:
+            //   C[n] = sum_{p=0}^{P-1} A[n+p] * refBuf[p]  ← true cross-correlation.
+            let outputLen = stemLen - refLen + 1   // 2*maxOff + 1
+            var correlation = [Float](repeating: 0, count: outputLen)
+
+            stemBuf.withUnsafeBufferPointer { stemPtr in
+                refBuf.withUnsafeBufferPointer { refPtr in
+                    vDSP_conv(
+                        stemPtr.baseAddress!, 1,
+                        refPtr.baseAddress!.advanced(by: refLen - 1), -1,
+                        &correlation, 1,
+                        vDSP_Length(outputLen), vDSP_Length(refLen)
+                    )
+                }
+            }
+
+            var peakVal: Float = 0
+            var peakIdx: vDSP_Length = 0
+            vDSP_maxvi(correlation, 1, &peakVal, &peakIdx, vDSP_Length(outputLen))
+
+            var corrRms: Float = 0
+            vDSP_rmsqv(correlation, 1, &corrRms, vDSP_Length(outputLen))
+
+            guard corrRms > 0, peakVal / corrRms >= confidenceThreshold else {
+                windowStart += probeStep; continue
+            }
+
+            // Lag: peakIdx=0 → stem maxOff early; peakIdx=maxOff → aligned; peakIdx=2*maxOff → stem maxOff late
+            let lagSamples = Int(peakIdx) - maxOff
+            let lagMs = Double(lagSamples) / sr * 1000.0
+            return .aligned(offsetMs: lagMs, samples: lagSamples)
         }
 
-        // Find correlation peak
-        var peakVal: Float = 0
-        var peakIdx: vDSP_Length = 0
-        vDSP_maxvi(correlation, 1, &peakVal, &peakIdx, vDSP_Length(outputLen))
-
-        // Confidence: peak must stand out from RMS of correlation
-        var corrRms: Float = 0
-        vDSP_rmsqv(correlation, 1, &corrRms, vDSP_Length(outputLen))
-        guard corrRms > 0, peakVal / corrRms >= confidenceThreshold else {
-            return .unableToDetermine
-        }
-
-        // Lag interpretation:
-        //   peakIdx = 0       → stem is maxOff early (stem content starts maxOff before refStart)
-        //   peakIdx = maxOff  → aligned
-        //   peakIdx = 2*maxOff → stem is maxOff late
-        let lagSamples = Int(peakIdx) - maxOff
-        let lagMs = Double(lagSamples) / sr * 1000.0
-
-        return .aligned(offsetMs: lagMs, samples: lagSamples)
+        return .unableToDetermine
     }
 
     // MARK: - Mono rendering
 
     /// Renders `length` samples of mono audio starting at `fromSeconds` in session time,
     /// applying the AudioSegment model (cuts, moves). Gaps between segments stay zero.
+    /// Accepts an already-open `file` to avoid reopening on every probe window.
     private static func renderMono(
         url: URL,
         state: StemState,
         fromSeconds: Double,
-        length: Int
+        length: Int,
+        file: AVAudioFile
     ) -> [Float]? {
-        guard let file = try? AVAudioFile(forReading: url) else { return nil }
-        let fileSR = file.processingFormat.sampleRate
-        let nChannels = Int(file.processingFormat.channelCount)
+        let fileSR          = file.processingFormat.sampleRate
+        let nChannels       = Int(file.processingFormat.channelCount)
         let totalFileFrames = Int(file.length)
         guard totalFileFrames > 0, length > 0 else { return nil }
 
