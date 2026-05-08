@@ -1016,51 +1016,7 @@ struct EditView: View {
                 }
             }
 
-            // Row 2: Locators
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Locators")
-                        .font(.lato(size: 10, weight: .semibold))
-                        .foregroundColor(Color.fgMid)
-                    Spacer()
-                    Button {
-                        buildStore.locators.append(
-                            ALSGeneratorService.BuildLocator(beat: buildStore.loopEndBeat, name: "")
-                        )
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(Color.accent)
-                    }
-                    .buttonStyle(.plain)
-                }
-                ForEach(buildStore.locators.indices, id: \.self) { idx in
-                    HStack(spacing: 6) {
-                        TextField("Beat", value: $buildStore.locators[idx].beat, formatter: buildBeatFormatter)
-                            .font(.lato(size: 11))
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 70)
-                        TextField("Section Name", text: $buildStore.locators[idx].name)
-                            .font(.lato(size: 11))
-                            .textFieldStyle(.roundedBorder)
-                        Button {
-                            buildStore.locators.remove(at: idx)
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9))
-                                .foregroundColor(Color.fgMid)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                if buildStore.locators.isEmpty {
-                    Text("No locators — tap + to add, or use Populate")
-                        .font(.lato(size: 11))
-                        .foregroundColor(Color.fgDim)
-                }
-            }
-
-            // Row 3: Output folder + Build button
+            // Row 2: Output folder + Build button
             HStack(spacing: 10) {
                 Button {
                     let panel = NSOpenPanel()
@@ -1118,10 +1074,7 @@ struct EditView: View {
 
     private var buildCanBuild: Bool {
         guard let bpmVal = Double(buildStore.bpm), bpmVal > 0 else { return false }
-        return buildStore.outputFolder != nil
-            && !buildStore.locators.isEmpty
-            && buildStore.loopEndBeat > 0
-            && !buildStore.locators.contains(where: { $0.name.trimmingCharacters(in: .whitespaces).isEmpty })
+        return buildStore.outputFolder != nil && buildStore.loopEndBeat > 0
     }
 
     private func populateBuildSession() {
@@ -1135,14 +1088,6 @@ struct EditView: View {
         if let b = result.bpm { buildStore.bpm = String(Int(b.rounded())) }
         // Time sig from first time sig
         if let ts = result.timeSignatures.first { buildStore.timeSig = ts.sig }
-        // Locators → beats
-        buildStore.locators = result.markers.compactMap { m in
-            let beat: Double
-            if let b = m.beat { beat = b }
-            else if let secs = markerTimeToSeconds(m.time) { beat = secsToBeat(secs) }
-            else { return nil }
-            return ALSGeneratorService.BuildLocator(beat: beat, name: m.text)
-        }
         // Loop end from loopBracket
         if let lb = loopBracket { buildStore.loopEndBeat = lb.endBeat }
         else if let ns = result.markers.first(where: { $0.text.uppercased() == "NEXT SONG" }),
