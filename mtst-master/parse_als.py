@@ -846,6 +846,72 @@ def _downgrade_to_live11(path):
     )
     content = content.replace('\t\t\t</Locators>', '\t\t\t</Locators>' + _locator_mappings, 1)
 
+    # 27. Renumber low-range AutomationTarget/ModulationTarget IDs in MasterTrack
+    #     AND PreHearTrack to the high range, and bump NextPointeeId.
+    # Live 12 assigns small Pointee IDs (1–27) to MasterTrack/PreHearTrack mixer params.
+    # These collide in Live 11's global pointee namespace with AudioTrack track-IDs
+    # (which start at 8 and increase by 1 per track), causing a silent crash deep in
+    # deserialization (KERN_INVALID_ADDRESS, frames 2346044/2342340/...).
+    # BB11 native Live 11 sessions don't have this problem because their MasterTrack
+    # AutomationTargets start at high IDs (5538+).
+    _target_tags = (
+        'AutomationTarget',
+        'ModulationTarget',
+        'VolumeModulationTarget',
+        'TranspositionModulationTarget',
+        'GrainSizeModulationTarget',
+        'FluxModulationTarget',
+        'SampleOffsetModulationTarget',
+    )
+    all_ids = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
+    max_id = max(all_ids) if all_ids else 0
+    next_id = max_id + 100  # leave a gap for safety
+
+    remap = {}
+    target_re = re.compile(r'<(' + '|'.join(_target_tags) + r')\s+Id="(\d+)"')
+
+    def _renumber_in_block(block_xml):
+        """Renumber low-IDs in an XML block; updates `remap` and `next_id`."""
+        nonlocal next_id
+        def _sub(m):
+            nonlocal next_id
+            tag = m.group(1)
+            old = int(m.group(2))
+            if old < 30000 and old not in remap:
+                remap[old] = next_id
+                next_id += 1
+            new = remap.get(old, old)
+            return f'<{tag} Id="{new}"'
+        return target_re.sub(_sub, block_xml)
+
+    # Apply to MasterTrack block.
+    mt_match = re.search(r'<MasterTrack\b.*?</MasterTrack>', content, flags=re.DOTALL)
+    if mt_match:
+        new_mt = _renumber_in_block(mt_match.group(0))
+        content = content[:mt_match.start()] + new_mt + content[mt_match.end():]
+
+    # Apply to PreHearTrack block (re-search since indices shifted).
+    pht_match = re.search(r'<PreHearTrack\b.*?</PreHearTrack>', content, flags=re.DOTALL)
+    if pht_match:
+        new_pht = _renumber_in_block(pht_match.group(0))
+        content = content[:pht_match.start()] + new_pht + content[pht_match.end():]
+
+    # Update <PointeeId Value="N"/> references across the whole document.
+    def _update_pointee(m):
+        old = int(m.group(1))
+        if old in remap:
+            return f'<PointeeId Value="{remap[old]}"/>'
+        return m.group(0)
+    content = re.sub(r'<PointeeId\s+Value="(\d+)"\s*/>', _update_pointee, content)
+
+    # Bump <NextPointeeId> to be safely above the new max.
+    content = re.sub(
+        r'(<NextPointeeId\s+Value=")\d+(")',
+        f'\\g<1>{next_id + 100}\\g<2>',
+        content,
+        count=1,
+    )
+
     # Write output
     dir_name  = os.path.dirname(path)
     base_name = os.path.basename(path)
