@@ -1,4 +1,4 @@
-# MT Song Tool — v1.6.0
+# MT Song Tool — v1.6.1
 
 ## Features
 
@@ -22,6 +22,15 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.6.1 — May 2026
+
+#### Edit Tab
+
+- **Build Session — stem folder drop fixed** — Dragging a stems folder onto the Edit tab now works correctly when the Build Session panel is visible. Native macOS text fields and pickers were intercepting the drag before the parent drop handler could fire; a duplicate drop target is now registered directly on the panel to catch drops over the form area.
+- **Spacebar plays/pauses with text field focus** — Pressing Space while the BPM or other text fields retain keyboard focus now correctly plays or pauses instead of inserting a space. A local key monitor intercepts spacebar when an NSTextView has first responder, resigns it, and fires the transport action.
+- **Build Session panel renamed to "Session Details" when .als is loaded** — The panel at the bottom of the Edit tab now shows "Session Details" when a parsed session is loaded, and "Build Session" in stem-only mode. Fields auto-populate from the loaded session and the panel auto-expands on load.
+- **Locators removed from Build Session panel** — Locator management moved to the locator lane in the Edit tab timeline; the locator list and add/remove controls are no longer in the panel.
 
 ### v1.6.0 — May 2026
 
