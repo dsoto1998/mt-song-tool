@@ -103,7 +103,7 @@ class EditPlayerService: ObservableObject {
     @Published var totalDuration: Double = 0
     @Published var isNormalizing: Bool = false
     @Published var isCheckingAlignment: Bool = false
-    @Published var alignmentResults: [URL: AlignmentResult] = [:]
+    @Published var busAlignmentResult: AlignmentResult? = nil
     /// Published whenever playback (re)starts — EditView observes this to re-anchor the metronome.
     @Published var playAnchor: PlayAnchor? = nil
 
@@ -1071,81 +1071,62 @@ class EditPlayerService: ObservableObject {
         }
     }
 
-    // MARK: - Alignment
+    // MARK: - Alignment Check
 
+    var hasAlignmentReference: Bool {
+        let hasOG = stemURLs.contains {
+            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
+            && stemStates[$0]?.isExcluded != true
+        }
+        return hasOG && !collectiveURLs.isEmpty
+    }
+
+    /// Cross-correlates the summed collective stem bus against ORIGINAL SONG.
+    /// Single global result — all collective stems share the same offset.
     func runAlignmentCheck() {
-        guard !isCheckingAlignment else { return }
+        guard !isCheckingAlignment, hasAlignmentReference else { return }
+
+        let collective = collectiveURLs
         guard let refURL = stemURLs.first(where: {
             $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
-        }),
-        let refState = stemStates[refURL] else { return }
+            && stemStates[$0]?.isExcluded != true
+        }) else { return }
 
-        // Skip synthesized tracks — click/guide don't share audio content with ORIGINAL SONG
-        // so cross-correlation produces false offsets against beat transients.
-        let skipNames: Set<String> = ["CLICK TRACK", "GUIDE"]
-        let stemsToCheck: [(URL, StemState)] = stemURLs.compactMap { url in
-            let name = url.deletingPathExtension().lastPathComponent.uppercased()
-            guard url != refURL,
-                  !skipNames.contains(name),
-                  stemStates[url]?.isExcluded != true,
-                  let state = stemStates[url] else { return nil }
-            return (url, state)
-        }
-        guard !stemsToCheck.isEmpty else { return }
+        let snapshot = stemStates
+        let refState = snapshot[refURL] ?? StemState()
+        let collectiveStates = Dictionary(uniqueKeysWithValues: collective.compactMap { url -> (URL, StemState)? in
+            guard let s = snapshot[url] else { return nil }
+            return (url, s)
+        })
 
-        let capturedRefState = refState
         isCheckingAlignment = true
-        alignmentResults = [:]
+        busAlignmentResult = nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-
-            let results = await withTaskGroup(
-                of: (URL, AlignmentResult).self
-            ) { group -> [URL: AlignmentResult] in
-                for (url, state) in stemsToCheck {
-                    group.addTask {
-                        let r = await AlignmentService.check(
-                            url: url, state: state,
-                            referenceURL: refURL, referenceState: capturedRefState
-                        )
-                        return (url, r)
-                    }
-                }
-                var dict: [URL: AlignmentResult] = [:]
-                for await (url, result) in group {
-                    dict[url] = result
-                }
-                return dict
-            }
-
+            let result = await AlignmentService.checkBus(
+                stemURLs: collective,
+                stemStates: collectiveStates,
+                referenceURL: refURL,
+                referenceState: refState
+            )
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.alignmentResults = results
+                self.busAlignmentResult = result
                 self.isCheckingAlignment = false
             }
         }
     }
 
-    func applyAlignmentCorrection(url: URL) {
-        guard let result = alignmentResults[url],
-              case .aligned(_, let samples) = result,
-              samples != 0 else { return }
-        saveUndoSnapshot()
-        shiftAllSegments(url, delta: -Double(samples) / 44100.0)
-        isSessionDirty = true
-    }
-
+    /// Shifts all collective stems by the inverse of the detected bus offset.
     func applyAllAlignmentCorrections() {
-        let actionable = alignmentResults.filter { $0.value.isActionable }
-        guard !actionable.isEmpty else { return }
+        guard case .aligned(_, let samples) = busAlignmentResult else { return }
+        let delta = -Double(samples) / AlignmentService.sampleRate
         saveUndoSnapshot()
-        for (url, result) in actionable {
-            if case .aligned(_, let samples) = result, samples != 0 {
-                shiftAllSegments(url, delta: -Double(samples) / 44100.0)
-            }
+        for url in collectiveURLs {
+            shiftAllSegments(url, delta: delta)
         }
-        isSessionDirty = true
+        busAlignmentResult = nil
     }
 
     // MARK: - Helpers

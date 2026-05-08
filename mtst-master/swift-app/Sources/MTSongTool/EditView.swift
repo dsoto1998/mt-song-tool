@@ -174,16 +174,6 @@ struct EditView: View {
         editPlayer.totalDuration > 0 ? editPlayer.currentTime / editPlayer.totalDuration : 0
     }
 
-    private var hasAlignmentReference: Bool {
-        sortedStemURLs.contains {
-            $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
-        }
-    }
-
-    private var actionableAlignmentCount: Int {
-        editPlayer.alignmentResults.values.filter { $0.isActionable }.count
-    }
-
     /// Duration of one bar at end of session — used to compute canvas padding.
     private var lastBarSeconds: Double {
         let db = metronome.beatSchedule.filter { $0.isDownbeat }
@@ -333,15 +323,6 @@ struct EditView: View {
         // When stems change while the Edit tab is already visible (e.g. user clears a file and
         // re-scans stems without leaving the tab), onAppear doesn't fire again, so loadStems
         // would never be called. This onChange handles that case.
-        .onChange(of: editPlayer.alignmentResults) { results in
-            guard !results.isEmpty else { return }
-            // Expand rows so the alignment badge row is visible.
-            for url in sortedStemURLs {
-                if (rowHeights[url] ?? defaultRowHeight) < 82 {
-                    rowHeights[url] = 82
-                }
-            }
-        }
         .onChange(of: editPlayer.totalDuration) { dur in
             guard dur > 0 else { return }
             // Rebuild so grid covers any new space created by dragging a stem right.
@@ -424,20 +405,12 @@ struct EditView: View {
         } message: {
             Text(saveError ?? "Unknown error")
         }
-        .overlay {
-            if showExportValidation {
-                ZStack {
-                    Color.black.opacity(0.45)
-                        .ignoresSafeArea()
-                    ExportValidationSheet(
-                        checks: pendingExportChecks,
-                        onExport: { showExportValidation = false; openSavePanel() },
-                        onDismiss: { showExportValidation = false }
-                    )
-                    .cornerRadius(12)
-                    .shadow(color: .black.opacity(0.4), radius: 24, x: 0, y: 8)
-                }
-            }
+        .sheet(isPresented: $showExportValidation) {
+            ExportValidationSheet(
+                checks: pendingExportChecks,
+                onExport: { showExportValidation = false; openSavePanel() },
+                onDismiss: { showExportValidation = false }
+            )
         }
     }
 
@@ -608,35 +581,8 @@ struct EditView: View {
 
             Divider().frame(height: 18)
 
-            // Check Alignment
-            if editPlayer.isCheckingAlignment {
-                HStack(spacing: 4) {
-                    ProgressView().scaleEffect(0.7).tint(Color.accent)
-                    Text("Checking…")
-                        .font(.lato(size: 11, weight: .regular))
-                        .foregroundColor(Color.fgMid)
-                }
-            } else {
-                HStack(spacing: 6) {
-                    Button("Check Alignment") {
-                        editPlayer.runAlignmentCheck()
-                    }
-                    .font(.lato(size: 11, weight: .regular))
-                    .foregroundColor(hasAlignmentReference ? Color.fgBright : Color.fgMid)
-                    .buttonStyle(.plain)
-                    .disabled(!hasAlignmentReference)
-                    .help("Compare each stem against ORIGINAL SONG and report timing offset")
-
-                    if actionableAlignmentCount > 0 {
-                        Button("Correct All (\(actionableAlignmentCount))") {
-                            editPlayer.applyAllAlignmentCorrections()
-                        }
-                        .font(.lato(size: 11, weight: .regular))
-                        .foregroundColor(Color.accent)
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
+            // Alignment Check
+            alignmentCheckToolbarItem
 
             Divider().frame(height: 18)
 
@@ -705,6 +651,51 @@ struct EditView: View {
                 .buttonStyle(.plain)
                 .disabled(!canExport)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var alignmentCheckToolbarItem: some View {
+        if editPlayer.isCheckingAlignment {
+            HStack(spacing: 4) {
+                ProgressView().scaleEffect(0.7).tint(Color.accent)
+                Text("Checking…")
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+            }
+        } else if let result = editPlayer.busAlignmentResult {
+            HStack(spacing: 6) {
+                if result.isInSync {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.green)
+                }
+                Text(result.isInSync ? "In sync" : result.displayText)
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(result.isInSync ? Color.green : (result.isActionable ? Color.red : Color.fgMid))
+                if result.isActionable {
+                    Button("Correct") { editPlayer.applyAllAlignmentCorrections() }
+                        .font(.lato(size: 11, weight: .semibold))
+                        .foregroundColor(Color.accent)
+                        .buttonStyle(.plain)
+                }
+                Button {
+                    editPlayer.runAlignmentCheck()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.fgMid)
+                }
+                .buttonStyle(.plain)
+                .help("Re-check alignment")
+            }
+        } else {
+            Button("Check Alignment") { editPlayer.runAlignmentCheck() }
+                .font(.lato(size: 11, weight: .regular))
+                .foregroundColor(editPlayer.hasAlignmentReference ? Color.fgBright : Color.fgMid)
+                .buttonStyle(.plain)
+                .disabled(!editPlayer.hasAlignmentReference)
+                .help("Cross-correlate stem bus against ORIGINAL SONG to detect timing offset")
         }
     }
 
@@ -796,9 +787,7 @@ struct EditView: View {
                             onRename: { newName in
                                 analyzer.renameStem(oldFilename: url.lastPathComponent, newStemName: newName)
                             },
-                            onRemoveStem: { triggerRemoveStem(url) },
-                            alignmentResult: editPlayer.alignmentResults[url],
-                            onCorrectAlignment: { editPlayer.applyAlignmentCorrection(url: url) }
+                            onRemoveStem: { triggerRemoveStem(url) }
                         )
 
                         Divider().foregroundColor(Color.border)
@@ -1372,8 +1361,6 @@ struct EditTrackSidebar: View {
     var analyzerResult: AudioFileResult? = nil
     var onRename: ((String) -> Void)? = nil
     var onRemoveStem: (() -> Void)? = nil
-    var alignmentResult: AlignmentResult? = nil
-    var onCorrectAlignment: (() -> Void)? = nil
 
     @State private var resizeStartHeight: CGFloat? = nil
     @State private var isEditingGain = false
@@ -1536,38 +1523,6 @@ struct EditTrackSidebar: View {
                                 gainEditText = String(format: "%.1f", db)
                                 isEditingGain = true
                             }
-                    }
-                }
-            }
-
-            // Alignment result badge
-            if let result = alignmentResult, case .skipped = result {} else if let result = alignmentResult {
-                HStack(spacing: 4) {
-                    switch result {
-                    case .aligned(let ms, _):
-                        let isSync = abs(ms) < 2.0
-                        Image(systemName: isSync ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(isSync ? Color.green : (ms >= 0 ? Color.red : Color.accent2))
-                        Text(result.displayText)
-                            .font(.lato(size: 9))
-                            .foregroundColor(isSync ? Color.fgMid : Color.fgBright)
-                            .monospacedDigit()
-                        if !isSync, let correct = onCorrectAlignment {
-                            Button("Correct") { correct() }
-                                .font(.lato(size: 9, weight: .medium))
-                                .foregroundColor(Color.accent)
-                                .buttonStyle(.plain)
-                        }
-                    case .unableToDetermine:
-                        Image(systemName: "questionmark.circle")
-                            .font(.system(size: 9))
-                            .foregroundColor(Color.fgMid)
-                        Text("Unable to determine")
-                            .font(.lato(size: 9))
-                            .foregroundColor(Color.fgMid)
-                    default:
-                        EmptyView()
                     }
                 }
             }

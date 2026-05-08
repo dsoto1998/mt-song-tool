@@ -5,20 +5,14 @@ import Accelerate
 // MARK: - AlignmentResult
 
 enum AlignmentResult: Equatable {
-    /// Positive offsetMs = stem is late (arrives after ORIGINAL SONG). Negative = early.
+    /// Positive offsetMs = stems bus is late vs ORIGINAL SONG. Negative = early.
     case aligned(offsetMs: Double, samples: Int)
     case unableToDetermine
     case skipped
 
-    /// True when the offset is large enough to matter (≥2ms).
     var isActionable: Bool {
         guard case .aligned(let ms, _) = self else { return false }
         return abs(ms) >= 2.0
-    }
-
-    var offsetMs: Double? {
-        guard case .aligned(let ms, _) = self else { return nil }
-        return ms
     }
 
     var offsetSamples: Int? {
@@ -29,9 +23,16 @@ enum AlignmentResult: Equatable {
     var displayText: String {
         switch self {
         case .aligned(let ms, let samples):
-            let sign = ms >= 0 ? "+" : ""
-            let dir = ms >= 0 ? "late" : "early"
-            return "\(sign)\(String(format: "%.1f", ms))ms (\(abs(samples)) samples \(dir))"
+            let absMs  = abs(ms)
+            let sign   = ms >= 0 ? "+" : "−"
+            let dir    = ms >= 0 ? "late" : "early"
+            let absSamples = abs(samples)
+            if absMs >= 1000 {
+                let secs = absMs / 1000.0
+                return "\(sign)\(String(format: "%.2f", secs))s (\(absSamples) samples \(dir))"
+            } else {
+                return "\(sign)\(String(format: "%.1f", absMs))ms (\(absSamples) samples \(dir))"
+            }
         case .unableToDetermine:
             return "Unable to determine"
         case .skipped:
@@ -48,91 +49,116 @@ enum AlignmentResult: Equatable {
 // MARK: - AlignmentService
 
 struct AlignmentService {
-    private static let sampleRate: Double = 44100.0
+    static let sampleRate: Double = 44100.0
 
-    // 2-second fingerprint window starting at 1s (skips count-off)
-    private static let refStartSeconds: Double = 1.0
-    private static let refWindowSeconds: Double = 2.0  // 88200 samples
+    // 2-second fingerprint window
+    private static let refWindowSeconds: Double = 2.0   // 88200 samples
 
     // ±300ms search range
-    private static let maxOffsetSeconds: Double = 0.3  // 13230 samples each side
+    private static let maxOffsetSeconds: Double = 0.3   // 13230 samples each side
 
-    // Peak/RMS confidence ratio — below this, try next window (or return .unableToDetermine)
+    // Peak/RMS confidence gate
     private static let confidenceThreshold: Float = 2.5
 
-    // Min RMS to consider signal has content
+    // Min RMS to consider a signal has content
     private static let minRMS: Float = 1e-4
 
-    // Probe spacing and maximum — cover full song, not just first 2 min
+    // Probe parameters — 5s steps, up to 6 min
     private static let probeStep: Double = 5.0
-    private static let probeMaxSeconds: Double = 360.0  // up to 6 min
+    private static let probeMaxSeconds: Double = 360.0
 
-    static func check(
-        url: URL,
-        state: StemState,
+    // MARK: - Public API
+
+    /// Sums all collective stems into one bus and cross-correlates against ORIGINAL SONG.
+    /// Returns a single global offset — all stems shift by the same amount.
+    static func checkBus(
+        stemURLs: [URL],
+        stemStates: [URL: StemState],
         referenceURL: URL,
         referenceState: StemState
     ) async -> AlignmentResult {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
-                cont.resume(returning: compute(
-                    url: url, state: state,
+                cont.resume(returning: computeBus(
+                    stemURLs: stemURLs, stemStates: stemStates,
                     refURL: referenceURL, refState: referenceState
                 ))
             }
         }
     }
 
-    // MARK: - Core correlation
+    // MARK: - Bus correlation
 
-    private static func compute(
-        url: URL, state: StemState,
-        refURL: URL, refState: StemState
+    private static func computeBus(
+        stemURLs: [URL],
+        stemStates: [URL: StemState],
+        refURL: URL,
+        refState: StemState
     ) -> AlignmentResult {
-        guard let refFile  = try? AVAudioFile(forReading: refURL),
-              let stemFile = try? AVAudioFile(forReading: url) else { return .unableToDetermine }
+        guard let refFile = try? AVAudioFile(forReading: refURL) else { return .unableToDetermine }
 
-        let sr         = sampleRate
-        let refLen     = Int(refWindowSeconds * sr)    // 88200
-        let maxOff     = Int(maxOffsetSeconds * sr)    // 13230
-        let stemLen    = refLen + 2 * maxOff           // 114660
-        let fileDur    = Double(stemFile.length) / sr
-        let refFileDur = Double(refFile.length)  / sr
+        // Open all stem files upfront — reused across every probe window.
+        let openStems: [(file: AVAudioFile, state: StemState)] = stemURLs.compactMap { url in
+            guard let file = try? AVAudioFile(forReading: url),
+                  let state = stemStates[url] else { return nil }
+            return (file, state)
+        }
+        guard !openStems.isEmpty else { return .unableToDetermine }
 
-        // Probe windows spaced 10s apart until both signals have content.
-        // Skip first second (may be silence/count-off). Cap at 120s.
-        let probeStart: Double = 1.0
-        let probeMax:   Double = min(refFileDur, fileDur, probeMaxSeconds)
+        let sr        = sampleRate
+        let refLen    = Int(refWindowSeconds * sr)   // 88200
+        let maxOff    = Int(maxOffsetSeconds * sr)   // 13230
+        let stemLen   = refLen + 2 * maxOff          // 114660
+        let outputLen = stemLen - refLen + 1         // 2*maxOff + 1 = 26461
 
-        var windowStart = probeStart
+        let refFileDur    = Double(refFile.length) / sr
+        let minStemDur    = openStems.map { Double($0.file.length) / sr }.min() ?? 0
+        let probeMax      = min(refFileDur, minStemDur, probeMaxSeconds)
+
+        var windowStart = 1.0
         while windowStart + refWindowSeconds <= probeMax {
-            let stemWindowStart = max(0, windowStart - maxOffsetSeconds)
+            let busWindowStart = max(0, windowStart - maxOffsetSeconds)
 
-            guard let refBuf  = renderMono(url: refURL,  state: refState,
-                                            fromSeconds: windowStart,      length: refLen,  file: refFile),
-                  let stemBuf = renderMono(url: url,     state: state,
-                                            fromSeconds: stemWindowStart,  length: stemLen, file: stemFile)
+            guard let refBuf = renderMono(state: refState,
+                                           fromSeconds: windowStart, length: refLen,
+                                           file: refFile)
             else { windowStart += probeStep; continue }
 
             var refRms: Float = 0
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(refLen))
-            var stemRms: Float = 0
-            vDSP_rmsqv(stemBuf, 1, &stemRms, vDSP_Length(stemLen))
+            guard refRms > minRMS else { windowStart += probeStep; continue }
 
-            guard refRms > minRMS, stemRms > minRMS else {
-                windowStart += probeStep; continue
+            // Sum all stems into one bus buffer for this window.
+            var busBuf = [Float](repeating: 0, count: stemLen)
+            var activeStemCount = 0
+
+            for (stemFile, stemState) in openStems {
+                guard let stemBuf = renderMono(state: stemState,
+                                               fromSeconds: busWindowStart, length: stemLen,
+                                               file: stemFile) else { continue }
+                var stemRms: Float = 0
+                vDSP_rmsqv(stemBuf, 1, &stemRms, vDSP_Length(stemLen))
+                if stemRms > minRMS { activeStemCount += 1 }
+                vDSP_vadd(busBuf, 1, stemBuf, 1, &busBuf, 1, vDSP_Length(stemLen))
             }
 
-            // Cross-correlation via vDSP_conv.
-            // With B pointer at last element and stride -1:
-            //   C[n] = sum_{p=0}^{P-1} A[n+p] * refBuf[p]  ← true cross-correlation.
-            let outputLen = stemLen - refLen + 1   // 2*maxOff + 1
-            var correlation = [Float](repeating: 0, count: outputLen)
+            guard activeStemCount > 0 else { windowStart += probeStep; continue }
 
-            stemBuf.withUnsafeBufferPointer { stemPtr in
+            // Normalise bus level.
+            var scale = 1.0 / Float(openStems.count)
+            vDSP_vsmul(busBuf, 1, &scale, &busBuf, 1, vDSP_Length(stemLen))
+
+            var busRms: Float = 0
+            vDSP_rmsqv(busBuf, 1, &busRms, vDSP_Length(stemLen))
+            guard busRms > minRMS else { windowStart += probeStep; continue }
+
+            // Cross-correlation via vDSP_conv (negative stride = correlation, not convolution).
+            //   C[n] = sum_{p=0}^{P-1} busBuf[n+p] * refBuf[p]
+            var correlation = [Float](repeating: 0, count: outputLen)
+            busBuf.withUnsafeBufferPointer { busPtr in
                 refBuf.withUnsafeBufferPointer { refPtr in
                     vDSP_conv(
-                        stemPtr.baseAddress!, 1,
+                        busPtr.baseAddress!, 1,
                         refPtr.baseAddress!.advanced(by: refLen - 1), -1,
                         &correlation, 1,
                         vDSP_Length(outputLen), vDSP_Length(refLen)
@@ -146,14 +172,13 @@ struct AlignmentService {
 
             var corrRms: Float = 0
             vDSP_rmsqv(correlation, 1, &corrRms, vDSP_Length(outputLen))
-
             guard corrRms > 0, peakVal / corrRms >= confidenceThreshold else {
                 windowStart += probeStep; continue
             }
 
-            // Lag: peakIdx=0 → stem maxOff early; peakIdx=maxOff → aligned; peakIdx=2*maxOff → stem maxOff late
+            // Lag: peakIdx=0 → bus maxOff early; peakIdx=maxOff → aligned; peakIdx=2*maxOff → bus maxOff late
             let lagSamples = Int(peakIdx) - maxOff
-            let lagMs = Double(lagSamples) / sr * 1000.0
+            let lagMs      = Double(lagSamples) / sr * 1000.0
             return .aligned(offsetMs: lagMs, samples: lagSamples)
         }
 
@@ -162,11 +187,7 @@ struct AlignmentService {
 
     // MARK: - Mono rendering
 
-    /// Renders `length` samples of mono audio starting at `fromSeconds` in session time,
-    /// applying the AudioSegment model (cuts, moves). Gaps between segments stay zero.
-    /// Accepts an already-open `file` to avoid reopening on every probe window.
     private static func renderMono(
-        url: URL,
         state: StemState,
         fromSeconds: Double,
         length: Int,
@@ -177,13 +198,12 @@ struct AlignmentService {
         let totalFileFrames = Int(file.length)
         guard totalFileFrames > 0, length > 0 else { return nil }
 
-        var output = [Float](repeating: 0, count: length)
+        var output    = [Float](repeating: 0, count: length)
         let windowEnd = fromSeconds + Double(length) / fileSR
+        let fileDur   = Double(totalFileFrames) / fileSR
 
-        // Derive duration from file directly — state.duration may be 0 if peaks haven't loaded yet.
-        let fileDuration = Double(totalFileFrames) / fileSR
         let segments: [AudioSegment] = state.segments.isEmpty
-            ? [AudioSegment(sourceStart: 0, sourceEnd: fileDuration, sessionStart: 0)]
+            ? [AudioSegment(sourceStart: 0, sourceEnd: fileDur, sessionStart: 0)]
             : state.segments
 
         for seg in segments {
@@ -191,17 +211,15 @@ struct AlignmentService {
             let overlapEnd   = min(seg.sessionEnd,   windowEnd)
             guard overlapEnd > overlapStart + 0.001 else { continue }
 
-            let srcStart = seg.sourceStart + (overlapStart - seg.sessionStart)
-            let srcLen   = overlapEnd - overlapStart
-
+            let srcStart   = seg.sourceStart + (overlapStart - seg.sessionStart)
+            let srcLen     = overlapEnd - overlapStart
             let startFrame = Int(srcStart * fileSR)
             let frameCount = min(Int(ceil(srcLen * fileSR)), totalFileFrames - startFrame)
             guard frameCount > 0, startFrame >= 0, startFrame < totalFileFrames else { continue }
 
-            guard let buf = AVAudioPCMBuffer(
-                pcmFormat: file.processingFormat,
-                frameCapacity: AVAudioFrameCount(frameCount)
-            ) else { continue }
+            guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                              frameCapacity: AVAudioFrameCount(frameCount))
+            else { continue }
 
             file.framePosition = Int64(startFrame)
             guard (try? file.read(into: buf)) != nil,
