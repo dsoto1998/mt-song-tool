@@ -3,6 +3,15 @@ import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
 
+// MARK: - Export validation model
+
+struct ExportCheck {
+    let label: String
+    let detail: String
+    let isBlocking: Bool
+    let isFailing: Bool
+}
+
 // MARK: - EditView (root)
 
 struct EditView: View {
@@ -43,6 +52,8 @@ struct EditView: View {
     @State private var isExporting: Bool = false
     @State private var exportError: String? = nil
     @State private var showExportError: Bool = false
+    @State private var showExportValidation: Bool = false
+    @State private var pendingExportChecks: [ExportCheck] = []
 
     // Save session state
     @State private var isSaving: Bool = false
@@ -393,6 +404,13 @@ struct EditView: View {
             Button("OK") {}
         } message: {
             Text(saveError ?? "Unknown error")
+        }
+        .sheet(isPresented: $showExportValidation) {
+            ExportValidationSheet(
+                checks: pendingExportChecks,
+                onExport: { showExportValidation = false; openSavePanel() },
+                onDismiss: { showExportValidation = false }
+            )
         }
     }
 
@@ -1150,7 +1168,99 @@ struct EditView: View {
 
     // MARK: - Export
 
+    private func runExportChecks() -> [ExportCheck] {
+        var checks: [ExportCheck] = []
+        let lb = loopBracket
+        let markers = parsedResult?.markers ?? []
+        let activeStems = editPlayer.stemStates.filter { !$0.value.isExcluded }
+        let activeStemNames = Set(activeStems.keys.map { $0.deletingPathExtension().lastPathComponent.uppercased() })
+
+        // Invalid locator names
+        let invalidLocators = markers.compactMap { m -> String? in
+            let name = editPlayer.locatorOverrides[m.alsId]?.name ?? m.text
+            return LocatorValidator.isValid(name, mtCompleteMode: mtCompleteMode) ? nil : name.isEmpty ? "(blank)" : name
+        }
+        checks.append(ExportCheck(
+            label: "All locators valid",
+            detail: invalidLocators.isEmpty ? "" : "Invalid: \(invalidLocators.joined(separator: ", "))",
+            isBlocking: true,
+            isFailing: !invalidLocators.isEmpty
+        ))
+
+        // Loop bracket requires NEXT SONG or MT Complete loop end
+        checks.append(ExportCheck(
+            label: "Loop bracket set",
+            detail: lb == nil ? "Add a NEXT SONG locator to define the loop end." : "",
+            isBlocking: true,
+            isFailing: lb == nil
+        ))
+
+        // No muted stems
+        let mutedNames = activeStems.filter { $0.value.isMuted }
+            .map { $0.key.deletingPathExtension().lastPathComponent }.sorted()
+        checks.append(ExportCheck(
+            label: "No muted stems",
+            detail: mutedNames.isEmpty ? "" : "Muted: \(mutedNames.joined(separator: ", "))",
+            isBlocking: true,
+            isFailing: !mutedNames.isEmpty
+        ))
+
+        // No soloed stems
+        let soloedNames = activeStems.filter { $0.value.isSoloed }
+            .map { $0.key.deletingPathExtension().lastPathComponent }.sorted()
+        checks.append(ExportCheck(
+            label: "No soloed stems",
+            detail: soloedNames.isEmpty ? "" : "Soloed: \(soloedNames.joined(separator: ", "))",
+            isBlocking: true,
+            isFailing: !soloedNames.isEmpty
+        ))
+
+        // CLICK TRACK present in session
+        checks.append(ExportCheck(
+            label: "CLICK TRACK in session",
+            detail: activeStemNames.contains("CLICK TRACK") ? "" : "Add CLICK TRACK.wav to the stems folder.",
+            isBlocking: true,
+            isFailing: !activeStemNames.contains("CLICK TRACK")
+        ))
+
+        // GUIDE present in session
+        checks.append(ExportCheck(
+            label: "GUIDE in session",
+            detail: activeStemNames.contains("GUIDE") ? "" : "Add GUIDE.wav to the stems folder.",
+            isBlocking: true,
+            isFailing: !activeStemNames.contains("GUIDE")
+        ))
+
+        // Stems shorter than loop bracket by >500ms (warning, non-blocking)
+        if let lb {
+            let shortNames = activeStems.filter { (_, state) in
+                state.duration > 0 && lb.endSeconds - state.duration > 0.5
+            }.map { $0.key.deletingPathExtension().lastPathComponent }.sorted()
+            if !shortNames.isEmpty {
+                checks.append(ExportCheck(
+                    label: "Stem length",
+                    detail: "Ends >500ms short of loop bracket: \(shortNames.joined(separator: ", "))",
+                    isBlocking: false,
+                    isFailing: true
+                ))
+            }
+        }
+
+        return checks
+    }
+
     private func startExport() {
+        guard loopBracket != nil, !analyzer.stemURLs.isEmpty else { return }
+        let failing = runExportChecks().filter { $0.isFailing }
+        if failing.isEmpty {
+            openSavePanel()
+        } else {
+            pendingExportChecks = failing
+            showExportValidation = true
+        }
+    }
+
+    private func openSavePanel() {
         guard let lb = loopBracket else { return }
 
         let panel = NSOpenPanel()
@@ -3780,6 +3890,108 @@ struct EditLocatorChip: View {
                 withAnimation(.easeOut(duration: 0.08)) { isHovering = h }
                 if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
             }
+    }
+}
+
+// MARK: - Export Validation Sheet
+
+struct ExportValidationSheet: View {
+    let checks: [ExportCheck]
+    let onExport: () -> Void
+    let onDismiss: () -> Void
+
+    private var hasBlockers: Bool { checks.contains { $0.isBlocking && $0.isFailing } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Text("Export Validation")
+                    .font(.horizon(size: 14))
+                    .foregroundColor(Color.fgBright)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+
+            Color.border.frame(height: 1)
+
+            // Check rows
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(checks.enumerated()), id: \.offset) { _, check in
+                        ExportCheckRow(check: check)
+                        Color.border.frame(height: 1)
+                    }
+                }
+            }
+
+            Color.border.frame(height: 1)
+
+            // Footer
+            HStack {
+                if hasBlockers {
+                    Text("Fix the issues above before exporting.")
+                        .font(.lato(size: 11))
+                        .foregroundColor(Color.fgMid)
+                } else {
+                    Text("Warnings found. You can still export.")
+                        .font(.lato(size: 11))
+                        .foregroundColor(Color.fgMid)
+                }
+                Spacer()
+                Button("Dismiss") { onDismiss() }
+                    .buttonStyle(CompactSecondaryButtonStyle())
+                if !hasBlockers {
+                    Button("Export Anyway") { onExport() }
+                        .buttonStyle(CompactSecondaryButtonStyle())
+                        .foregroundColor(Color.accent)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+        }
+        .frame(width: 480)
+        .background(Color.bgCard)
+    }
+}
+
+private struct ExportCheckRow: View {
+    let check: ExportCheck
+
+    private var iconName: String {
+        if check.isBlocking { return "xmark.circle.fill" }
+        return "exclamationmark.triangle.fill"
+    }
+
+    private var iconColor: Color {
+        check.isBlocking ? Color.red : Color(nsColor: .systemYellow)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: iconName)
+                .foregroundColor(iconColor)
+                .font(.system(size: 13))
+                .frame(width: 16, height: 16)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(check.label)
+                    .font(.lato(size: 12, weight: .semibold))
+                    .foregroundColor(Color.fgBright)
+                if !check.detail.isEmpty {
+                    Text(check.detail)
+                        .font(.lato(size: 11))
+                        .foregroundColor(Color.fgMid)
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.bgCard)
     }
 }
 
