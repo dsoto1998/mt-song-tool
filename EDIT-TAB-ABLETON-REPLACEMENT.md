@@ -1,7 +1,7 @@
 # Edit Tab — Ableton Replacement Implementation Plan
 
 **Full spec:** `ABLETON-REPLACEMENT-SPEC.md` (read this first for all rules and rationale)  
-**Status:** Phase 1 in progress — not started
+**Status:** Phase 1 complete — Phase 2 next
 
 ---
 
@@ -9,7 +9,7 @@
 
 | Phase | Goal | Status |
 |---|---|---|
-| 1 | Core editing parity (locator drag, loop bracket, stem deletion, tempo lane, time sig lane, gain lock) | 🔄 In progress |
+| 1 | Core editing parity (locator drag, loop bracket, stem deletion, tempo lane, time sig lane, gain lock) | ✅ Complete |
 | 2 | Guardrails + alignment (pre-export validation gate, alignment check/auto-correct) | 🔲 Not started |
 | 3 | Automation (click track MIDI-derived, guide track, export) | 🔲 Not started |
 | 4 | Dynamic cues (placement UI, anti-collision, multi-language) | 🔲 Not started |
@@ -290,7 +290,7 @@ Parser:         mtst-master/parse_als.py
 
 **Read first:** `ABLETON-REPLACEMENT-SPEC.md` + this file + memory index. The spec is the authority — this file is the implementation breakdown.
 
-**First task:** Phase 1a — locator drag-to-reposition. Before writing any code, read `EditView.swift` and `EditPlayerService.swift` to understand current locator lane state.
+**First task:** Phase 2a — pre-export validation gate. Before writing any code, read `EditView.swift` and `EditPlayerService.swift`.
 
 **Key architectural decisions already made (do not re-discuss):**
 - Session model: no file writes during editing. All changes in memory. `save_session` Python action on Save/Save As. QA tab renames also route through session while Edit tab session is active.
@@ -303,18 +303,20 @@ Parser:         mtst-master/parse_als.py
 - `performCommit` removed — Export replaces it.
 - Dirty state never auto-clears from undo — only clears on explicit Save.
 - Loop bracket always recalculated from NEXT SONG on load — saved value in `.als` ignored.
+- After Save: use `reparseAfterSave()` not `loadNewFile()` — skips `audioAnalyzer.reset()` so Edit stems survive.
 
-**Phase 1 items in order:**
+**Phase 1 items — ALL COMPLETE (2026-05-08):**
 1a. ✅ Locator drag-to-reposition — DONE 2026-04-18
 1b. ✅ Loop bracket auto-set + display — DONE 2026-04-18
 1c. ✅ Stem deletion from session — DONE 2026-05-07
 1d. ✅ Tempo lane rebuild — DONE
 1e. ✅ Time signature lane (new) — DONE 2026-05-07
-1f. Gain lock for CLICK TRACK / GUIDE / ORIGINAL SONG (confirmed missing)
-1g. Build Session re-add (confirmed missing from codebase)
+1f. ✅ Gain lock for CLICK TRACK / GUIDE / ORIGINAL SONG — already implemented (isLockedStem passed at call site)
+1g. ✅ Build Session re-add — DONE 2026-05-08
 + ✅ Save / Save As UI — DONE
-+ ✅ Dirty indicator — DONE (accent dot right of "Save Session" text)
-+ Post-save QA flash + unsaved-changes alert
++ ✅ Dirty indicator — dot badge overlay on Save button (7px accent circle, top-right, spring animation)
++ ✅ Post-save QA tab flash — accent dot on QA button, clears on tab visit
++ ✅ Unsaved-changes guard — Clear All + Cmd+Q both prompt Save/Discard/Cancel
 
 **What was built in the 2026-04-18 session:**
 - `Marker.beat: Double?` — Ableton beat position, populated from Python `locator_data[i][1]`
