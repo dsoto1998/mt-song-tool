@@ -11,7 +11,7 @@
 - **Stem audio preview** — Inline per-stem playback with waveform seek view; click to seek, drag to scrub
 - **Locator section preview** — Play ORIGINAL SONG from any locator's start time directly from the Locators panel
 - **AudioShake tab** — AI-powered stem separation via the AudioShake API; drop any mixed audio file, select from 15 stem models (vocals, lead/backing, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download separated stems with inline playback
-- **Edit tab** — Multi-stem timeline with transport (play/pause/stop), pinch-to-zoom, drag-to-nudge, region select/delete/move, cut/split, trim, per-stem gain and peak metering, mute/solo, and FFmpeg bake-out
+- **Edit tab** — Multi-stem timeline with transport, pinch-to-zoom, region select/delete/move, cut/split, per-stem gain, mute/solo, and FFmpeg bake-out. Interactive tempo lane and time signature lane. Locator drag-to-reposition with live loop bracket. Stem deletion. Gain-locked reference stems (CLICK TRACK, GUIDE, ORIGINAL SONG) with per-stem peak-hold meters. Master meter with all-time peak hold. Export Stems to 44.1 kHz / 16-bit PCM. Build Session generates a complete `.als` from scratch. Suggest Locators from a lyric sheet or Genius/AZLyrics URL via Whisper alignment.
 - **Metronome** — Tempo-synced click track with mute toggle, subdivision modes (quarter/eighth), and real-time volume control
 - **Live 12 detection** — Loading a Live 12 session prompts conversion to Live 11 before QA; old Ableton (v10 and earlier) sessions show an alert with an "Open in Ableton 11" option
 - **Quick Check mode** — Removes the requirement to have both an `.als` and stems before proceeding
@@ -46,6 +46,7 @@
 - **Export Stems** — New toolbar button replaces "Commit Changes." Exports all session stems to a user-chosen folder, each padded or trimmed to exactly the loop bracket end (NEXT SONG − 1 bar). Segment edits and cuts are baked into a single file per stem; current gain is applied; mute state is ignored so all stems export at full signal. Output is 44.1 kHz / 16-bit PCM, conforming to QA tab standards. Excluded (deleted) stems are omitted.
 - **Sidebar widened to 220 px** — More room for longer stem names and the gain readout.
 - **Performance** — Meters use lock-free float atoms (no `Task` allocation per audio buffer). `StemPeakMeter` and `MasterPeakMeter` are Canvas-based (single GPU draw call per frame). Pinch-to-zoom no longer triggers a waveform path rebuild mid-gesture; CALayer scale transform is used instead, with a full rebuild only on gesture end.
+
 
 ### v1.4.1 — April 15, 2026
 

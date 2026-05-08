@@ -108,7 +108,8 @@ struct ContentView: View {
                         onSaveEdits: { newPath in loadNewFile(path: newPath) },
                         alsFullPath: parser.alsPath,
                         mtCompleteMode: userSettings.mtCompleteMode,
-                        onFolderDrop: { url in handleFolderDrop(url) }
+                        onFolderDrop: { url in handleFolderDrop(url) },
+                        onBuildComplete: { path in loadNewFile(path: path) }
                     )
                     .padding(.horizontal, 20)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -16,8 +16,13 @@ struct EditView: View {
     var alsFullPath: String? = nil   // full .als path for Save Session (parsedResult.file is basename only)
     var mtCompleteMode: Bool = false
     var onFolderDrop: ((URL) -> Void)? = nil
+    var onBuildComplete: (String) -> Void = { _ in }
 
     @ObservedObject private var userSettings = UserSettings.shared
+
+    @StateObject private var buildStore = BuildSessionStore()
+    @StateObject private var alsGen = ALSGeneratorService()
+    @State private var buildPanelExpanded: Bool = false
 
     // Timeline state
     @State private var zoomScale: CGFloat = 0.25       // horizontal zoom multiplier
@@ -214,6 +219,7 @@ struct EditView: View {
 
             if stemURLs.isEmpty {
                 emptyState
+                    .layoutPriority(1)
             } else if editPlayer.totalDuration == 0 {
                 // Peaks still loading — show spinner instead of flashing empty canvases
                 VStack(spacing: 8) {
@@ -228,6 +234,8 @@ struct EditView: View {
                 // Timeline
                 timelineView
             }
+
+            buildSessionPanel
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.bg)
@@ -271,6 +279,15 @@ struct EditView: View {
                 editPlayer.initTimeSigs(from: result.timeSignatures)
             }
             // Build metronome beat schedule from parsed session
+            rebuildBeatSchedule()
+        }
+        .onChange(of: parsedResult?.file) { _ in
+            if let result = parsedResult {
+                editPlayer.initTimeSigs(from: result.timeSignatures)
+                rebuildBeatSchedule()
+            }
+        }
+        .onChange(of: editPlayer.timeSigOverrides) { _ in
             rebuildBeatSchedule()
         }
         .onChange(of: editPlayer.playAnchor) { anchor in
@@ -323,9 +340,6 @@ struct EditView: View {
         .onChange(of: editPlayer.editableTempoEvents) { _ in
             rebuildBeatSchedule()
         }
-        .onChange(of: editPlayer.timeSigOverrides) { _ in
-            rebuildBeatSchedule()
-        }
         .confirmationDialog(
             confirmRemoveStemURLs.count == 1
                 ? "\(confirmRemoveStemURLs[0].deletingPathExtension().lastPathComponent) is a protected stem."
@@ -342,6 +356,12 @@ struct EditView: View {
                 confirmRemoveStemURLs = []
             }
             Button("Cancel", role: .cancel) { confirmRemoveStemURLs = [] }
+        }
+        .onChange(of: alsGen.phase) { phase in
+            if case .done(let path) = phase {
+                onBuildComplete(path)
+                alsGen.reset()
+            }
         }
         .alert("Export Error", isPresented: $showExportError) {
             Button("OK") {}
@@ -870,13 +890,263 @@ struct EditView: View {
         .animation(.easeOut(duration: 0.12), value: isFolderDropTargeted)
     }
 
+    // MARK: - Build Session Panel
+
+    private var buildSessionPanel: some View {
+        VStack(spacing: 0) {
+            Divider().foregroundColor(Color.border)
+            // Header
+            HStack(spacing: 6) {
+                Image(systemName: buildPanelExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.fgMid)
+                Text("Build Session")
+                    .font(.lato(size: 12, weight: .semibold))
+                    .foregroundColor(Color.fgBright)
+                Spacer()
+                if parsedResult != nil && !buildPanelExpanded {
+                    Button("Populate") {
+                        populateBuildSession()
+                        buildPanelExpanded = true
+                    }
+                    .font(.lato(size: 11))
+                    .foregroundColor(Color.accent)
+                    .buttonStyle(.plain)
+                }
+                if buildPanelExpanded && parsedResult != nil {
+                    Button("Populate") { populateBuildSession() }
+                        .font(.lato(size: 11))
+                        .foregroundColor(Color.accent)
+                        .buttonStyle(.plain)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { buildPanelExpanded.toggle() } }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.bgCard)
+
+            if buildPanelExpanded {
+                buildSessionForm
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: buildPanelExpanded)
+    }
+
+    private var buildSessionForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Row 1: BPM + Time Sig
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("BPM")
+                        .font(.lato(size: 10, weight: .semibold))
+                        .foregroundColor(Color.fgMid)
+                    TextField("120", text: $buildStore.bpm)
+                        .font(.lato(size: 13))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 80)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Time Sig")
+                        .font(.lato(size: 10, weight: .semibold))
+                        .foregroundColor(Color.fgMid)
+                    Picker("", selection: $buildStore.timeSig) {
+                        ForEach(["4/4", "3/4", "6/8", "12/8", "2/4", "2/2", "5/4", "7/8", "9/8"], id: \.self) {
+                            Text($0).tag($0)
+                        }
+                    }
+                    .frame(width: 90)
+                    .labelsHidden()
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Loop End (beats)")
+                        .font(.lato(size: 10, weight: .semibold))
+                        .foregroundColor(Color.fgMid)
+                    TextField("0", value: $buildStore.loopEndBeat, formatter: NumberFormatter())
+                        .font(.lato(size: 13))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 90)
+                }
+                Spacer()
+                // Stems count
+                if !stemURLs.isEmpty {
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text("Stems")
+                            .font(.lato(size: 10, weight: .semibold))
+                            .foregroundColor(Color.fgMid)
+                        Text("\(stemURLs.count)")
+                            .font(.lato(size: 13, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                    }
+                }
+            }
+
+            // Row 2: Locators
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Locators")
+                        .font(.lato(size: 10, weight: .semibold))
+                        .foregroundColor(Color.fgMid)
+                    Spacer()
+                    Button {
+                        buildStore.locators.append(
+                            ALSGeneratorService.BuildLocator(beat: buildStore.loopEndBeat, name: "")
+                        )
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(Color.accent)
+                    }
+                    .buttonStyle(.plain)
+                }
+                ForEach(buildStore.locators.indices, id: \.self) { idx in
+                    HStack(spacing: 6) {
+                        TextField("Beat", value: $buildStore.locators[idx].beat, formatter: buildBeatFormatter)
+                            .font(.lato(size: 11))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 70)
+                        TextField("Section Name", text: $buildStore.locators[idx].name)
+                            .font(.lato(size: 11))
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            buildStore.locators.remove(at: idx)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9))
+                                .foregroundColor(Color.fgMid)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                if buildStore.locators.isEmpty {
+                    Text("No locators — tap + to add, or use Populate")
+                        .font(.lato(size: 11))
+                        .foregroundColor(Color.fgDim)
+                }
+            }
+
+            // Row 3: Output folder + Build button
+            HStack(spacing: 10) {
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.canCreateDirectories = true
+                    panel.prompt = "Choose Folder"
+                    if panel.runModal() == .OK {
+                        buildStore.outputFolder = panel.url
+                    }
+                } label: {
+                    Label(buildStore.outputFolder?.lastPathComponent ?? "Choose Output Folder",
+                          systemImage: "folder")
+                        .font(.lato(size: 11))
+                        .foregroundColor(buildStore.outputFolder != nil ? Color.fgBright : Color.fgMid)
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                if case .failed(let msg) = alsGen.phase {
+                    Text(msg)
+                        .font(.lato(size: 10))
+                        .foregroundColor(Color.red)
+                        .lineLimit(1)
+                }
+
+                if case .building = alsGen.phase {
+                    ProgressView().controlSize(.small)
+                }
+
+                Button(buildCanBuild ? "Build .als" : "Build .als") {
+                    performBuildSession()
+                }
+                .font(.lato(size: 11, weight: .semibold))
+                .foregroundColor(buildCanBuild ? .white : Color.fgMid)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(buildCanBuild ? Color.accent : Color.border.opacity(0.5))
+                .cornerRadius(5)
+                .buttonStyle(.plain)
+                .disabled(!buildCanBuild || alsGen.phase.isActive)
+            }
+        }
+        .padding(12)
+        .background(Color.bg)
+    }
+
+    private let buildBeatFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 3
+        return f
+    }()
+
+    private var buildCanBuild: Bool {
+        guard let bpmVal = Double(buildStore.bpm), bpmVal > 0 else { return false }
+        return buildStore.outputFolder != nil
+            && !buildStore.locators.isEmpty
+            && buildStore.loopEndBeat > 0
+            && !buildStore.locators.contains(where: { $0.name.trimmingCharacters(in: .whitespaces).isEmpty })
+    }
+
+    private func populateBuildSession() {
+        guard let result = parsedResult else { return }
+        let schedule = metronome.beatSchedule
+        func secsToBeat(_ secs: Double) -> Double {
+            guard !schedule.isEmpty else { return 0 }
+            return schedule.min(by: { abs($0.timeSeconds - secs) < abs($1.timeSeconds - secs) })?.absoluteBeat ?? 0
+        }
+        // BPM
+        if let b = result.bpm { buildStore.bpm = String(Int(b.rounded())) }
+        // Time sig from first time sig
+        if let ts = result.timeSignatures.first { buildStore.timeSig = ts.sig }
+        // Locators → beats
+        buildStore.locators = result.markers.compactMap { m in
+            let beat: Double
+            if let b = m.beat { beat = b }
+            else if let secs = markerTimeToSeconds(m.time) { beat = secsToBeat(secs) }
+            else { return nil }
+            return ALSGeneratorService.BuildLocator(beat: beat, name: m.text)
+        }
+        // Loop end from loopBracket
+        if let lb = loopBracket { buildStore.loopEndBeat = lb.endBeat }
+        else if let ns = result.markers.first(where: { $0.text.uppercased() == "NEXT SONG" }),
+                let secs = markerTimeToSeconds(ns.time) {
+            buildStore.loopEndBeat = secsToBeat(secs)
+        }
+    }
+
+    private func performBuildSession() {
+        guard let folder = buildStore.outputFolder,
+              let bpmVal = Double(buildStore.bpm), bpmVal > 0 else { return }
+        let outputPath = folder.appendingPathComponent("\(folder.lastPathComponent).als").path
+        let clips: [(name: String, filePath: String, durationSeconds: Double, volumeDB: Double)] =
+            sortedStemURLs.map { url in
+                let name = url.deletingPathExtension().lastPathComponent
+                let dur = editPlayer.stemStates[url].map { s in
+                    s.segments.map { $0.sourceEnd - $0.sourceStart }.reduce(0, +)
+                } ?? 0
+                return (name: name, filePath: url.path, durationSeconds: dur, volumeDB: 0.0)
+            }
+        alsGen.build(
+            outputPath: outputPath,
+            clips: clips,
+            bpm: bpmVal,
+            tempoEvents: buildStore.additionalTempoEvents,
+            timeSignatures: [TimeSig(time: "0", sig: buildStore.timeSig, beat: 0.0)],
+            locators: buildStore.locators,
+            loopEndBeat: buildStore.loopEndBeat
+        )
+    }
+
     // MARK: - Name Bar Overlay
 
     /// Semi-transparent name chips pinned to the left edge of the waveform area.
     /// Lives outside the NSScrollView so horizontal scroll doesn't carry them away.
     private var waveformNameOverlay: some View {
         VStack(spacing: 0) {
-            Color.clear.frame(height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight)
+            Color.clear.frame(height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.timeSigLaneHeight)
             ForEach(sortedStemURLs, id: \.self) { url in
                 let h = rowHeights[url] ?? defaultRowHeight
                 Color.clear
@@ -1552,6 +1822,9 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onTrimLeftEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onTrimRightEdge: (URL, UUID, Double) -> Void = { _, _, _ in }
     var onRemoveStemByURL: ((URL) -> Void)? = nil
+    var timeSigs: [TimeSigOverride] = []
+    var onTimeSigAdd: (Double, Int, Int) -> Void = { _, _, _ in }   // (tapSeconds, num, den)
+    var onTimeSigRemove: (Double) -> Void = { _ in }               // (beat)
 
     // Tempo lane
     var editableTempoEvents: [TempoEvent] = []
@@ -1684,6 +1957,9 @@ struct WaveformScrollHost: NSViewRepresentable {
             h.combine(url); h.combine(r.lowerBound); h.combine(r.upperBound)
         }
         h.combine(beatSchedule.count)
+        if let first = beatSchedule.first { h.combine(first.timeSeconds.bitPattern) }
+        if beatSchedule.count > 1 { h.combine(beatSchedule[beatSchedule.count / 2].timeSeconds.bitPattern) }
+        if let last = beatSchedule.last { h.combine(last.timeSeconds.bitPattern) }
         h.combine(totalDuration)
         for url in stemURLs {
             let s = stemStates[url]
@@ -2379,6 +2655,7 @@ struct WaveformScrollHost: NSViewRepresentable {
                     onRemove: onTimeSigRemove
                 )
                 .frame(height: WaveformScrollHost.timeSigLaneHeight)
+
 
                 let allHeights = stemURLs.map { rowHeights[$0] ?? defaultRowHeight }
                 ForEach(Array(stemURLs.enumerated()), id: \.element) { (idx, url) in
@@ -3540,5 +3817,245 @@ extension View {
         } else {
             self.onDeleteCommand(perform: action)
         }
+    }
+}
+
+// MARK: - Edit Tab Time Signature Lane
+
+struct EditTimeSigLane: View {
+    let timeSigs: [TimeSigOverride]
+    let totalDuration: Double
+    let beatSchedule: [BeatInfo]
+    let onAdd: (Double, Int, Int) -> Void   // (tapSeconds, num, den) — snap handled upstream
+    let onRemove: (Double) -> Void          // (beat)
+
+    private func secondsForBeat(_ beat: Double) -> Double {
+        guard !beatSchedule.isEmpty else { return 0 }
+        var prev = beatSchedule[0]
+        for info in beatSchedule { if info.absoluteBeat > beat { break }; prev = info }
+        return prev.timeSeconds
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            laneContent(width: geo.size.width)
+        }
+    }
+
+    @ViewBuilder
+    private func laneContent(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(width: width, height: WaveformScrollHost.timeSigLaneHeight)
+
+            if totalDuration > 0, width > 0, !timeSigs.isEmpty {
+                let sorted = timeSigs.sorted { $0.beat < $1.beat }
+                ForEach(Array(sorted.enumerated()), id: \.element.beat) { i, ts in
+                    let startSecs = secondsForBeat(ts.beat)
+                    let endSecs: Double = i + 1 < sorted.count
+                        ? secondsForBeat(sorted[i + 1].beat) : totalDuration
+                    let x = CGFloat(startSecs / totalDuration) * width
+                    let nextX = CGFloat(endSecs / totalDuration) * width
+                    let chipW = max(0, nextX - x)
+
+                    EditTimeSigChip(
+                        ts: ts,
+                        chipWidth: chipW,
+                        chipStartSecs: startSecs,
+                        chipEndSecs: endSecs,
+                        beatSchedule: beatSchedule,
+                        isRemovable: ts.beat > 0.001,
+                        onConfirm: { secs, num, den in
+                            // Pass seconds through — snap handled at EditView level with live schedule
+                            onAdd(secs, num, den)
+                        },
+                        onRemove: ts.beat > 0.001 ? { onRemove(ts.beat) } : nil
+                    )
+                    .frame(width: max(chipW, 1), height: WaveformScrollHost.timeSigLaneHeight)
+                    .offset(x: max(0, x), y: 0)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Edit Tab Time Signature Chip
+
+struct EditTimeSigChip: View {
+    let ts: TimeSigOverride
+    let chipWidth: CGFloat
+    let chipStartSecs: Double
+    let chipEndSecs: Double
+    let beatSchedule: [BeatInfo]
+    let isRemovable: Bool
+    /// Callback passes tapped SECONDS (not pre-snapped beat) — snap happens at EditView level
+    /// using the live metronome.beatSchedule so it's never stale.
+    let onConfirm: (Double, Int, Int) -> Void   // (tapSecs, num, den)
+    let onRemove: (() -> Void)?
+
+    @State private var pickerOpen = false
+    @State private var pickerNum: Int = 4
+    @State private var pickerDen: Int = 4
+    @State private var tapSecs: Double = 0
+    @State private var snappedBar: Int = 1   // best-effort display; computed from frozen beatSchedule
+    @State private var tapXFraction: CGFloat = 0
+    @State private var isHovering = false
+
+    // Best-effort bar number for picker display — uses the chip's (possibly frozen) beat schedule.
+    // If schedule is empty, shows bar 1 (harmless display artifact).
+    private func estimateBar(_ seconds: Double) -> Int {
+        let downbeats = beatSchedule.filter { $0.isDownbeat }
+        guard !downbeats.isEmpty else { return 1 }
+        return downbeats.min(by: { abs($0.timeSeconds - seconds) < abs($1.timeSeconds - seconds) })!.bar
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            chipBody(w: geo.size.width)
+        }
+    }
+
+    @ViewBuilder
+    private func chipBody(w: CGFloat) -> some View {
+        let h = WaveformScrollHost.timeSigLaneHeight
+        // attachmentAnchor uses UnitPoint evaluated at render time — both tapXFraction and
+        // pickerOpen batch into the same render cycle, so the anchor is already correct when
+        // the popover opens. No layout-timing tricks needed.
+        Color(white: 0.18).opacity(0.95)
+            .overlay(alignment: .leading) {
+                Color.white.opacity(0.35).frame(width: 1)
+            }
+            .overlay {
+                HStack(spacing: 0) {
+                    Text(ts.sig)
+                        .font(.lato(size: 8, weight: .bold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.leading, 4)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if isRemovable && isHovering {
+                        Button {
+                            onRemove?()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundColor(.white.opacity(0.7))
+                                .padding(.trailing, 4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(height: h)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onEnded { value in
+                        let frac = max(0, min(1, value.location.x / max(1, w)))
+                        tapXFraction = frac
+                        let range = chipEndSecs - chipStartSecs
+                        let t = chipStartSecs + Double(frac) * max(0, range)
+                        tapSecs = t
+                        snappedBar = estimateBar(t)  // display only
+                        pickerNum = ts.numerator
+                        pickerDen = ts.denominator
+                        pickerOpen = true
+                    }
+            )
+            .onHover { isHovering = $0 }
+            .popover(isPresented: $pickerOpen,
+                     attachmentAnchor: .point(UnitPoint(x: tapXFraction, y: 0)),
+                     arrowEdge: .bottom) {
+                TimeSigPickerPopover(
+                    barNumber: snappedBar,
+                    numerator: $pickerNum,
+                    denominator: $pickerDen,
+                    onConfirm: {
+                        // Pass seconds — snap to live beat schedule happens at EditView level
+                        onConfirm(tapSecs, pickerNum, pickerDen)
+                        pickerOpen = false
+                    },
+                    onCancel: { pickerOpen = false }
+                )
+            }
+            .frame(width: w, height: h)
+    }
+}
+
+// MARK: - Time Signature Picker Popover
+
+struct TimeSigPickerPopover: View {
+    let barNumber: Int          // bar where the change takes effect
+    @Binding var numerator: Int
+    @Binding var denominator: Int
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    private let denominators = [2, 4, 8, 16]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Time Signature")
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.fgBright)
+                Text("Starting at bar \(barNumber)")
+                    .font(.lato(size: 9, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+            }
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Numerator")
+                        .font(.lato(size: 9, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                    Stepper(value: $numerator, in: 1...16) {
+                        Text("\(numerator)")
+                            .font(.lato(size: 14, weight: .bold))
+                            .foregroundColor(Color.fgBright)
+                            .frame(minWidth: 28, alignment: .center)
+                    }
+                    .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Denominator")
+                        .font(.lato(size: 9, weight: .regular))
+                        .foregroundColor(Color.fgMid)
+                    HStack(spacing: 4) {
+                        ForEach(denominators, id: \.self) { d in
+                            Button("\(d)") { denominator = d }
+                                .font(.lato(size: 11, weight: denominator == d ? .bold : .regular))
+                                .foregroundColor(denominator == d ? .white : Color.fgMid)
+                                .frame(width: 30, height: 26)
+                                .background(denominator == d ? Color.accent : Color.border.opacity(0.4))
+                                .cornerRadius(4)
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            Divider().foregroundColor(Color.border)
+
+            HStack {
+                Button("Cancel") { onCancel() }
+                    .font(.lato(size: 11, weight: .regular))
+                    .foregroundColor(Color.fgMid)
+                    .buttonStyle(.plain)
+                Spacer()
+                Text("\(numerator)/\(denominator)")
+                    .font(.lato(size: 13, weight: .bold))
+                    .foregroundColor(Color.fgBright)
+                Spacer()
+                Button("Set") { onConfirm() }
+                    .font(.lato(size: 11, weight: .semibold))
+                    .foregroundColor(Color.accent)
+                    .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .frame(width: 280)
+        .background(Color.bgCard)
     }
 }

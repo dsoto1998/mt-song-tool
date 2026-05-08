@@ -107,9 +107,9 @@ class EditPlayerService: ObservableObject {
 
     // MARK: - Session state
     @Published var locatorOverrides: [String: LocatorOverride] = [:]
+    @Published var timeSigOverrides: [TimeSigOverride] = []
     @Published var isSessionDirty: Bool = false
     @Published var editableTempoEvents: [TempoEvent] = []
-    @Published var timeSigOverrides: [TimeSigOverride] = []
 
     func moveLocator(alsId: String, toBeat beat: Double) {
         var override = locatorOverrides[alsId] ?? LocatorOverride()
@@ -270,6 +270,7 @@ class EditPlayerService: ObservableObject {
     @Published var canRedo: Bool = false
     private var undoStack: [[URL: StemState]] = []
     private var redoStack: [[URL: StemState]] = []
+    // Parallel stacks keep timeSigOverrides in sync with stemStates snapshots.
     private var timeSigUndoStack: [[TimeSigOverride]] = []
     private var timeSigRedoStack: [[TimeSigOverride]] = []
     private let maxUndoSteps = 30

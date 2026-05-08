@@ -1509,6 +1509,755 @@ def parse_file(path):
         return json.dumps({"error": str(e), "markers": [], "time_signatures": [], "file": "", "bpm": None, "warnings": []})
 
 
+def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locators, loop_end_beat):
+    """Generate a minimal Live 11 .als from scratch and write to output_path.
+
+    clips          – list of {name, file_path, duration_seconds, volume_db}
+    bpm            – initial BPM (float) at beat 0
+    tempo_events   – list of {beat, bpm} for additional tempo changes
+    time_signatures– list of {beat, numerator, denominator}
+    locators       – list of {beat, name}
+    loop_end_beat  – loop bracket end in quarter-note beats
+    """
+    import math as _math
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    _idc = [20]  # IDs 1–20 reserved for master track; audio tracks use 21+
+    def _nid(): _idc[0] += 1; return _idc[0]
+
+    def encode_ts(num, den):
+        return (num - 1) + int(_math.log2(den)) * 99
+
+    def db_to_amp(db):
+        return 10.0 ** (db / 20.0)
+
+    def warp_sec(beat_bpm):
+        return repr(1.875 / beat_bpm)
+
+    # ── initial values ────────────────────────────────────────────────────────
+    initial_num = time_signatures[0]['numerator']  if time_signatures else 4
+    initial_den = time_signatures[0]['denominator'] if time_signatures else 4
+    initial_ts_val = encode_ts(initial_num, initial_den)
+
+    # ── tempo FloatEvents ─────────────────────────────────────────────────────
+    # Ghost event at negative beat + real events. Step changes = two events at same beat.
+    all_tempo_evs = [(0.0, bpm)]
+    for ev in sorted(tempo_events, key=lambda x: x['beat']):
+        prev_bpm = all_tempo_evs[-1][1]
+        all_tempo_evs.append((ev['beat'], prev_bpm))   # pre-step (old value)
+        all_tempo_evs.append((ev['beat'], ev['bpm']))  # post-step (new value)
+
+    # Ghost event at -63072000, then real events (step changes = two events at same beat)
+    tempo_float_lines = [f'								<FloatEvent Id="0" Time="-63072000" Value="{repr(bpm)}" />']
+    for ev_id, (b, v) in enumerate(all_tempo_evs[1:], 1):
+        tempo_float_lines.append(f'								<FloatEvent Id="{ev_id}" Time="{repr(b)}" Value="{repr(v)}" />')
+    tempo_float_events = '\n'.join(tempo_float_lines)
+
+    # ── time sig EnumEvents ───────────────────────────────────────────────────
+    ts_enum_lines = [f'								<EnumEvent Id="0" Time="-63072000" Value="{initial_ts_val}" />']
+    for i, ts in enumerate(sorted(time_signatures, key=lambda x: x['beat']), 1):
+        val = encode_ts(ts['numerator'], ts['denominator'])
+        ts_beat = repr(float(ts['beat']))
+        ts_enum_lines.append(f'								<EnumEvent Id="{i}" Time="{ts_beat}" Value="{val}" />')
+    ts_enum_events = '\n'.join(ts_enum_lines)
+
+    # ── freeze sequencer helper ───────────────────────────────────────────────
+    def freeze_seq(on_id, pointee_id):
+        slots = '\n'.join(f'''					<ClipSlot Id="{i}">
+						<LomId Value="0" />
+						<ClipSlot><Value /></ClipSlot>
+						<HasStop Value="true" />
+						<NeedRefreeze Value="true" />
+					</ClipSlot>''' for i in range(8))
+        return f'''				<FreezeSequencer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{on_id}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{pointee_id}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="true" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<ClipSlotList>
+{slots}
+					</ClipSlotList>
+					<MonitoringEnum Value="1" />
+					<Sample><ArrangerAutomation><Events /></ArrangerAutomation></Sample>
+					<VolumeModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></VolumeModulationTarget>
+					<TranspositionModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></TranspositionModulationTarget>
+					<GrainSizeModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></GrainSizeModulationTarget>
+					<FluxModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></FluxModulationTarget>
+					<SampleOffsetModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></SampleOffsetModulationTarget>
+					<Recorder><IsArmed Value="false" /><TakeCounter Value="1" /></Recorder>
+				</FreezeSequencer>'''
+
+    # ── per-clip routing snippet ──────────────────────────────────────────────
+    def routing_block(upper_in, lower_in, upper_out="Master", lower_out=""):
+        return f'''					<AudioInputRouting>
+						<Target Value="AudioIn/External/M0" />
+						<UpperDisplayString Value="{upper_in}" />
+						<LowerDisplayString Value="{lower_in}" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</AudioInputRouting>
+					<MidiInputRouting>
+						<Target Value="MidiIn/External.All/-1" />
+						<UpperDisplayString Value="Ext: All Ins" />
+						<LowerDisplayString Value="" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</MidiInputRouting>
+					<AudioOutputRouting>
+						<Target Value="AudioOut/Master" />
+						<UpperDisplayString Value="{upper_out}" />
+						<LowerDisplayString Value="{lower_out}" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</AudioOutputRouting>
+					<MidiOutputRouting>
+						<Target Value="MidiOut/None" />
+						<UpperDisplayString Value="None" />
+						<LowerDisplayString Value="" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</MidiOutputRouting>'''
+
+    # ── audio track builder ───────────────────────────────────────────────────
+    def audio_track(track_id, clip_idx, clip):
+        amp = db_to_amp(clip.get('volume_db', 0.0))
+        dur_sec = clip['duration_seconds']
+        name = clip['name']
+        fpath = clip['file_path']
+        warp2 = warp_sec(bpm)
+
+        on_id     = _nid()
+        send0_at  = _nid(); send0_mt = _nid()
+        send1_at  = _nid(); send1_mt = _nid()
+        spk_id    = _nid()
+        pan_at    = _nid(); pan_mt = _nid()
+        vol_at    = _nid(); vol_mt = _nid()
+        pointee_id = _nid()
+        clip_at   = _nid()
+        frz_on    = _nid(); frz_pt = _nid()
+
+        sends = f'''						<TrackSendHolder Id="0">
+							<Send>
+								<LomId Value="0" /><Manual Value="0.0003162277571" />
+								<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1" /></MidiControllerRange>
+								<AutomationTarget Id="{send0_at}"><LockEnvelope Value="0" /></AutomationTarget>
+								<ModulationTarget Id="{send0_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+							</Send>
+							<Active Value="true" />
+						</TrackSendHolder>
+						<TrackSendHolder Id="1">
+							<Send>
+								<LomId Value="0" /><Manual Value="0.0003162277571" />
+								<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1" /></MidiControllerRange>
+								<AutomationTarget Id="{send1_at}"><LockEnvelope Value="0" /></AutomationTarget>
+								<ModulationTarget Id="{send1_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+							</Send>
+							<Active Value="true" />
+						</TrackSendHolder>'''
+
+        return f'''		<AudioTrack Id="{track_id}">
+			<LomId Value="0" /><LomIdView Value="0" />
+			<IsContentSelectedInDocument Value="false" /><PreferredContentViewMode Value="0" />
+			<TrackDelay><Value Value="0" /><IsValueSampleBased Value="false" /></TrackDelay>
+			<Name>
+				<EffectiveName Value="{name}" /><UserName Value="{name}" />
+				<Annotation Value="" /><MemorizedFirstClipName Value="{name}" />
+			</Name>
+			<Color Value="0" />
+			<AutomationEnvelopes><Envelopes /></AutomationEnvelopes>
+			<TrackGroupId Value="-1" /><TrackUnfolded Value="true" />
+			<DevicesListWrapper LomId="0" /><ClipSlotsListWrapper LomId="0" />
+			<ViewData Value="{{}}" />
+			<TakeLanes><TakeLanes /><AreTakeLanesFolded Value="true" /></TakeLanes>
+			<LinkedTrackGroupId Value="-1" />
+			<SavedPlayingSlot Value="-1" /><SavedPlayingOffset Value="0" />
+			<Freeze Value="false" /><VelocityDetail Value="0" />
+			<NeedArrangerRefreeze Value="true" /><PostProcessFreezeClips Value="0" />
+			<DeviceChain>
+				<AutomationLanes>
+					<AutomationLanes>
+						<AutomationLane Id="0">
+							<SelectedDevice Value="1" /><SelectedEnvelope Value="0" />
+							<IsContentSelectedInDocument Value="false" /><LaneHeight Value="68" />
+						</AutomationLane>
+					</AutomationLanes>
+					<AreAdditionalAutomationLanesFolded Value="false" />
+				</AutomationLanes>
+				<ClipEnvelopeChooserViewState>
+					<SelectedDevice Value="1" /><SelectedEnvelope Value="0" /><PreferModulationVisible Value="true" />
+				</ClipEnvelopeChooserViewState>
+{routing_block("Ext. In", "1")}
+				<Mixer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{on_id}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{pointee_id}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<Sends>
+{sends}
+					</Sends>
+					<Speaker>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{spk_id}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</Speaker>
+					<SoloSink Value="false" /><PanMode Value="0" />
+					<Pan>
+						<LomId Value="0" /><Manual Value="0" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Pan>
+					<Volume>
+						<LomId Value="0" /><Manual Value="{repr(amp)}" />
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
+						<AutomationTarget Id="{vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Volume>
+					<ViewStateSesstionTrackWidth Value="74" />
+					<CrossFadeState Value="0" /><SendsListWrapper LomId="0" />
+				</Mixer>
+				<MainSequencer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{clip_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{_nid()}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<MonitoringEnum Value="1" />
+					<Sample>
+						<ArrangerAutomation>
+							<Events>
+								<AudioClip Id="{clip_idx}" Time="0">
+									<LomId Value="0" /><LomIdView Value="0" />
+									<CurrentStart Value="0" /><CurrentEnd Value="{repr(float(loop_end_beat))}" />
+									<Loop>
+										<LoopStart Value="0" /><LoopEnd Value="{repr(dur_sec)}" />
+										<StartRelative Value="0" /><LoopOn Value="false" />
+										<OutMarker Value="{repr(dur_sec)}" />
+										<HiddenLoopStart Value="0" /><HiddenLoopEnd Value="{repr(dur_sec)}" />
+									</Loop>
+									<Name Value="{name}" /><Annotation Value="" /><Color Value="0" />
+									<LaunchMode Value="0" /><LaunchQuantisation Value="0" />
+									<TimeSignature>
+										<TimeSignatures>
+											<RemoteableTimeSignature Id="0">
+												<Numerator Value="{initial_num}" />
+												<Denominator Value="{initial_den}" />
+												<Time Value="0" />
+											</RemoteableTimeSignature>
+										</TimeSignatures>
+									</TimeSignature>
+									<Envelopes><Envelopes /></Envelopes>
+									<ScrollerTimePreserver><LeftTime Value="0" /><RightTime Value="0" /></ScrollerTimePreserver>
+									<TimeSelection><AnchorTime Value="0" /><OtherTime Value="0" /></TimeSelection>
+									<Legato Value="false" /><Ram Value="false" />
+									<GrooveSettings><GrooveId Value="-1" /></GrooveSettings>
+									<Disabled Value="false" /><VelocityAmount Value="0" />
+									<FollowAction>
+										<FollowTime Value="4" /><IsLinked Value="true" /><LoopIterations Value="1" />
+										<FollowActionA Value="4" /><FollowActionB Value="0" />
+										<FollowChanceA Value="100" /><FollowChanceB Value="0" />
+										<JumpIndexA Value="1" /><JumpIndexB Value="1" />
+										<FollowActionEnabled Value="false" />
+									</FollowAction>
+									<Grid>
+										<FixedNumerator Value="1" /><FixedDenominator Value="16" />
+										<GridIntervalPixel Value="20" /><Ntoles Value="2" />
+										<SnapToGrid Value="true" /><Fixed Value="false" />
+									</Grid>
+									<FreezeStart Value="0" /><FreezeEnd Value="0" />
+									<IsWarped Value="false" />
+									<TakeId Value="1" />
+									<SampleRef>
+										<FileRef>
+											<RelativePathType Value="1" />
+											<RelativePath Value="" />
+											<Path Value="{fpath}" />
+											<Type Value="2" />
+											<LivePackName Value="" /><LivePackId Value="" />
+											<OriginalFileSize Value="0" /><OriginalCrc Value="0" />
+										</FileRef>
+										<LastModDate Value="0" />
+										<SourceContext />
+										<SampleUsageHint Value="0" />
+										<DefaultDuration Value="0" />
+										<DefaultSampleRate Value="44100" />
+									</SampleRef>
+									<Onsets><UserOnsets /><HasUserOnsets Value="false" /></Onsets>
+									<WarpMode Value="4" />
+									<GranularityTones Value="30" /><GranularityTexture Value="65" />
+									<FluctuationTexture Value="25" /><TransientResolution Value="6" />
+									<TransientLoopMode Value="2" /><TransientEnvelope Value="100" />
+									<ComplexProFormants Value="100" /><ComplexProEnvelope Value="128" />
+									<Sync Value="true" /><HiQ Value="true" /><Fade Value="false" />
+									<Fades>
+										<FadeInLength Value="0" /><FadeOutLength Value="0" />
+										<ClipFadesAreInitialized Value="true" /><CrossfadeInState Value="0" />
+										<FadeInCurveSkew Value="0" /><FadeInCurveSlope Value="0" />
+										<FadeOutCurveSkew Value="0" /><FadeOutCurveSlope Value="0" />
+										<IsDefaultFadeIn Value="false" /><IsDefaultFadeOut Value="false" />
+									</Fades>
+									<PitchCoarse Value="0" /><PitchFine Value="0" />
+									<SampleVolume Value="1" />
+									<WarpMarkers>
+										<WarpMarker Id="0" SecTime="0" BeatTime="0" />
+										<WarpMarker Id="1" SecTime="{warp2}" BeatTime="0.03125" />
+									</WarpMarkers>
+									<SavedWarpMarkersForStretched />
+									<MarkersGenerated Value="true" />
+									<IsSongTempoMaster Value="false" />
+								</AudioClip>
+							</Events>
+							<AutomationTransformViewState>
+								<IsTransformPending Value="false" /><TimeAndValueTransforms />
+							</AutomationTransformViewState>
+						</ArrangerAutomation>
+					</Sample>
+					<VolumeModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></VolumeModulationTarget>
+					<TranspositionModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></TranspositionModulationTarget>
+					<GrainSizeModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></GrainSizeModulationTarget>
+					<FluxModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></FluxModulationTarget>
+					<SampleOffsetModulationTarget Id="{_nid()}"><LockEnvelope Value="0" /></SampleOffsetModulationTarget>
+					<PitchViewScrollPosition Value="-1073741824" />
+					<SampleOffsetModulationScrollPosition Value="-1073741824" />
+					<Recorder><IsArmed Value="false" /><TakeCounter Value="1" /></Recorder>
+				</MainSequencer>
+{freeze_seq(frz_on, frz_pt)}
+			</DeviceChain>
+		</AudioTrack>'''
+
+    # ── return track builder ──────────────────────────────────────────────────
+    def return_track(track_id, label):
+        on_id = _nid(); spk_id = _nid()
+        pan_at = _nid(); pan_mt = _nid(); vol_at = _nid(); vol_mt = _nid()
+        pointee_id = _nid()
+        return f'''		<ReturnTrack Id="{track_id}">
+			<LomId Value="0" /><LomIdView Value="0" />
+			<IsContentSelectedInDocument Value="false" /><PreferredContentViewMode Value="0" />
+			<TrackDelay><Value Value="0" /><IsValueSampleBased Value="false" /></TrackDelay>
+			<Name>
+				<EffectiveName Value="{label}" /><UserName Value="" />
+				<Annotation Value="" /><MemorizedFirstClipName Value="" />
+			</Name>
+			<Color Value="1" />
+			<AutomationEnvelopes><Envelopes /></AutomationEnvelopes>
+			<TrackGroupId Value="-1" /><TrackUnfolded Value="false" />
+			<DevicesListWrapper LomId="0" /><ClipSlotsListWrapper LomId="0" />
+			<ViewData Value="{{}}" />
+			<TakeLanes><TakeLanes /><AreTakeLanesFolded Value="true" /></TakeLanes>
+			<LinkedTrackGroupId Value="-1" />
+			<DeviceChain>
+				<AutomationLanes>
+					<AutomationLanes>
+						<AutomationLane Id="0">
+							<SelectedDevice Value="1" /><SelectedEnvelope Value="0" />
+							<IsContentSelectedInDocument Value="false" /><LaneHeight Value="68" />
+						</AutomationLane>
+					</AutomationLanes>
+					<AreAdditionalAutomationLanesFolded Value="false" />
+				</AutomationLanes>
+				<ClipEnvelopeChooserViewState>
+					<SelectedDevice Value="1" /><SelectedEnvelope Value="0" /><PreferModulationVisible Value="false" />
+				</ClipEnvelopeChooserViewState>
+{routing_block("Ext. In", "1", "Ext. Out", "1/2")}
+				<Mixer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{on_id}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{pointee_id}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<Sends />
+					<Speaker>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{spk_id}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</Speaker>
+					<SoloSink Value="false" /><PanMode Value="0" />
+					<Pan>
+						<LomId Value="0" /><Manual Value="0" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Pan>
+					<Volume>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
+						<AutomationTarget Id="{vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Volume>
+					<ViewStateSesstionTrackWidth Value="74" />
+					<CrossFadeState Value="0" /><SendsListWrapper LomId="0" />
+				</Mixer>
+			</DeviceChain>
+		</ReturnTrack>'''
+
+    # ── assemble all tracks ───────────────────────────────────────────────────
+    n = len(clips)
+    track_blocks = [audio_track(i, i, c) for i, c in enumerate(clips)]
+    track_blocks.append(return_track(n,     "A-Return"))
+    track_blocks.append(return_track(n + 1, "B-Return"))
+    tracks_xml = '\n'.join(track_blocks)
+
+    # ── locators XML ──────────────────────────────────────────────────────────
+    loc_items = '\n'.join(
+        f'''			<Locator Id="{i}">
+				<LomId Value="0" />
+				<Time Value="{repr(float(loc['beat']))}" />
+				<Name Value="{loc['name']}" />
+				<Annotation Value="" />
+				<IsSongStart Value="false" />
+			</Locator>'''
+        for i, loc in enumerate(sorted(locators, key=lambda x: x['beat']))
+    )
+
+    # ── 8 minimal scenes ──────────────────────────────────────────────────────
+    scenes_xml = '\n'.join(f'''		<Scene Id="{i}">
+			<FollowAction>
+				<FollowTime Value="4" /><IsLinked Value="true" /><LoopIterations Value="1" />
+				<FollowActionA Value="4" /><FollowActionB Value="0" />
+				<FollowChanceA Value="100" /><FollowChanceB Value="0" />
+				<JumpIndexA Value="1" /><JumpIndexB Value="1" />
+				<FollowActionEnabled Value="false" />
+			</FollowAction>
+			<Name Value="" /><Annotation Value="" /><Color Value="-1" />
+			<Tempo Value="120" /><IsTempoEnabled Value="false" />
+			<TimeSignatureId Value="{initial_ts_val}" /><IsTimeSignatureEnabled Value="false" />
+			<LomId Value="0" /><ClipSlotsListWrapper LomId="0" />
+		</Scene>''' for i in range(8))
+
+    # ── master track minimal PreHear ──────────────────────────────────────────
+    prehear_on = _nid(); prehear_spk = _nid(); prehear_pan_at = _nid(); prehear_pan_mt = _nid()
+    prehear_vol_at = _nid(); prehear_vol_mt = _nid(); prehear_pt = _nid()
+
+    # ── final NextPointeeId ───────────────────────────────────────────────────
+    next_id = _idc[0] + 100
+
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Ableton MajorVersion="5" MinorVersion="11.0_11300" SchemaChangeCount="7" Creator="Ableton Live 11.3.43" Revision="">
+	<LiveSet>
+		<NextPointeeId Value="{next_id}" />
+		<OverwriteProtectionNumber Value="2819" />
+		<LomId Value="0" />
+		<LomIdView Value="0" />
+		<Tracks>
+{tracks_xml}
+		</Tracks>
+		<MasterTrack>
+			<LomId Value="0" /><LomIdView Value="0" />
+			<IsContentSelectedInDocument Value="false" /><PreferredContentViewMode Value="0" />
+			<TrackDelay><Value Value="0" /><IsValueSampleBased Value="false" /></TrackDelay>
+			<Name>
+				<EffectiveName Value="Master" /><UserName Value="" />
+				<Annotation Value="" /><MemorizedFirstClipName Value="" />
+			</Name>
+			<Color Value="16" />
+			<AutomationEnvelopes>
+				<Envelopes>
+					<AutomationEnvelope Id="0">
+						<EnvelopeTarget><PointeeId Value="10" /></EnvelopeTarget>
+						<Automation>
+							<Events>
+{ts_enum_events}
+							</Events>
+							<AutomationTransformViewState>
+								<IsTransformPending Value="false" /><TimeAndValueTransforms />
+							</AutomationTransformViewState>
+						</Automation>
+					</AutomationEnvelope>
+					<AutomationEnvelope Id="1">
+						<EnvelopeTarget><PointeeId Value="8" /></EnvelopeTarget>
+						<Automation>
+							<Events>
+{tempo_float_events}
+							</Events>
+							<AutomationTransformViewState>
+								<IsTransformPending Value="false" /><TimeAndValueTransforms />
+							</AutomationTransformViewState>
+						</Automation>
+					</AutomationEnvelope>
+				</Envelopes>
+			</AutomationEnvelopes>
+			<TrackGroupId Value="-1" /><TrackUnfolded Value="false" />
+			<DevicesListWrapper LomId="0" /><ClipSlotsListWrapper LomId="0" />
+			<ViewData Value="{{}}" />
+			<TakeLanes><TakeLanes /><AreTakeLanesFolded Value="true" /></TakeLanes>
+			<LinkedTrackGroupId Value="-1" />
+			<DeviceChain>
+				<AutomationLanes>
+					<AutomationLanes>
+						<AutomationLane Id="0">
+							<SelectedDevice Value="1" /><SelectedEnvelope Value="0" />
+							<IsContentSelectedInDocument Value="false" /><LaneHeight Value="85" />
+						</AutomationLane>
+					</AutomationLanes>
+					<AreAdditionalAutomationLanesFolded Value="false" />
+				</AutomationLanes>
+				<ClipEnvelopeChooserViewState>
+					<SelectedDevice Value="0" /><SelectedEnvelope Value="0" /><PreferModulationVisible Value="false" />
+				</ClipEnvelopeChooserViewState>
+				<AudioInputRouting>
+					<Target Value="AudioIn/External/S0" /><UpperDisplayString Value="Ext. In" /><LowerDisplayString Value="1/2" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</AudioInputRouting>
+				<MidiInputRouting>
+					<Target Value="MidiIn/External.All/-1" /><UpperDisplayString Value="Ext: All Ins" /><LowerDisplayString Value="" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</MidiInputRouting>
+				<AudioOutputRouting>
+					<Target Value="AudioOut/External/S0" /><UpperDisplayString Value="Ext. Out" /><LowerDisplayString Value="1/2" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</AudioOutputRouting>
+				<MidiOutputRouting>
+					<Target Value="MidiOut/None" /><UpperDisplayString Value="None" /><LowerDisplayString Value="" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</MidiOutputRouting>
+				<Mixer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="1"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="2" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<Sends />
+					<Speaker>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="3"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</Speaker>
+					<SoloSink Value="false" /><PanMode Value="0" />
+					<Pan>
+						<LomId Value="0" /><Manual Value="0" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="4"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="5"><LockEnvelope Value="0" /></ModulationTarget>
+					</Pan>
+					<Volume>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
+						<AutomationTarget Id="6"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="7"><LockEnvelope Value="0" /></ModulationTarget>
+					</Volume>
+					<SendsListWrapper LomId="0" />
+					<Tempo>
+						<LomId Value="0" />
+						<Manual Value="{repr(float(bpm))}" />
+						<MidiControllerRange><Min Value="60" /><Max Value="200" /></MidiControllerRange>
+						<AutomationTarget Id="8"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="9"><LockEnvelope Value="0" /></ModulationTarget>
+					</Tempo>
+					<TimeSignature>
+						<LomId Value="0" />
+						<Manual Value="{initial_ts_val}" />
+						<AutomationTarget Id="10"><LockEnvelope Value="0" /></AutomationTarget>
+					</TimeSignature>
+					<GlobalGrooveAmount>
+						<LomId Value="0" /><Manual Value="100" />
+						<MidiControllerRange><Min Value="0" /><Max Value="131.25" /></MidiControllerRange>
+						<AutomationTarget Id="11"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="12"><LockEnvelope Value="0" /></ModulationTarget>
+					</GlobalGrooveAmount>
+					<CrossFade>
+						<LomId Value="0" /><Manual Value="0" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="13"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="14"><LockEnvelope Value="0" /></ModulationTarget>
+					</CrossFade>
+					<TempoAutomationViewBottom Value="60" />
+					<TempoAutomationViewTop Value="200" />
+				</Mixer>
+				<FreezeSequencer>
+					<AudioSequencer Id="0">
+						<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+						<On>
+							<LomId Value="0" /><Manual Value="true" />
+							<AutomationTarget Id="15"><LockEnvelope Value="0" /></AutomationTarget>
+							<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+						</On>
+						<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+						<Pointee Id="16" />
+						<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+						<LastPresetRef><Value /></LastPresetRef>
+						<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="true" />
+						<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+						<ClipSlotList>
+							<ClipSlot Id="0"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /></ClipSlot>
+						</ClipSlotList>
+						<MonitoringEnum Value="1" />
+						<Sample><ArrangerAutomation><Events /></ArrangerAutomation></Sample>
+					</AudioSequencer>
+				</FreezeSequencer>
+				<DevicesListWrapper LomId="0" />
+			</DeviceChain>
+		</MasterTrack>
+		<PreHearTrack>
+			<LomId Value="0" /><LomIdView Value="0" />
+			<IsContentSelectedInDocument Value="false" /><PreferredContentViewMode Value="0" />
+			<TrackDelay><Value Value="0" /><IsValueSampleBased Value="false" /></TrackDelay>
+			<Name>
+				<EffectiveName Value="Master" /><UserName Value="" />
+				<Annotation Value="" /><MemorizedFirstClipName Value="" />
+			</Name>
+			<Color Value="-1" />
+			<AutomationEnvelopes><Envelopes /></AutomationEnvelopes>
+			<TrackGroupId Value="-1" /><TrackUnfolded Value="false" />
+			<DevicesListWrapper LomId="0" /><ClipSlotsListWrapper LomId="0" />
+			<ViewData Value="{{}}" />
+			<TakeLanes><TakeLanes /><AreTakeLanesFolded Value="true" /></TakeLanes>
+			<LinkedTrackGroupId Value="-1" />
+			<DeviceChain>
+				<AutomationLanes>
+					<AutomationLanes>
+						<AutomationLane Id="0">
+							<SelectedDevice Value="0" /><SelectedEnvelope Value="0" />
+							<IsContentSelectedInDocument Value="false" /><LaneHeight Value="85" />
+						</AutomationLane>
+					</AutomationLanes>
+					<AreAdditionalAutomationLanesFolded Value="false" />
+				</AutomationLanes>
+				<ClipEnvelopeChooserViewState>
+					<SelectedDevice Value="0" /><SelectedEnvelope Value="0" /><PreferModulationVisible Value="false" />
+				</ClipEnvelopeChooserViewState>
+				<AudioInputRouting>
+					<Target Value="AudioIn/External/S0" /><UpperDisplayString Value="Ext. In" /><LowerDisplayString Value="1/2" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</AudioInputRouting>
+				<MidiInputRouting>
+					<Target Value="MidiIn/External.All/-1" /><UpperDisplayString Value="Ext: All Ins" /><LowerDisplayString Value="" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</MidiInputRouting>
+				<AudioOutputRouting>
+					<Target Value="AudioOut/External/S0" /><UpperDisplayString Value="Ext. Out" /><LowerDisplayString Value="1/2" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</AudioOutputRouting>
+				<MidiOutputRouting>
+					<Target Value="MidiOut/None" /><UpperDisplayString Value="None" /><LowerDisplayString Value="" />
+					<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+				</MidiOutputRouting>
+				<Mixer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{prehear_on}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{prehear_pt}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<Sends />
+					<Speaker>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{prehear_spk}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</Speaker>
+					<SoloSink Value="false" /><PanMode Value="0" />
+					<Pan>
+						<LomId Value="0" /><Manual Value="0" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{prehear_pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{prehear_pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Pan>
+					<Volume>
+						<LomId Value="0" /><Manual Value="0.7071067691" />
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
+						<AutomationTarget Id="{prehear_vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{prehear_vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</Volume>
+					<SendsListWrapper LomId="0" />
+				</Mixer>
+			</DeviceChain>
+		</PreHearTrack>
+		<SendsPre>
+			<SendPreBool Id="0" Value="false" />
+			<SendPreBool Id="1" Value="false" />
+		</SendsPre>
+		<Scenes>
+{scenes_xml}
+		</Scenes>
+		<Transport>
+			<LoopOn Value="true" />
+			<LoopStart Value="0" />
+			<LoopLength Value="{repr(float(loop_end_beat))}" />
+			<LoopIsSongStart Value="false" />
+			<CurrentTime Value="0" />
+			<PunchIn Value="false" />
+			<PunchOut Value="false" />
+			<MetronomeTickDuration Value="0" />
+			<DrawMode Value="false" />
+		</Transport>
+		<SongMasterValues><SessionScrollerPos X="0" Y="0" /></SongMasterValues>
+		<SignalModulations />
+		<GlobalQuantisation Value="4" />
+		<AutoQuantisation Value="0" />
+		<Grid>
+			<FixedNumerator Value="1" /><FixedDenominator Value="16" /><GridIntervalPixel Value="20" />
+			<Ntoles Value="2" /><SnapToGrid Value="true" /><Fixed Value="false" />
+		</Grid>
+		<ScaleInformation><RootNote Value="0" /><Name Value="Major" /></ScaleInformation>
+		<InKey Value="false" /><SmpteFormat Value="0" />
+		<TimeSelection><AnchorTime Value="0" /><OtherTime Value="0" /></TimeSelection>
+		<SequencerNavigator>
+			<BeatTimeHelper><CurrentZoom Value="0.25" /></BeatTimeHelper>
+			<ScrollerPos X="0" Y="0" /><ClientSize X="1200" Y="800" />
+		</SequencerNavigator>
+		<IsContentSelectedInDocument Value="false" />
+		<SignalModulations />
+		<ContentSplitterProperties>
+			<IsExpanded Value="true" /><Height Value="300" /><Minimized Value="false" />
+		</ContentSplitterProperties>
+		<ViewStateSessionMixerHeight Value="120" />
+		<Locators>
+			<Locators>
+{loc_items}
+			</Locators>
+		</Locators>
+		<ViewStates>
+			<SessionIO Value="1" /><SessionSends Value="1" /><SessionReturns Value="1" />
+			<SessionMixer Value="1" /><SessionMixerI Value="1" />
+			<ArrangerIO Value="1" /><ArrangerReturns Value="1" /><ArrangerMixer Value="1" />
+		</ViewStates>
+	</LiveSet>
+</Ableton>'''
+
+    import gzip as _gzip
+    with _gzip.open(output_path, 'wb') as f:
+        f.write(xml.encode('utf-8'))
+    return {"path": output_path}
+
+
 def run_server():
     """Long-running mode: read file paths from stdin, write JSON to stdout.
     Protocol:
@@ -1551,6 +2300,17 @@ def run_server():
                         cmd.get("time_sig_events", []),
                         cmd.get("locator_overrides", []),
                         cmd.get("output_path") or None,
+                    )
+                    print(json.dumps(result), flush=True)
+                elif action == "generate_als":
+                    result = _generate_als(
+                        output_path=cmd["output_path"],
+                        clips=cmd.get("clips", []),
+                        bpm=float(cmd.get("bpm", 120.0)),
+                        tempo_events=cmd.get("tempo_events", []),
+                        time_signatures=cmd.get("time_signatures", []),
+                        locators=cmd.get("locators", []),
+                        loop_end_beat=float(cmd.get("loop_end_beat", 0.0)),
                     )
                     print(json.dumps(result), flush=True)
                 else:
