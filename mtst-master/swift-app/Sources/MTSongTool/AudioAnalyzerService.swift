@@ -786,15 +786,18 @@ class AudioAnalyzerService: ObservableObject {
 
                     var cursor = 0.0
                     for seg in sorted {
-                        let gapDur = seg.sessionStart - cursor
+                        let preRoll = max(0.0, -seg.sessionStart)
+                        let effSessionStart = seg.sessionStart + preRoll  // = max(0, sessionStart)
+                        let effSourceStart  = seg.sourceStart  + preRoll
+                        let gapDur = effSessionStart - cursor
                         if gapDur > 0.001 {
                             filterParts.append("aevalsrc=0:d=\(String(format: "%.6f", gapDur))[g\(pieceIdx)]")
                             concatInputs.append("[g\(pieceIdx)]")
                             pieceIdx += 1
                         }
-                        filterParts.append("[0:a]atrim=start=\(String(format: "%.6f", seg.sourceStart)):end=\(String(format: "%.6f", seg.sourceEnd)),asetpts=PTS-STARTPTS[s\(pieceIdx)]")
+                        filterParts.append("[0:a]atrim=start=\(String(format: "%.6f", effSourceStart)):end=\(String(format: "%.6f", seg.sourceEnd)),asetpts=PTS-STARTPTS[s\(pieceIdx)]")
                         concatInputs.append("[s\(pieceIdx)]")
-                        cursor = seg.sessionEnd
+                        cursor = effSessionStart + (seg.sourceEnd - effSourceStart)
                         pieceIdx += 1
                     }
 
@@ -959,18 +962,21 @@ class AudioAnalyzerService: ObservableObject {
                     var cursor = 0.0
 
                     for (segI, seg) in sorted.enumerated() {
-                        let gapDur = seg.sessionStart - cursor
+                        let preRoll = max(0.0, -seg.sessionStart)
+                        let effSessionStart = seg.sessionStart + preRoll
+                        let effSourceStart  = seg.sourceStart  + preRoll
+                        let gapDur = effSessionStart - cursor
                         if gapDur > 0.001 {
                             filterParts.append("aevalsrc=0:d=\(String(format: "%.9f", gapDur))[g\(pieceIdx)]")
                             concatInputs.append("[g\(pieceIdx)]")
                             pieceIdx += 1
                         }
-                        var trimFilter = "[0:a]atrim=start=\(String(format: "%.9f", seg.sourceStart)):end=\(String(format: "%.9f", seg.sourceEnd)),asetpts=PTS-STARTPTS"
+                        var trimFilter = "[0:a]atrim=start=\(String(format: "%.9f", effSourceStart)):end=\(String(format: "%.9f", seg.sourceEnd)),asetpts=PTS-STARTPTS"
                         if autoFadeCuts && segI > 0 { trimFilter += ",afade=t=in:st=0:d=0.01" }
                         trimFilter += "[s\(pieceIdx)]"
                         filterParts.append(trimFilter)
                         concatInputs.append("[s\(pieceIdx)]")
-                        cursor = seg.sessionEnd
+                        cursor = effSessionStart + (seg.sourceEnd - effSourceStart)
                         pieceIdx += 1
                     }
 
