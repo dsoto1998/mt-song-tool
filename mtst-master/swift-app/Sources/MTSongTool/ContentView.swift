@@ -108,7 +108,7 @@ struct ContentView: View {
                         analyzer: audioAnalyzer,
                         parsedResult: parser.result,
                         onLocatorFix: { fixes in applyLocatorFixes(fixes) },
-                        onSaveEdits: { newPath in loadNewFile(path: newPath); qaTabFlash = true },
+                        onSaveEdits: { newPath in reparseAfterSave(path: newPath); qaTabFlash = true },
                         alsFullPath: parser.alsPath,
                         mtCompleteMode: userSettings.mtCompleteMode,
                         onFolderDrop: { url in handleFolderDrop(url) },
@@ -759,6 +759,14 @@ struct ContentView: View {
         parser.errorMessage = nil
         resetSongData()
         audioAnalyzer.reset()
+        parser.parse(alsPath: path)
+    }
+
+    /// Re-parse after Edit tab Save — skips audioAnalyzer.reset() so Edit tab stems stay loaded.
+    private func reparseAfterSave(path: String) {
+        parser.result = nil
+        parser.errorMessage = nil
+        resetSongData()
         parser.parse(alsPath: path)
     }
 

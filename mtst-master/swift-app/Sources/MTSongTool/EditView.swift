@@ -581,14 +581,7 @@ struct EditView: View {
                 Button {
                     Task { await saveSession() }
                 } label: {
-                    HStack(spacing: 3) {
-                        Text("Save Session")
-                        if editPlayer.isSessionDirty && parsedResult != nil {
-                            Circle()
-                                .fill(Color.accent)
-                                .frame(width: 5, height: 5)
-                        }
-                    }
+                    Text("Save Session")
                 }
                 .font(.lato(size: 11, weight: .semibold))
                 .foregroundColor(editPlayer.isSessionDirty && parsedResult != nil ? Color.accent : Color.fgMid)
@@ -596,6 +589,16 @@ struct EditView: View {
                 .disabled(!editPlayer.isSessionDirty || parsedResult == nil)
                 .help("Write tempo map, time signatures, and locator edits back to the .als file  ⌘S")
                 .keyboardShortcut("s", modifiers: .command)
+                .overlay(alignment: .topTrailing) {
+                    if editPlayer.isSessionDirty && parsedResult != nil {
+                        Circle()
+                            .fill(Color.accent)
+                            .frame(width: 7, height: 7)
+                            .offset(x: 3, y: -3)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .animation(.spring(duration: 0.2), value: editPlayer.isSessionDirty)
 
                 Button("Save As…") {
                     Task { await saveSessionAs() }
