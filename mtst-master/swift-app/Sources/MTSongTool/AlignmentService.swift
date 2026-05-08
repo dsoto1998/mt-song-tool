@@ -113,11 +113,17 @@ struct AlignmentService {
 
         let refFileDur    = Double(refFile.length) / sr
         let minStemDur    = openStems.map { Double($0.file.length) / sr }.min() ?? 0
-        let probeMax      = min(refFileDur, minStemDur, probeMaxSeconds)
 
-        var windowStart = 1.0
+        // OG may be offset in the session (e.g. user moved it). Track its session start so
+        // the bus search window is centred on the same file content as the ref window.
+        let ogOffset   = refState.segments.first?.sessionStart ?? 0
+        let probeMax   = min(refFileDur, minStemDur, probeMaxSeconds) + ogOffset
+
+        var windowStart = ogOffset + 1.0
         while windowStart + refWindowSeconds <= probeMax {
-            let busWindowStart = max(0, windowStart - maxOffsetSeconds)
+            // Bus window centres on the same file-content range as refBuf, regardless of
+            // where OG sits in the session timeline.
+            let busWindowStart = max(0, (windowStart - ogOffset) - maxOffsetSeconds)
 
             guard let refBuf = renderMono(state: refState,
                                            fromSeconds: windowStart, length: refLen,
