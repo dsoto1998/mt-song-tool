@@ -173,29 +173,35 @@ struct EditView: View {
     /// Called whenever the session or stems change so the grid fills the entire scrollable area.
     /// Uses editableTempoEvents (user-edited) when available, falls back to parsedResult events.
     private func rebuildBeatSchedule() {
-        guard let result = parsedResult else { return }
-        let audioDur = result.expectedDuration ?? editPlayer.totalDuration
-        guard audioDur > 0 else { return }
-        let tempoEvs = editPlayer.editableTempoEvents.isEmpty ? result.tempoEvents : editPlayer.editableTempoEvents
-        let timeSigsToUse: [TimeSig] = editPlayer.timeSigOverrides.isEmpty
-            ? result.timeSignatures
-            : editPlayer.timeSigOverrides.map { ev in TimeSig(time: "", sig: ev.sig, beat: ev.beat) }
+        let audioDur: Double
+        let tempoEvs: [TempoEvent]
+        let timeSigsToUse: [TimeSig]
+        let staticBPM: Double
+
+        if let result = parsedResult {
+            audioDur = result.expectedDuration ?? editPlayer.totalDuration
+            guard audioDur > 0 else { return }
+            tempoEvs = editPlayer.editableTempoEvents.isEmpty ? result.tempoEvents : editPlayer.editableTempoEvents
+            timeSigsToUse = editPlayer.timeSigOverrides.isEmpty
+                ? result.timeSignatures
+                : editPlayer.timeSigOverrides.map { ev in TimeSig(time: "", sig: ev.sig, beat: ev.beat) }
+            staticBPM = result.bpm ?? 120.0
+        } else if editPlayer.totalDuration > 0, let bpmVal = Double(buildStore.bpm), bpmVal > 0 {
+            // No parsed session yet — use Build Session fields to drive the grid.
+            audioDur = editPlayer.totalDuration
+            tempoEvs = []
+            timeSigsToUse = [TimeSig(time: "", sig: buildStore.timeSig, beat: 0)]
+            staticBPM = bpmVal
+        } else {
+            return
+        }
+
         // First pass: build up to audio end so lastBarSeconds is accurate.
-        metronome.buildSchedule(
-            tempoEvents: tempoEvs,
-            timeSigs: timeSigsToUse,
-            totalDuration: audioDur,
-            staticBPM: result.bpm
-        )
+        metronome.buildSchedule(tempoEvents: tempoEvs, timeSigs: timeSigsToUse, totalDuration: audioDur, staticBPM: staticBPM)
         // Second pass: extend to cover the full canvas (10-bar tail + any scroll padding).
         let extendedDur = canvasDuration
         guard extendedDur > audioDur else { return }
-        metronome.buildSchedule(
-            tempoEvents: tempoEvs,
-            timeSigs: timeSigsToUse,
-            totalDuration: extendedDur,
-            staticBPM: result.bpm
-        )
+        metronome.buildSchedule(tempoEvents: tempoEvs, timeSigs: timeSigsToUse, totalDuration: extendedDur, staticBPM: staticBPM)
     }
 
     /// Canvas width = totalDuration + 10 bars of empty space + any dynamic right padding grown from scrolling.
@@ -356,6 +362,12 @@ struct EditView: View {
                 confirmRemoveStemURLs = []
             }
             Button("Cancel", role: .cancel) { confirmRemoveStemURLs = [] }
+        }
+        .onChange(of: buildStore.bpm) { _ in
+            if parsedResult == nil { rebuildBeatSchedule() }
+        }
+        .onChange(of: buildStore.timeSig) { _ in
+            if parsedResult == nil { rebuildBeatSchedule() }
         }
         .onChange(of: alsGen.phase) { phase in
             if case .done(let path) = phase {
