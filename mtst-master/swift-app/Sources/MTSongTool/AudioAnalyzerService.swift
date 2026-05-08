@@ -719,7 +719,7 @@ class AudioAnalyzerService: ObservableObject {
             }
 
             // Rescan the final folder (now carries the original folder name)
-            self.analyze(folder: folderToScan)
+            DispatchQueue.main.async { self.analyze(folder: folderToScan) }
         }
     }
 
@@ -892,7 +892,7 @@ class AudioAnalyzerService: ObservableObject {
                 completion(errors.isEmpty ? nil : errors.joined(separator: "\n"))
             }
 
-            self.analyze(folder: folderToScan)
+            DispatchQueue.main.async { self.analyze(folder: folderToScan) }
         }
     }
 
