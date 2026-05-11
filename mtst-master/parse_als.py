@@ -1061,6 +1061,59 @@ def _downgrade_to_live11(path):
         if patched is not m.group(0):
             content = content[:m.start()] + patched + content[m.end():]
 
+    # 30. Renumber low-range AudioTrack/MidiTrack/GroupTrack IDs to avoid collision
+    #     with Live 11 internal Pointee objects.
+    #
+    # Live 11 pre-allocates internal Pointee objects using IDs up to ~103 during
+    # session initialization. Sessions downgraded from Live 12 have AudioTrack/
+    # MidiTrack/GroupTrack IDs in the range 8-61 (one per track, assigned sequentially
+    # at session creation). These collide with Live 11 internal objects, causing
+    # CheckForClipOrSceneSelection() to crash at 0x0 (null virtual dispatch) ~4s
+    # after load.
+    #
+    # Reference: BB11 (native Live 11, stable) has tracks starting at Id=104.
+    # ReturnTrack IDs 2 and 3 are safe (Live 11 uses these IDs for return tracks
+    # consistently — BB11 stable with ReturnTrack 2,3 confirms this).
+    #
+    # Fix: renumber AudioTrack/MidiTrack/GroupTrack Id attributes below 200 to a
+    # fresh range above the current max Id. No PointeeId cross-references point to
+    # these track IDs (confirmed by inspection — no TrackRef/TrackGroupId elements
+    # reference them in these session types).
+
+    _TRACK_SAFE_THRESHOLD = 200
+    _track_tags = ('AudioTrack', 'MidiTrack', 'GroupTrack')
+
+    # Recompute max after all prior steps have run.
+    _all_ids_now = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
+    _cur_max = max(_all_ids_now) if _all_ids_now else 0
+    _next_safe = _cur_max + 200  # generous gap
+
+    _track_id_remap = {}
+    _track_open_re = re.compile(
+        r'<(' + '|'.join(_track_tags) + r')\s+Id="(\d+)"'
+    )
+    for _m in _track_open_re.finditer(content):
+        _old = int(_m.group(2))
+        if _old < _TRACK_SAFE_THRESHOLD and _old not in _track_id_remap:
+            _track_id_remap[_old] = _next_safe
+            _next_safe += 1
+
+    if _track_id_remap:
+        def _remap_track_open_id(m):
+            tag, old_s = m.group(1), m.group(2)
+            old = int(old_s)
+            return f'<{tag} Id="{_track_id_remap.get(old, old)}"'
+
+        content = _track_open_re.sub(_remap_track_open_id, content)
+
+        # Bump NextPointeeId above the new max so Live 11's allocator stays safe.
+        content = re.sub(
+            r'(<NextPointeeId\s+Value=")\d+(")',
+            f'\\g<1>{_next_safe + 100}\\g<2>',
+            content,
+            count=1,
+        )
+
     # Write output
     dir_name  = os.path.dirname(path)
     base_name = os.path.basename(path)
