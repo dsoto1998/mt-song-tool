@@ -63,5 +63,5 @@ The Python parser (`parse_als.py`) runs as a persistent server process. Swift se
 
 **Version**
 
-- Current release: **v1.5.0**
+- Current release: **v1.6.3**
 - See Release Notes.md for full changelog.
