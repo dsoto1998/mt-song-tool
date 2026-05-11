@@ -994,6 +994,73 @@ def _downgrade_to_live11(path):
             new_block = _clear_freeze_needrefreeze(track_xml)
             content = content[:m.start()] + new_block + content[m.end():]
 
+    # 29. Inject OriginalFileRef into AudioClips that lack it.
+    #
+    # Live 11 expects every AudioClip to carry an <OriginalFileRef> element (a FileRef
+    # pointing to the original source file, identical to SampleRef/FileRef for non-
+    # consolidated clips).  Sessions created natively in Live 12 omit this field.
+    # When Live 11's CheckForClipOrSceneSelection() timer iterates clips and accesses
+    # clip->originalFileRef, the null pointer causes KERN_INVALID_ADDRESS at 0x0.
+    #
+    # Fix: for each AudioClip that lacks <OriginalFileRef>, copy the SampleRef/FileRef
+    # and inject it as <OriginalFileRef>, followed by the empty housekeeping elements
+    # <BrowserContentPath> and <LocalFiltersJson> that Live 11 also expects nearby.
+
+    def _inject_original_file_ref_into_clip(clip_xml):
+        if '<OriginalFileRef>' in clip_xml:
+            return clip_xml
+
+        # Copy the FileRef from SampleRef to use as OriginalFileRef content.
+        sr_match = re.search(r'<SampleRef>.*?(<FileRef\b.*?</FileRef>)', clip_xml, re.DOTALL)
+        if sr_match:
+            file_ref_content = sr_match.group(1)
+        else:
+            # No SampleRef/FileRef found; inject a minimal empty FileRef so Live 11
+            # gets a non-null object to work with.
+            file_ref_content = (
+                '<FileRef>\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<RelativePathType Value="0" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<RelativePath Value="" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<Path Value="" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<Type Value="0" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<LivePackName Value="" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<LivePackId Value="" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<OriginalFileSize Value="0" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t\t<OriginalCrc Value="0" />\n'
+                '\t\t\t\t\t\t\t\t\t\t\t</FileRef>'
+            )
+
+        # Detect indentation from the IsSongTempoMaster line (same level as our injection).
+        indent_m = re.search(r'^(\t+)<IsSongTempoMaster', clip_xml, re.MULTILINE)
+        indent = indent_m.group(1) if indent_m else '\t\t\t\t\t\t\t\t\t\t'
+
+        injection = (
+            f'\n{indent}<OriginalFileRef>\n'
+            f'{indent}\t{file_ref_content}\n'
+            f'{indent}</OriginalFileRef>\n'
+            f'{indent}<BrowserContentPath Value="" />\n'
+            f'{indent}<LocalFiltersJson Value="" />'
+        )
+
+        # Insert after the self-closing <IsSongTempoMaster .../> tag.
+        iso_m = re.search(r'<IsSongTempoMaster\b[^>]*/>', clip_xml)
+        if iso_m:
+            pos = iso_m.end()
+            return clip_xml[:pos] + injection + clip_xml[pos:]
+
+        # Fallback: insert before </AudioClip>.
+        end_pos = clip_xml.rfind('</AudioClip>')
+        if end_pos != -1:
+            return clip_xml[:end_pos] + injection + '\n' + clip_xml[end_pos:]
+
+        return clip_xml
+
+    # Apply in reverse order so string offsets stay valid.
+    for m in reversed(list(re.finditer(r'<AudioClip\b.*?</AudioClip>', content, re.DOTALL))):
+        patched = _inject_original_file_ref_into_clip(m.group(0))
+        if patched is not m.group(0):
+            content = content[:m.start()] + patched + content[m.end():]
+
     # Write output
     dir_name  = os.path.dirname(path)
     base_name = os.path.basename(path)
