@@ -112,13 +112,17 @@ struct AlignmentService {
         let minStemDur = openStems.map { Double($0.file.length) / sr }.min() ?? 0
         let probeMax   = min(refFileDur, minStemDur, probeMaxSeconds) + ogOffset
 
+        Log("ogOffset=\(ogOffset)s, probeMax=\(probeMax)s, stems=\(openStems.count)", "Align")
+
         // Pass 0: very-coarse global cross-correlation (±300s at 22 Hz) with normalized
         // cosine similarity. Anchors the subsequent passes so the ±10s coarse pass can never
         // lock onto a spurious peak elsewhere in the song. Falls back to 0 if Pass 0 fails.
-        let veryCoarseHintSec = veryCoarsePass(
+        let pass0Result = veryCoarsePass(
             openStems: openStems, refFile: refFile, refState: refState,
             probeMax: probeMax
-        ) ?? 0
+        )
+        let veryCoarseHintSec = pass0Result ?? 0
+        Log("Pass 0 hint = \(pass0Result.map { String(format: "%.3f", $0) } ?? "nil")s", "Align")
 
         // Pass 1: coarse probe (±10s at 441 Hz) centred on the Pass 0 hint.
         // Returns ABSOLUTE offset (hint + measured lag).
@@ -127,9 +131,10 @@ struct AlignmentService {
             ogOffset: ogOffset, probeMax: probeMax,
             hintSec: veryCoarseHintSec
         ) else {
-            // No reliable coarse result — surface to user.
+            Log("Pass 1 returned nil → unableToDetermine", "Align")
             return .unableToDetermine
         }
+        Log("Pass 1 result = \(String(format: "%.3f", coarseOffsetSec))s", "Align")
 
         // Pass 2: guided fine (±150ms around coarse peak). Absolute lag = coarseHintSamples + fineLag.
         let guidedAbs = fineSweep(
@@ -139,11 +144,13 @@ struct AlignmentService {
         )
         if let fineLag = medianLag(guidedAbs) {
             let absoluteSamples = Int(coarseOffsetSec * sr) + fineLag
+            Log("Pass 2 fineLag=\(fineLag), absoluteSamples=\(absoluteSamples) → \(String(format: "%.1f", Double(absoluteSamples) / sr * 1000))ms", "Align")
             return .aligned(offsetMs: Double(absoluteSamples) / sr * 1000, samples: absoluteSamples)
         }
 
         // Fallback: return coarse result directly (~2ms precision).
         let coarseSamples = Int(coarseOffsetSec * sr)
+        Log("Pass 2 failed, using coarse fallback → \(String(format: "%.1f", coarseOffsetSec * 1000))ms", "Align")
         return .aligned(offsetMs: coarseOffsetSec * 1000, samples: coarseSamples)
     }
 
@@ -414,7 +421,11 @@ struct AlignmentService {
             }
         }
 
-        guard bestScore > veryCoarseConfidence else { return nil }
+        Log("Pass 0 bestLag=\(bestLag) (coarse samples), bestScore=\(String(format: "%.3f", bestScore)), coarseLen=\(coarseLen)", "Align")
+        guard bestScore > veryCoarseConfidence else {
+            Log("Pass 0 confidence \(String(format: "%.3f", bestScore)) < \(veryCoarseConfidence) → nil", "Align")
+            return nil
+        }
         return Double(bestLag) * Double(ds) / sr
     }
 
