@@ -365,17 +365,18 @@ struct AlignmentService {
         let coarseLen    = renderLen / ds
         guard coarseLen > 10 else { return nil }
 
-        // Render OG over [0, renderDurSec] in session time, then decimate to ~22 Hz.
+        // Render OG over [0, renderDurSec] in session time, then take the amplitude
+        // envelope at ~22 Hz. Signed mean would average to ~0 at 2000× decimation.
         guard let ogFull = renderMono(state: refState, fromSeconds: 0,
                                       length: renderLen, file: refFile) else { return nil }
-        let ogCoarse = downsampleBlock(ogFull, factor: ds, outputLength: coarseLen)
+        let ogCoarse = envelopeDownsample(ogFull, factor: ds, outputLength: coarseLen)
 
-        // Sum every collective stem (decimated) into the bus.
+        // Sum every collective stem's envelope into the bus envelope.
         var busCoarse = [Float](repeating: 0, count: coarseLen)
         for (stemFile, stemState) in openStems {
             guard let stemFull = renderMono(state: stemState, fromSeconds: 0,
                                             length: renderLen, file: stemFile) else { continue }
-            let stemCoarse = downsampleBlock(stemFull, factor: ds, outputLength: coarseLen)
+            let stemCoarse = envelopeDownsample(stemFull, factor: ds, outputLength: coarseLen)
             vDSP_vadd(busCoarse, 1, stemCoarse, 1, &busCoarse, 1, vDSP_Length(coarseLen))
         }
 
@@ -419,7 +420,8 @@ struct AlignmentService {
 
     // MARK: - Helpers
 
-    /// Block-average downsample. Each output sample = mean of `factor` input samples.
+    /// Block-average downsample (signed mean). OK for small factors (≤100); for large
+    /// factors the signed mean ≈ DC ≈ 0 — use `envelopeDownsample` instead.
     private static func downsampleBlock(_ buf: [Float], factor: Int, outputLength: Int) -> [Float] {
         var out = [Float](repeating: 0, count: outputLength)
         let available = buf.count / factor
@@ -429,6 +431,26 @@ struct AlignmentService {
                 for i in 0..<n {
                     var val: Float = 0
                     vDSP_meanv(bufPtr.baseAddress! + i * factor, 1, &val, vDSP_Length(factor))
+                    outPtr[i] = val
+                }
+            }
+        }
+        return out
+    }
+
+    /// Envelope downsample: each output sample = mean(|x|) over `factor` input samples.
+    /// Required for large decimation ratios where the signed mean averages to ~0 (audio
+    /// oscillates around zero). Captures amplitude envelope, which is what cross-correlation
+    /// at a very coarse rate actually relies on.
+    private static func envelopeDownsample(_ buf: [Float], factor: Int, outputLength: Int) -> [Float] {
+        var out = [Float](repeating: 0, count: outputLength)
+        let available = buf.count / factor
+        let n = min(outputLength, available)
+        buf.withUnsafeBufferPointer { bufPtr in
+            out.withUnsafeMutableBufferPointer { outPtr in
+                for i in 0..<n {
+                    var val: Float = 0
+                    vDSP_meamgv(bufPtr.baseAddress! + i * factor, 1, &val, vDSP_Length(factor))
                     outPtr[i] = val
                 }
             }
