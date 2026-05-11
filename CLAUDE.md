@@ -19,7 +19,7 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 7. **Quick Check Mode** — toggle that removes the requirement to have both an `.als` and stems before proceeding.
 8. **MT Complete Mode** — toggle that suppresses the NEXT SONG missing-locator warning (for single-song sessions). Also reveals Song Duration and Display Duration copy fields.
 9. **Jam Night Mode** — toggle (hidden by default; shown via Settings) that relaxes copy blocking for tempo ramps and loop/clip alignment issues; only ORIGINAL SONG required instead of full stem set. Shows Tempo panel in QA tab.
-10. **Edit tab** — multi-stem timeline editor: region select/delete/move, per-stem gain/mute/solo, metronome, click track generation, ALS generation (Build Session), locator suggestion via Whisper, AudioShake integration.
+10. **Edit tab** — multi-stem timeline editor: region select/delete/move, per-stem gain/mute/solo, metronome, click track generation, ALS generation (Build Session), locator suggestion via Whisper, AudioShake integration, auto-align stems (Check Alignment + Correct via full-file FFT cross-correlation of summed collective stem bus vs ORIGINAL SONG).
 11. **AudioShake tab** — stem separation via AudioShake API. Upload a WAV file, select separation models, download results as named stems.
 12. **Upload tab / Queue** — `UploadView.swift`, `QueueView.swift`, `BackOfficeService.swift`, `NolanRyanService.swift` are preserved in the codebase but **disconnected from the current UI**. The tab switcher only shows QA / Edit / AudioShake.
 
@@ -55,6 +55,7 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 - `ALSGeneratorService.swift` — `.als` generation from scratch via `generate_als` parser action (Build Session)
 - `LocatorSuggesterService.swift` — Whisper-based locator suggestion via `suggest_locators` + `write_locators` parser actions
 - `SuggestLocatorsSheet.swift` — sheet UI for lyric/chord sheet drop + locator review
+- `AlignmentService.swift` — full-file FFT cross-correlation (`fftFullCorrelate`) + guided ±150 ms fine pass (`fineSweep`); reports session-time offset (positive = bus late). Two vDSP pitfalls: (1) negate decoded lag — `vDSP_fft_zrip` INVERSE convention is opposite of textbook ifft; (2) save/restore DC + Nyquist around `vDSP_zvmul` due to packed split-complex format
 
 **AudioShake tab:**
 - `AudioShakeService.swift` — AudioShake API client; upload → poll → download stem files
@@ -240,6 +241,8 @@ After stem scan finishes (`audioAnalyzer.isScanning` → `false`): if `songKey` 
 - Beat-0 anchor event cannot be deleted: `deleteTempoEvent(at:)` and `deleteTimeSig(at:)` both guard `index > 0`.
 - `isSessionDirty: Bool` — set by any locator/tempo/time-sig mutation; used to gate save prompts.
 - `masterPeakDB: Float`, `meterLevels: [URL: Float]` — master and per-stem peak dBFS updated at ~43 Hz.
+- `busAlignmentResult: AlignmentResult?`, `isCheckingAlignment: Bool` — alignment check state; `runAlignmentCheck()` triggers FFT correlation on `Task.detached`; `applyAllAlignmentCorrections()` shifts collective stems by `-samples/sr` (CLICK/GUIDE/OG locked).
+- `invalidateAlignmentIfOG(url)` — clears `busAlignmentResult` when OG segments mutate (called from `deleteRegion`, `moveRegion`, `trim*`, `shiftAllSegments`). Forces re-check after OG drag.
 
 ### `AudioAnalysisView.swift`
 - `WaveformSeekView` — Canvas-based waveform. In section mode (`sectionStart/sectionEnd/totalDuration` provided): dims entire waveform at `fgMid.opacity(0.15)`, renders section window at `fgMid.opacity(0.35)`, fills played portion blue from `sectionStart` to playhead. In normal mode: blue left of playhead, gray right.
@@ -396,3 +399,5 @@ Button styles: `CompactSecondaryButtonStyle`, `SecondaryButtonStyle`, `FixedHeig
 - **Parser binary location** — now at `Resources/parse_als_dir/parse_als` (not `MacOS/parse_als_dir`). The legacy path is still checked as fallback. Don't change the resolution order in `ParserProcess.resolveParser()` without updating both paths.
 - **Multiple `.als` in folder drop** — `AlsPickerSheet` is shown; user selects one or clicks "Load Stems Only". Stems are loaded after the sheet closes regardless of choice.
 - **`clearAll()` resets modes** — also resets `jamNightMode` in addition to `quickCheckMode` and `mtCompleteMode`.
+- **AlignmentService vDSP FFT pitfalls** — (1) `vDSP_fft_zrip` with `FFT_INVERSE` returns lag axis flipped vs textbook ifft — **negate the decoded lag** (`lagCoarse = -rawLag`). (2) Packed split-complex format stores DC in `realp[0]` and Nyquist in `imagp[0]` as REAL values; `vDSP_zvmul` treats element 0 as a complex pair and produces wrong results — **save DC*DC and Nyq*Nyq before the multiply, restore after**. Both verified empirically; without them the reported offset sign flips or magnitude is wrong. Don't regress.
+- **Alignment correction allows negative sessionStart** — `applyAllAlignmentCorrections` calls `shiftAllSegments(url, delta, clampToZero: false)`. After a positive bus-late correction, stems can sit before bar 1 (pre-roll). Both playback and FFmpeg export handle negative `sessionStart` via `preRoll = max(0, -sessionStart)`.
