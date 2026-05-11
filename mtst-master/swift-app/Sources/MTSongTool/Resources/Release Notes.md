@@ -1,4 +1,4 @@
-# MT Song Tool — v1.6.2
+# MT Song Tool — v1.6.3
 
 ## Features
 
@@ -22,6 +22,15 @@
 - Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
 
 ## Changelog
+
+### v1.6.3 — May 2026
+
+#### Auto-align stems
+
+- **Check Alignment** (Edit tab toolbar) — cross-correlates the summed collective stem bus against ORIGINAL SONG using a full-file FFT and reports the session-time offset. Catches both render-time export errors (stems and OG with different intro silence) and OG drag on the timeline. Sub-millisecond precision via a guided ±150 ms fine-pass at 44.1 kHz.
+- **Correct button** — appears when the offset is ≥ 2 ms; shifts every collective stem uniformly to align with ORIGINAL SONG. CLICK TRACK, GUIDE, and ORIGINAL SONG stay locked in place. Negative `sessionStart` values are allowed so a corrected stem can sit before bar 1 of the session (pre-roll).
+- **Auto-invalidates** when ORIGINAL SONG is dragged, trimmed, deleted, or otherwise mutated — forces re-check so the displayed offset always reflects the current OG position.
+- Cross-correlation peak comes from the entire song waveform, so the alignment works regardless of which instrument plays first (validated against 28-stem sessions where collective stems have several seconds of intro silence).
 
 ### v1.6.2 — May 2026
 

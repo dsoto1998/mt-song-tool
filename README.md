@@ -19,6 +19,7 @@
   - **Gain lock** — CLICK TRACK, GUIDE, ORIGINAL SONG locked at 0 dB with per-stem peak-hold readout
   - **Master meter** — all-time peak hold with tick mark and dB readout; reflects mix stems only (excludes reference stems and metronome)
   - **Export Stems** — exports all stems to a chosen folder, padded/trimmed to loop bracket end, 44.1 kHz / 16-bit PCM
+  - **Auto-align stems** — Check Alignment cross-correlates the summed collective stem bus against ORIGINAL SONG via full-file FFT; reports the session-time offset (catches export render errors and OG drag); Correct button shifts collective stems uniformly to snap them into alignment with sub-millisecond precision
   - **Build Session** — generates a complete Ableton Live 11 `.als` from scratch (BPM, time sig, locators, click track, beat detection from ORIGINAL SONG)
   - **Suggest Locators** — drop a lyric sheet or paste a Genius/AZLyrics URL; Whisper aligns lyrics to timestamps and populates locators
   - **Metronome** — tempo-synced, compound time signature support, mute toggle, subdivision modes
