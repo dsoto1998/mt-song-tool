@@ -54,7 +54,7 @@ struct AlignmentService {
     // Fine-pass parameters
     private static let refWindowSeconds: Double  = 2.0    // 88200 samples
     private static let aidedMaxOffsetSec: Double = 0.15   // ±150ms when guided by coarse
-    private static let confidenceThreshold: Float = 2.5
+    private static let confidenceThreshold: Float = 4.0   // stricter — rejects spurious peaks
     private static let minRMS: Float              = 1e-4
     private static let probeStep: Double          = 5.0
     private static let probeMaxSeconds: Double    = 360.0
@@ -62,7 +62,12 @@ struct AlignmentService {
 
     // Coarse-pass parameters (100× downsample → 441 Hz)
     private static let coarseDownsample: Int       = 100
-    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s
+    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s around the very-coarse hint
+
+    // Very-coarse Pass 0 parameters (2000× downsample → ~22 Hz)
+    private static let veryCoarseDownsample: Int    = 2000
+    private static let veryCoarseMaxLagSec: Double  = 300.0  // ±300s — covers any practical drag
+    private static let veryCoarseConfidence: Float  = 0.5    // normalized cosine similarity threshold
 
     // MARK: - Public API
 
@@ -107,13 +112,22 @@ struct AlignmentService {
         let minStemDur = openStems.map { Double($0.file.length) / sr }.min() ?? 0
         let probeMax   = min(refFileDur, minStemDur, probeMaxSeconds) + ogOffset
 
-        // Pass 1: coarse probe (±10s at 441Hz). Always runs first — the unaided fine pass
-        // produced spurious peaks when the true offset was outside its ±300ms range. Coarse
-        // first narrows the search range so the fine pass cannot mis-fire.
+        // Pass 0: very-coarse global cross-correlation (±300s at 22 Hz) with normalized
+        // cosine similarity. Anchors the subsequent passes so the ±10s coarse pass can never
+        // lock onto a spurious peak elsewhere in the song. Falls back to 0 if Pass 0 fails.
+        let veryCoarseHintSec = veryCoarsePass(
+            openStems: openStems, refFile: refFile, refState: refState,
+            probeMax: probeMax
+        ) ?? 0
+
+        // Pass 1: coarse probe (±10s at 441 Hz) centred on the Pass 0 hint.
+        // Returns ABSOLUTE offset (hint + measured lag).
         guard let coarseOffsetSec = coarseProbe(
             openStems: openStems, refFile: refFile, refState: refState,
-            ogOffset: ogOffset, probeMax: probeMax
+            ogOffset: ogOffset, probeMax: probeMax,
+            hintSec: veryCoarseHintSec
         ) else {
+            // No reliable coarse result — surface to user.
             return .unableToDetermine
         }
 
@@ -232,15 +246,16 @@ struct AlignmentService {
 
     // MARK: - Coarse probe
 
-    /// One wide-range probe at 441 Hz (100× downsample) covering ±10s.
-    /// Reads a single 22-second bus window — only called when fine pass finds nothing.
-    /// Returns offset in seconds (positive = bus late), or nil if not confident.
+    /// One wide-range probe at 441 Hz (100× downsample) covering ±10s around `hintSec`.
+    /// Reads a single 22-second bus window.
+    /// Returns ABSOLUTE offset in seconds (hint + measured lag), or nil if not confident.
     private static func coarseProbe(
         openStems: [(file: AVAudioFile, state: StemState)],
         refFile: AVAudioFile,
         refState: StemState,
         ogOffset: Double,
-        probeMax: Double
+        probeMax: Double,
+        hintSec: Double = 0
     ) -> Double? {
         let sr         = sampleRate
         let ds         = coarseDownsample                              // 100
@@ -265,8 +280,9 @@ struct AlignmentService {
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(fullRefLen))
             guard refRms > minRMS else { windowStart += 10.0; continue }
 
-            // Wide bus window: ±coarseMaxOffsetSec around OG's current session time.
-            let intendedBusStart = windowStart - coarseMaxOffsetSec
+            // Wide bus window: ±coarseMaxOffsetSec around (OG's current session time + hint).
+            let busCenter        = windowStart + hintSec
+            let intendedBusStart = busCenter - coarseMaxOffsetSec
             let busWindowStart   = max(0, intendedBusStart)
             // Clamp compensation in coarse (441Hz) samples.
             let clampSamples441  = Int((busWindowStart - intendedBusStart) * coarseRate)
@@ -320,13 +336,85 @@ struct AlignmentService {
                 windowStart += 10.0; continue
             }
 
-            // Convert coarse lag (441 Hz samples) → full-rate seconds.
+            // Convert coarse lag (441 Hz samples) → full-rate seconds, add hint for absolute offset.
             let coarseLag441   = (Int(peakIdx) - coarseMaxOff) + clampSamples441
-            let coarseOffsetSec = Double(coarseLag441 * ds) / sr
-            return coarseOffsetSec
+            let measuredSec    = Double(coarseLag441 * ds) / sr
+            return hintSec + measuredSec
         }
 
         return nil
+    }
+
+    // MARK: - Very-coarse pass (Pass 0)
+
+    /// Global cross-correlation at ~22 Hz (2000× downsample) over ±300 s, using normalized
+    /// cosine similarity at every integer lag. Anchors the subsequent passes so they cannot
+    /// lock onto a spurious peak elsewhere in the song.
+    /// Returns offset in seconds (positive = bus late), or nil if the best match is unreliable.
+    private static func veryCoarsePass(
+        openStems: [(file: AVAudioFile, state: StemState)],
+        refFile: AVAudioFile,
+        refState: StemState,
+        probeMax: Double
+    ) -> Double? {
+        let sr           = sampleRate
+        let ds           = veryCoarseDownsample
+        let coarseRate   = sr / Double(ds)
+        let renderDurSec = min(probeMax, probeMaxSeconds)
+        let renderLen    = Int(renderDurSec * sr)
+        let coarseLen    = renderLen / ds
+        guard coarseLen > 10 else { return nil }
+
+        // Render OG over [0, renderDurSec] in session time, then decimate to ~22 Hz.
+        guard let ogFull = renderMono(state: refState, fromSeconds: 0,
+                                      length: renderLen, file: refFile) else { return nil }
+        let ogCoarse = downsampleBlock(ogFull, factor: ds, outputLength: coarseLen)
+
+        // Sum every collective stem (decimated) into the bus.
+        var busCoarse = [Float](repeating: 0, count: coarseLen)
+        for (stemFile, stemState) in openStems {
+            guard let stemFull = renderMono(state: stemState, fromSeconds: 0,
+                                            length: renderLen, file: stemFile) else { continue }
+            let stemCoarse = downsampleBlock(stemFull, factor: ds, outputLength: coarseLen)
+            vDSP_vadd(busCoarse, 1, stemCoarse, 1, &busCoarse, 1, vDSP_Length(coarseLen))
+        }
+
+        let maxLagCoarse = min(Int(veryCoarseMaxLagSec * coarseRate), coarseLen - 1)
+
+        var bestLag   = 0
+        var bestScore: Float = -.infinity
+
+        ogCoarse.withUnsafeBufferPointer { ogPtr in
+            busCoarse.withUnsafeBufferPointer { busPtr in
+                for lag in (-maxLagCoarse)...maxLagCoarse {
+                    let busStart = max(0, lag)
+                    let ogStart  = max(0, -lag)
+                    let length   = min(coarseLen - busStart, coarseLen - ogStart)
+                    guard length > 10 else { continue }
+
+                    var dot: Float = 0
+                    vDSP_dotpr(busPtr.baseAddress! + busStart, 1,
+                               ogPtr.baseAddress!  + ogStart,  1,
+                               &dot, vDSP_Length(length))
+
+                    var ogSS: Float = 0
+                    vDSP_svesq(ogPtr.baseAddress! + ogStart, 1, &ogSS, vDSP_Length(length))
+                    var busSS: Float = 0
+                    vDSP_svesq(busPtr.baseAddress! + busStart, 1, &busSS, vDSP_Length(length))
+
+                    let denom = sqrtf(ogSS) * sqrtf(busSS)
+                    guard denom > 1e-9 else { continue }
+                    let score = dot / denom
+                    if score > bestScore {
+                        bestScore = score
+                        bestLag   = lag
+                    }
+                }
+            }
+        }
+
+        guard bestScore > veryCoarseConfidence else { return nil }
+        return Double(bestLag) * Double(ds) / sr
     }
 
     // MARK: - Helpers
