@@ -109,42 +109,43 @@ struct AlignmentService {
 
         Log("ogOffset=\(ogOffset)s, probeMax=\(probeMax)s, stems=\(openStems.count)", "Align")
 
-        // Pass 0: direct hint from OG's current session position. If user dragged OG to
-        // session N, the bus is N seconds early relative to OG's content (assuming stems
-        // were originally aligned at session 0). Pass 1 then refines within ±10s to catch
-        // any sub-second file-content offset on top of the drag. This avoids the envelope
-        // mismatch problem when collective stems have lots of intro silence.
-        let veryCoarseHintSec = -ogOffset
-        Log("Pass 0 hint = \(String(format: "%.3f", veryCoarseHintSec))s (from -ogOffset)", "Align")
-
-        // Pass 1: coarse probe (±10s at 441 Hz) centred on the Pass 0 hint.
-        // Returns ABSOLUTE offset (hint + measured lag).
-        guard let coarseOffsetSec = coarseProbe(
+        // Pass 1: coarse probe (±10s at 441 Hz) finds the FILE-CONTENT offset between bus
+        // and OG. Invariant to OG's session position — bus window centres on OG's file
+        // position, so dragging OG doesn't move the search target.
+        guard let fileContentSec = coarseProbe(
             openStems: openStems, refFile: refFile, refState: refState,
-            ogOffset: ogOffset, probeMax: probeMax,
-            hintSec: veryCoarseHintSec
+            ogOffset: ogOffset, probeMax: probeMax
         ) else {
             Log("Pass 1 returned nil → unableToDetermine", "Align")
             return .unableToDetermine
         }
-        Log("Pass 1 result = \(String(format: "%.3f", coarseOffsetSec))s", "Align")
+        Log("Pass 1 file-content offset = \(String(format: "%.3f", fileContentSec))s", "Align")
 
-        // Pass 2: guided fine (±150ms around coarse peak). Absolute lag = coarseHintSamples + fineLag.
+        // Pass 2: guided fine (±150ms around Pass 1 result) for sub-ms precision.
         let guidedAbs = fineSweep(
             openStems: openStems, refFile: refFile, refState: refState,
             ogOffset: ogOffset, probeMax: probeMax,
-            coarseHintSec: coarseOffsetSec, maxOffsetSec: aidedMaxOffsetSec
+            coarseHintSec: fileContentSec, maxOffsetSec: aidedMaxOffsetSec
         )
-        if let fineLag = medianLag(guidedAbs) {
-            let absoluteSamples = Int(coarseOffsetSec * sr) + fineLag
-            Log("Pass 2 fineLag=\(fineLag), absoluteSamples=\(absoluteSamples) → \(String(format: "%.1f", Double(absoluteSamples) / sr * 1000))ms", "Align")
-            return .aligned(offsetMs: Double(absoluteSamples) / sr * 1000, samples: absoluteSamples)
-        }
 
-        // Fallback: return coarse result directly (~2ms precision).
-        let coarseSamples = Int(coarseOffsetSec * sr)
-        Log("Pass 2 failed, using coarse fallback → \(String(format: "%.1f", coarseOffsetSec * 1000))ms", "Align")
-        return .aligned(offsetMs: coarseOffsetSec * 1000, samples: coarseSamples)
+        // Combine file-content offset with OG drag. Total session-time offset =
+        //   file_content_offset - ogOffset.
+        // Examples:
+        //   Stems exported with 50ms render error, OG not dragged → +50ms
+        //   Stems perfectly aligned, OG dragged 20s right → 0 - 20 = -20s (bus 20s early)
+        //   Render error + drag → render_error - drag
+        let fileContentSamples: Int
+        if let fineLag = medianLag(guidedAbs) {
+            fileContentSamples = Int(fileContentSec * sr) + fineLag
+            Log("Pass 2 fineLag=\(fineLag) refined file-content offset", "Align")
+        } else {
+            fileContentSamples = Int(fileContentSec * sr)
+            Log("Pass 2 failed, using coarse fallback", "Align")
+        }
+        let totalSamples = fileContentSamples - Int(ogOffset * sr)
+        let totalMs = Double(totalSamples) / sr * 1000
+        Log("Reported = fileContent \(String(format: "%.1f", Double(fileContentSamples)/sr*1000))ms − ogOffset \(String(format: "%.1f", ogOffset*1000))ms = \(String(format: "%.1f", totalMs))ms", "Align")
+        return .aligned(offsetMs: totalMs, samples: totalSamples)
     }
 
     // MARK: - Fine sweep
@@ -179,14 +180,12 @@ struct AlignmentService {
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(refLen))
             guard refRms > minRMS else { windowStart += probeStep; continue }
 
-            // Bus window centred at OG's current SESSION time (not OG file position).
-            // Drop ogOffset compensation so the check reflects OG's live timeline position —
-            // moving OG in the Edit tab changes the reported offset.
-            let busCenter       = windowStart + coarseHintSec
+            // Bus window centred at OG's FILE position (windowStart - ogOffset). This finds
+            // file-content alignment — invariant to OG's session position. The drag is
+            // folded in at the end of computeBus by subtracting ogOffset from the result.
+            let busCenter       = (windowStart - ogOffset) + coarseHintSec
             let intendedBusStart = busCenter - maxOffsetSec
             let busWindowStart  = max(0, intendedBusStart)
-            // Clamping shifts the reference frame; compensate by adding the clamp delta
-            // (in samples) back into the lag result.
             let clampSamples    = Int((busWindowStart - intendedBusStart) * sr)
 
             var busBuf = [Float](repeating: 0, count: stemLen)
@@ -280,11 +279,11 @@ struct AlignmentService {
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(fullRefLen))
             guard refRms > minRMS else { windowStart += 10.0; continue }
 
-            // Wide bus window: ±coarseMaxOffsetSec around (OG's current session time + hint).
-            let busCenter        = windowStart + hintSec
+            // Wide bus window: ±coarseMaxOffsetSec around OG's FILE position. Finds the
+            // file-content offset, invariant to OG's session position.
+            let busCenter        = (windowStart - ogOffset) + hintSec
             let intendedBusStart = busCenter - coarseMaxOffsetSec
             let busWindowStart   = max(0, intendedBusStart)
-            // Clamp compensation in coarse (441Hz) samples.
             let clampSamples441  = Int((busWindowStart - intendedBusStart) * coarseRate)
 
             var busBuf = [Float](repeating: 0, count: fullStemLen)
