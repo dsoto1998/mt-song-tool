@@ -53,7 +53,6 @@ struct AlignmentService {
 
     // Fine-pass parameters
     private static let refWindowSeconds: Double  = 2.0    // 88200 samples
-    private static let fineMaxOffsetSec: Double  = 0.3    // ±300ms unaided
     private static let aidedMaxOffsetSec: Double = 0.15   // ±150ms when guided by coarse
     private static let confidenceThreshold: Float = 2.5
     private static let minRMS: Float              = 1e-4
@@ -108,17 +107,9 @@ struct AlignmentService {
         let minStemDur = openStems.map { Double($0.file.length) / sr }.min() ?? 0
         let probeMax   = min(refFileDur, minStemDur, probeMaxSeconds) + ogOffset
 
-        // Pass 1: unaided fine (±300ms). Collect up to maxCollect confident windows, return median.
-        let fineAbs = fineSweep(
-            openStems: openStems, refFile: refFile, refState: refState,
-            ogOffset: ogOffset, probeMax: probeMax,
-            coarseHintSec: 0, maxOffsetSec: fineMaxOffsetSec
-        )
-        if let lag = medianLag(fineAbs) {
-            return .aligned(offsetMs: Double(lag) / sr * 1000, samples: lag)
-        }
-
-        // Pass 2: coarse probe (±10s at 441Hz). Runs once — only if fine failed.
+        // Pass 1: coarse probe (±10s at 441Hz). Always runs first — the unaided fine pass
+        // produced spurious peaks when the true offset was outside its ±300ms range. Coarse
+        // first narrows the search range so the fine pass cannot mis-fire.
         guard let coarseOffsetSec = coarseProbe(
             openStems: openStems, refFile: refFile, refState: refState,
             ogOffset: ogOffset, probeMax: probeMax
@@ -126,7 +117,7 @@ struct AlignmentService {
             return .unableToDetermine
         }
 
-        // Pass 3: guided fine (±150ms around coarse peak). Absolute lag = coarseHintSamples + fineLag.
+        // Pass 2: guided fine (±150ms around coarse peak). Absolute lag = coarseHintSamples + fineLag.
         let guidedAbs = fineSweep(
             openStems: openStems, refFile: refFile, refState: refState,
             ogOffset: ogOffset, probeMax: probeMax,
