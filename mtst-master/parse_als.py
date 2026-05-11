@@ -917,18 +917,26 @@ def _downgrade_to_live11(path):
 
     # 28. Fix Live 12 → 11 stem-track downgrade Crash A (null warp marker array).
     #
-    # Live 12 SHAD-style sessions populate the MasterTrack's
-    # <FreezeSequencer><AudioSequencer><ClipSlotList> with N empty <ClipSlot> entries
-    # (one per AudioTrack). Each empty ClipSlot has <ClipSlot><Value /></ClipSlot> but
-    # no actual clip — yet on load Live 11 iterates these slots and tries to access a
-    # WarpMarker array that is never allocated, crashing on null+8 atomic refcount
-    # (KERN_INVALID_ADDRESS at 0x8, frames 21760912/21656556/...).
+    # Two related issues, requiring different fixes per track type:
     #
-    # BB11 native sessions have <ClipSlotList /> (empty) here, so they don't crash.
+    # Issue A — MasterTrack / PreHearTrack:
+    #   Live 12 populates their FreezeSequencer ClipSlotList with N empty <ClipSlot>
+    #   entries. Live 11 iterates these on load and tries to access an unallocated
+    #   WarpMarker array → null+8 atomic refcount crash (KERN_INVALID_ADDRESS at 0x8).
+    #   Fix: replace with <ClipSlotList /> (these tracks have no parallel MainSequencer
+    #   slot count to satisfy, so empty is safe).
     #
-    # Fix: replace the populated ClipSlotList inside MasterTrack/PreHearTrack
-    # FreezeSequencer with an empty <ClipSlotList />.
+    # Issue B — AudioTrack / MidiTrack / GroupTrack / ReturnTrack (Freeze=false):
+    #   Their FreezeSequencer ClipSlots carry NeedRefreeze="true". On any edit, Live 11
+    #   walks the FreezeSequencer to evaluate which slots need refreezing. For empty
+    #   slots with NeedRefreeze=true it tries to process the freeze, accessing null
+    #   WarpMarker arrays → crash. Cannot use <ClipSlotList /> here — the FreezeSequencer
+    #   slot count must match the MainSequencer slot count or Live 11 refuses to load
+    #   ("Slot count mismatch"). Fix: keep slots, zero NeedRefreeze to false.
+    #   Also zero NeedArrangerRefreeze on the track itself for the same reason.
+
     def _empty_freeze_clipslotlist(track_xml):
+        """Replace <ClipSlotList>...</ClipSlotList> inside FreezeSequencer with empty tag."""
         fs_match = re.search(r'<FreezeSequencer\b.*?</FreezeSequencer>', track_xml, flags=re.DOTALL)
         if not fs_match:
             return track_xml
@@ -940,10 +948,50 @@ def _downgrade_to_live11(path):
         )
         return track_xml[:fs_match.start()] + new_fs + track_xml[fs_match.end():]
 
+    def _clear_freeze_needrefreeze(track_xml):
+        """Zero NeedRefreeze/HasStop inside FreezeSequencer ClipSlots and NeedArrangerRefreeze on track.
+
+        NeedRefreeze="true": causes edit-crash (Live 11 tries to access null WarpMarker array
+          when evaluating pending refreeze on empty slots).
+        HasStop="true": causes timer-crash in LSong::CheckForClipOrSceneSelection() — Live 11
+          tries to build a stop-clip object for the FreezeSequencer slot, which has a null
+          back-reference in this context → null deref at 0x0.
+        NeedArrangerRefreeze="true": same refreeze trigger at the track level.
+        """
+        fs_match = re.search(r'<FreezeSequencer\b.*?</FreezeSequencer>', track_xml, flags=re.DOTALL)
+        if not fs_match:
+            return track_xml
+        new_fs = fs_match.group(0)
+        new_fs = re.sub(r'<NeedRefreeze\s+Value="true"', '<NeedRefreeze Value="false"', new_fs)
+        new_fs = re.sub(r'<HasStop\s+Value="true"', '<HasStop Value="false"', new_fs)
+        result = track_xml[:fs_match.start()] + new_fs + track_xml[fs_match.end():]
+        # Also zero NeedArrangerRefreeze on the track element itself.
+        result = re.sub(
+            r'<NeedArrangerRefreeze\s+Value="true"',
+            '<NeedArrangerRefreeze Value="false"',
+            result,
+        )
+        return result
+
+    # MasterTrack and PreHearTrack: clear ClipSlotList entirely (cannot be frozen,
+    # no MainSequencer slot count constraint).
     for track_tag in ('MasterTrack', 'PreHearTrack'):
         m = re.search(rf'<{track_tag}\b.*?</{track_tag}>', content, flags=re.DOTALL)
         if m:
             new_block = _empty_freeze_clipslotlist(m.group(0))
+            content = content[:m.start()] + new_block + content[m.end():]
+
+    # AudioTrack, MidiTrack, GroupTrack, ReturnTrack: for non-frozen tracks, zero
+    # NeedRefreeze flags instead of clearing slots (slot count must stay intact).
+    # Reverse iteration avoids index-shift after each replacement.
+    for track_tag in ('AudioTrack', 'MidiTrack', 'GroupTrack', 'ReturnTrack'):
+        matches = list(re.finditer(rf'<{track_tag}\b.*?</{track_tag}>', content, flags=re.DOTALL))
+        for m in reversed(matches):
+            track_xml = m.group(0)
+            freeze_m = re.search(r'<Freeze\s+Value="(\w+)"', track_xml)
+            if freeze_m and freeze_m.group(1).lower() == 'true':
+                continue  # track is frozen — preserve its FreezeSequencer data
+            new_block = _clear_freeze_needrefreeze(track_xml)
             content = content[:m.start()] + new_block + content[m.end():]
 
     # Write output
