@@ -177,8 +177,12 @@ struct AlignmentService {
             // Bus window centred at OG's current SESSION time (not OG file position).
             // Drop ogOffset compensation so the check reflects OG's live timeline position —
             // moving OG in the Edit tab changes the reported offset.
-            let busCenter     = windowStart + coarseHintSec
-            let busWindowStart = max(0, busCenter - maxOffsetSec)
+            let busCenter       = windowStart + coarseHintSec
+            let intendedBusStart = busCenter - maxOffsetSec
+            let busWindowStart  = max(0, intendedBusStart)
+            // Clamping shifts the reference frame; compensate by adding the clamp delta
+            // (in samples) back into the lag result.
+            let clampSamples    = Int((busWindowStart - intendedBusStart) * sr)
 
             var busBuf = [Float](repeating: 0, count: stemLen)
             var activeStemCount = 0
@@ -226,7 +230,7 @@ struct AlignmentService {
 
             // lagSamples: 0 = bus at coarseHint position (aligned relative to hint);
             // positive = bus later than hint; negative = bus earlier than hint.
-            let lagSamples = Int(peakIdx) - maxOff
+            let lagSamples = (Int(peakIdx) - maxOff) + clampSamples
             lags.append(lagSamples)
 
             windowStart += probeStep
@@ -271,7 +275,10 @@ struct AlignmentService {
             guard refRms > minRMS else { windowStart += 10.0; continue }
 
             // Wide bus window: ±coarseMaxOffsetSec around OG's current session time.
-            let busWindowStart = max(0, windowStart - coarseMaxOffsetSec)
+            let intendedBusStart = windowStart - coarseMaxOffsetSec
+            let busWindowStart   = max(0, intendedBusStart)
+            // Clamp compensation in coarse (441Hz) samples.
+            let clampSamples441  = Int((busWindowStart - intendedBusStart) * coarseRate)
 
             var busBuf = [Float](repeating: 0, count: fullStemLen)
             var activeStemCount = 0
@@ -323,7 +330,7 @@ struct AlignmentService {
             }
 
             // Convert coarse lag (441 Hz samples) → full-rate seconds.
-            let coarseLag441   = Int(peakIdx) - coarseMaxOff
+            let coarseLag441   = (Int(peakIdx) - coarseMaxOff) + clampSamples441
             let coarseOffsetSec = Double(coarseLag441 * ds) / sr
             return coarseOffsetSec
         }
