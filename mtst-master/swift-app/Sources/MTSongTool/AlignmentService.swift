@@ -110,17 +110,24 @@ struct AlignmentService {
 
         Log("ogOffset=\(ogOffset)s, probeMax=\(probeMax)s, stems=\(openStems.count)", "Align")
 
-        // Pass 1: coarse probe (±10s at 441 Hz) finds the FILE-CONTENT offset between bus
-        // and OG. Invariant to OG's session position — bus window centres on OG's file
-        // position, so dragging OG doesn't move the search target.
-        guard let fileContentSec = coarseProbe(
+        // Pass 1: full-file FFT cross-correlation at 441 Hz. Renders the COMPLETE
+        // session-time OG and summed bus, downsamples, then correlates entire signals
+        // via FFT. Eliminates windowed-correlation's spurious-peak issue (musical
+        // self-similarity beating the true peak when ref window is short).
+        // Result is the SESSION-TIME offset directly — no need to subtract ogOffset.
+        guard let totalSec = fftFullCorrelate(
             openStems: openStems, refFile: refFile, refState: refState,
-            ogOffset: ogOffset, probeMax: probeMax
+            probeMax: probeMax
         ) else {
-            Log("Pass 1 returned nil → unableToDetermine", "Align")
+            Log("Pass 1 FFT returned nil → unableToDetermine", "Align")
             return .unableToDetermine
         }
-        Log("Pass 1 file-content offset = \(String(format: "%.3f", fileContentSec))s", "Align")
+        Log("Pass 1 FFT session-time offset = \(String(format: "%.3f", totalSec))s", "Align")
+
+        // Pass 1 already returns the session-time offset. ogOffset is no longer
+        // applied separately — it's baked into how we render OG (with leading silence
+        // before sessionStart).
+        let fileContentSec = totalSec + ogOffset  // backwards-compat for fineSweep hint
 
         // Pass 2: guided fine (±150ms around Pass 1 result) for sub-ms precision.
         let guidedAbs = fineSweep(
@@ -135,18 +142,152 @@ struct AlignmentService {
         //   Stems exported with 50ms render error, OG not dragged → +50ms
         //   Stems perfectly aligned, OG dragged 20s right → 0 - 20 = -20s (bus 20s early)
         //   Render error + drag → render_error - drag
-        let fileContentSamples: Int
+        let totalSamples: Int
         if let fineLag = medianLag(guidedAbs) {
-            fileContentSamples = Int(fileContentSec * sr) + fineLag
-            Log("Pass 2 fineLag=\(fineLag) refined file-content offset", "Align")
+            totalSamples = Int(totalSec * sr) + fineLag
+            Log("Pass 2 fineLag=\(fineLag) refined to \(String(format: "%.1f", Double(totalSamples)/sr*1000))ms", "Align")
         } else {
-            fileContentSamples = Int(fileContentSec * sr)
-            Log("Pass 2 failed, using coarse fallback", "Align")
+            totalSamples = Int(totalSec * sr)
+            Log("Pass 2 failed, using FFT result", "Align")
         }
-        let totalSamples = fileContentSamples - Int(ogOffset * sr)
         let totalMs = Double(totalSamples) / sr * 1000
-        Log("Reported = fileContent \(String(format: "%.1f", Double(fileContentSamples)/sr*1000))ms − ogOffset \(String(format: "%.1f", ogOffset*1000))ms = \(String(format: "%.1f", totalMs))ms", "Align")
+        Log("Reported = \(String(format: "%.1f", totalMs))ms", "Align")
         return .aligned(offsetMs: totalMs, samples: totalSamples)
+    }
+
+    // MARK: - Full-file FFT correlation (Pass 1)
+
+    /// Renders the entire session-time OG and summed bus at coarse rate, then
+    /// cross-correlates them via FFT (Accelerate). Returns the session-time offset in
+    /// seconds where bus content lags OG content (positive = bus late). Uses the whole
+    /// signal so musical self-similarity cannot beat the true peak.
+    private static func fftFullCorrelate(
+        openStems: [(file: AVAudioFile, state: StemState)],
+        refFile: AVAudioFile,
+        refState: StemState,
+        probeMax: Double
+    ) -> Double? {
+        let sr           = sampleRate
+        let ds           = coarseDownsample
+        let coarseRate   = sr / Double(ds)
+        let renderDurSec = min(probeMax, probeMaxSeconds)
+        let renderLen    = Int(renderDurSec * sr)
+        let coarseLen    = renderLen / ds
+        guard coarseLen > 100 else { return nil }
+
+        // Render OG at session 0 to renderDurSec, downsample.
+        guard let ogFull = renderMono(state: refState, fromSeconds: 0,
+                                      length: renderLen, file: refFile) else { return nil }
+        let ogCoarse = downsampleBlock(ogFull, factor: ds, outputLength: coarseLen)
+
+        // Sum all stems (each rendered at session 0) into bus, downsample.
+        var busCoarse = [Float](repeating: 0, count: coarseLen)
+        for (stemFile, stemState) in openStems {
+            guard let stemFull = renderMono(state: stemState, fromSeconds: 0,
+                                            length: renderLen, file: stemFile) else { continue }
+            let stemCoarse = downsampleBlock(stemFull, factor: ds, outputLength: coarseLen)
+            vDSP_vadd(busCoarse, 1, stemCoarse, 1, &busCoarse, 1, vDSP_Length(coarseLen))
+        }
+
+        // FFT size: next power of 2 ≥ coarseLen + coarseLen.
+        var log2N: vDSP_Length = 1
+        while (1 << log2N) < 2 * coarseLen { log2N += 1 }
+        let N = 1 << log2N
+        let halfN = N / 2
+
+        guard let setup = vDSP_create_fftsetup(log2N, FFTRadix(kFFTRadix2)) else { return nil }
+        defer { vDSP_destroy_fftsetup(setup) }
+
+        // Zero-pad both signals to N.
+        var busPad = [Float](repeating: 0, count: N)
+        var ogPad  = [Float](repeating: 0, count: N)
+        busCoarse.withUnsafeBufferPointer { src in
+            busPad.withUnsafeMutableBufferPointer { dst in
+                _ = memcpy(dst.baseAddress!, src.baseAddress!, coarseLen * MemoryLayout<Float>.size)
+            }
+        }
+        ogCoarse.withUnsafeBufferPointer { src in
+            ogPad.withUnsafeMutableBufferPointer { dst in
+                _ = memcpy(dst.baseAddress!, src.baseAddress!, coarseLen * MemoryLayout<Float>.size)
+            }
+        }
+
+        // Split-complex buffers.
+        var busReal = [Float](repeating: 0, count: halfN)
+        var busImag = [Float](repeating: 0, count: halfN)
+        var ogReal  = [Float](repeating: 0, count: halfN)
+        var ogImag  = [Float](repeating: 0, count: halfN)
+        var result  = [Float](repeating: 0, count: N)
+
+        busReal.withUnsafeMutableBufferPointer { bR in
+        busImag.withUnsafeMutableBufferPointer { bI in
+        ogReal.withUnsafeMutableBufferPointer  { oR in
+        ogImag.withUnsafeMutableBufferPointer  { oI in
+            var busSplit = DSPSplitComplex(realp: bR.baseAddress!, imagp: bI.baseAddress!)
+            var ogSplit  = DSPSplitComplex(realp: oR.baseAddress!, imagp: oI.baseAddress!)
+
+            // Pack real → split-complex (interleaved as DSPComplex).
+            busPad.withUnsafeBufferPointer { p in
+                p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cp in
+                    vDSP_ctoz(cp, 2, &busSplit, 1, vDSP_Length(halfN))
+                }
+            }
+            ogPad.withUnsafeBufferPointer { p in
+                p.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cp in
+                    vDSP_ctoz(cp, 2, &ogSplit, 1, vDSP_Length(halfN))
+                }
+            }
+
+            // Forward FFT both.
+            vDSP_fft_zrip(setup, &busSplit, 1, log2N, FFTDirection(FFT_FORWARD))
+            vDSP_fft_zrip(setup, &ogSplit,  1, log2N, FFTDirection(FFT_FORWARD))
+
+            // Save DC and Nyquist (packed as real components of index 0).
+            let dcResult     = bR.baseAddress![0] * oR.baseAddress![0]
+            let nyqResult    = bI.baseAddress![0] * oI.baseAddress![0]
+
+            // Multiply bus × conj(og) in-place into ogSplit.
+            // vDSP_zvmul conjugates B (the second operand) when last arg = -1.
+            // Want bus * conj(og), so put og as B.
+            vDSP_zvmul(&busSplit, 1, &ogSplit, 1, &ogSplit, 1, vDSP_Length(halfN), -1)
+
+            // Restore DC/Nyquist (zvmul treated them as regular complex).
+            oR.baseAddress![0] = dcResult
+            oI.baseAddress![0] = nyqResult
+
+            // Inverse FFT.
+            vDSP_fft_zrip(setup, &ogSplit, 1, log2N, FFTDirection(FFT_INVERSE))
+
+            // Unpack split-complex → real array.
+            result.withUnsafeMutableBufferPointer { rp in
+                rp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: halfN) { cp in
+                    vDSP_ztoc(&ogSplit, 1, cp, 2, vDSP_Length(halfN))
+                }
+            }
+
+            // IFFT normalization: divide by 2N (vDSP packs scale 2× into forward FFT).
+            var scale: Float = 1.0 / Float(2 * N)
+            vDSP_vsmul(result, 1, &scale, &result, 1, vDSP_Length(N))
+        }}}}
+
+        // Find peak. result[0] = lag 0, result[k] for k < N/2 = lag +k,
+        // result[k] for k > N/2 = lag (k - N) (negative).
+        var peakVal: Float = 0
+        var peakIdx: vDSP_Length = 0
+        vDSP_maxvi(result, 1, &peakVal, &peakIdx, vDSP_Length(N))
+
+        let lagCoarse = Int(peakIdx) <= halfN ? Int(peakIdx) : Int(peakIdx) - N
+        let lagSec    = Double(lagCoarse) / coarseRate
+
+        // Confidence: peak vs std-dev of the full result.
+        var meanSq: Float = 0
+        vDSP_measqv(result, 1, &meanSq, vDSP_Length(N))
+        let rms = sqrtf(meanSq)
+        let confidence = rms > 0 ? peakVal / rms : 0
+        Log("Pass 1 FFT peakIdx=\(peakIdx), lagCoarse=\(lagCoarse), peak=\(String(format: "%.2f", peakVal)), rms=\(String(format: "%.2f", rms)), conf=\(String(format: "%.1f", confidence))", "Align")
+
+        guard confidence > 4.0 else { return nil }
+        return lagSec
     }
 
     // MARK: - Fine sweep
