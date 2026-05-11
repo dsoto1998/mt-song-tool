@@ -222,9 +222,20 @@ struct AlignmentService {
                 }
             }
 
+            // Bound peak search to ±maxOff samples around the intended center to avoid
+            // spurious peaks past the intended search range when busWindowStart is clamped.
+            let intendedCenterIdx = maxOff - clampSamples
+            let searchLo = max(0, intendedCenterIdx - maxOff)
+            let searchHi = min(outputLen - 1, intendedCenterIdx + maxOff)
+            let searchLen = searchHi - searchLo + 1
+            guard searchLen > 0 else { windowStart += probeStep; continue }
+
             var peakVal: Float = 0
-            var peakIdx: vDSP_Length = 0
-            vDSP_maxvi(correlation, 1, &peakVal, &peakIdx, vDSP_Length(outputLen))
+            var localPeakIdx: vDSP_Length = 0
+            correlation.withUnsafeBufferPointer { corrPtr in
+                vDSP_maxvi(corrPtr.baseAddress! + searchLo, 1, &peakVal, &localPeakIdx, vDSP_Length(searchLen))
+            }
+            let peakIdx = Int(localPeakIdx) + searchLo
 
             var corrRms: Float = 0
             vDSP_rmsqv(correlation, 1, &corrRms, vDSP_Length(outputLen))
@@ -234,7 +245,7 @@ struct AlignmentService {
 
             // lagSamples: 0 = bus at coarseHint position (aligned relative to hint);
             // positive = bus later than hint; negative = bus earlier than hint.
-            let lagSamples = (Int(peakIdx) - maxOff) + clampSamples
+            let lagSamples = (peakIdx - maxOff) + clampSamples
             lags.append(lagSamples)
 
             windowStart += probeStep
@@ -325,9 +336,21 @@ struct AlignmentService {
                 }
             }
 
+            // Bound peak search to ±coarseMaxOff samples around the intended center.
+            // When busWindowStart is clamped, the correlation output extends past the
+            // intended ±10s range and can lock onto spurious peaks (musical self-similarity).
+            let intendedCenterIdx = coarseMaxOff - clampSamples441
+            let searchLo = max(0, intendedCenterIdx - coarseMaxOff)
+            let searchHi = min(coarseOutLen - 1, intendedCenterIdx + coarseMaxOff)
+            let searchLen = searchHi - searchLo + 1
+            guard searchLen > 0 else { windowStart += 10.0; continue }
+
             var peakVal: Float = 0
-            var peakIdx: vDSP_Length = 0
-            vDSP_maxvi(correlation, 1, &peakVal, &peakIdx, vDSP_Length(coarseOutLen))
+            var localPeakIdx: vDSP_Length = 0
+            correlation.withUnsafeBufferPointer { corrPtr in
+                vDSP_maxvi(corrPtr.baseAddress! + searchLo, 1, &peakVal, &localPeakIdx, vDSP_Length(searchLen))
+            }
+            let peakIdx = Int(localPeakIdx) + searchLo
 
             var corrRms: Float = 0
             vDSP_rmsqv(correlation, 1, &corrRms, vDSP_Length(coarseOutLen))
@@ -336,7 +359,7 @@ struct AlignmentService {
             }
 
             // Convert coarse lag (441 Hz samples) → full-rate seconds, add hint for absolute offset.
-            let coarseLag441   = (Int(peakIdx) - coarseMaxOff) + clampSamples441
+            let coarseLag441   = (peakIdx - coarseMaxOff) + clampSamples441
             let measuredSec    = Double(coarseLag441 * ds) / sr
             return hintSec + measuredSec
         }
