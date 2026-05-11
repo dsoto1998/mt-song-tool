@@ -62,7 +62,8 @@ struct AlignmentService {
 
     // Coarse-pass parameters (100× downsample → 441 Hz)
     private static let coarseDownsample: Int       = 100
-    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s around the -ogOffset hint
+    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s search range
+    private static let coarseRefSeconds: Double    = 30.0  // long fingerprint for unique correlation peak
 
     // MARK: - Public API
 
@@ -270,18 +271,18 @@ struct AlignmentService {
         let sr         = sampleRate
         let ds         = coarseDownsample                              // 100
         let coarseRate = sr / Double(ds)                              // 441 Hz
-        let coarseRefLen  = Int(refWindowSeconds * coarseRate)        // 882
+        let coarseRefLen  = Int(coarseRefSeconds * coarseRate)        // 13230 (30s × 441)
         let coarseMaxOff  = Int(coarseMaxOffsetSec * coarseRate)      // 4410
-        let coarseStemLen = coarseRefLen + 2 * coarseMaxOff           // 9702
+        let coarseStemLen = coarseRefLen + 2 * coarseMaxOff           // 22050
         let coarseOutLen  = coarseStemLen - coarseRefLen + 1          // 8821
 
         // Full-rate buffer sizes
-        let fullRefLen  = coarseRefLen * ds                           // 88200 (2s)
-        let fullStemLen = coarseStemLen * ds                          // 970200 (22s)
+        let fullRefLen  = coarseRefLen * ds                           // 1,323,000 (30s)
+        let fullStemLen = coarseStemLen * ds                          // 2,205,000 (50s)
 
         // Scan for first OG window with good content, then run one coarse probe there.
         var windowStart = ogOffset + 1.0
-        while windowStart + refWindowSeconds <= probeMax {
+        while windowStart + coarseRefSeconds <= probeMax {
             guard let refBuf = renderMono(state: refState, fromSeconds: windowStart,
                                           length: fullRefLen, file: refFile)
             else { windowStart += 10.0; continue }
