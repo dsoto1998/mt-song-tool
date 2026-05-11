@@ -25,6 +25,23 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 
 ---
 
+## Planned Features (TODO)
+
+### Dynamic CLICK TRACK + GUIDE Builder
+**Memory file:** `project_dynamic_click_guide_builder.md`
+
+Planned MTST feature — build CLICK TRACK (MidiTrack) and GUIDE (AudioTrack) tracks dynamically inside the app and inject them directly into the `.als` file. Replaces the EDS (Engineering Default Set) template import workflow.
+
+**Why needed:** Live 11 crashes (`LSong::CheckForClipOrSceneSelection` via `__NSFireTimer`, null vdispatch) when loading a second document after a Live 12 → 11 downgraded session. Root cause is likely an Ableton-internal timer bug; unfixable from XML side. Full diagnosis in memory file `bug_live12_downgrade_crash.md`.
+
+**Scope:**
+- **Edit tab feature — not tied to downgrade flow.** Works on any session (native Live 11, downgraded, newly built).
+- User picks CLICK TRACK / GUIDE / both from Edit tab UI; MTST injects tracks into current `.als`
+- New `_inject_click_guide_tracks` parser action in `parse_als.py`; track IDs in safe range (104+)
+- Related existing code: `ClickTrackService.swift`, `ALSGeneratorService.swift`, `EditView.swift`, `_generate_click_track` + `_generate_als` parser actions
+
+---
+
 ## Swift Sources (`mtst-master/swift-app/Sources/MTSongTool/`)
 
 **QA tab:**
@@ -80,14 +97,39 @@ bash "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/swift-app/make_swift_
 
 **Flags:**
 - `--skip-parser` — skip PyInstaller step (use existing `dist/parse_als` binary). Fast for Swift-only changes.
+- `--no-relaunch` — skip the auto quit+reopen of a running `/Applications/MT Song Tool.app` at the end of the build. Default behavior gracefully quits via `osascript` (5s timeout → `pkill` fallback) and relaunches with `open -a`.
 
-**What it does (4 steps):**
+**What it does (4 steps + dev relaunch):**
 1. Runs `build_parser.sh` — compiles `parse_als.py` into a standalone binary via PyInstaller (venv at `mtst-master/venv/`). Installs `lxml` and `hexdump` into the venv first.
 2. Runs `swift build -c release`
 3. Assembles `/Applications/MT Song Tool.app` (Swift binary + parser binary + fonts + icon + bundled FFmpeg)
+   - Then (step 3b) quits + relaunches a currently-running `/Applications/MT Song Tool.app` so dev iterations test the fresh binary immediately. Skipped if the app isn't running, or if `--no-relaunch` is passed. Runs **before** the .pkg/.zip build so the relaunch happens during the slow packaging step.
 4. Produces a `.pkg` installer, wraps it with `Release Notes.md` in a versioned `.zip` at `Versions/MT Song Tool vX.X.X.zip`
 
 **No sudo required** — `/Applications` is group-writable for admin users. If the existing bundle is root-owned (from an older install), the script does a one-time `sudo chown` to take ownership.
+
+### GitHub Releases (manual)
+
+After each build, upload assets to the GitHub release at `https://github.com/dsoto1998/mt-song-tool/releases` (private repo). `gh` CLI is not installed — use curl directly:
+
+```bash
+# 1. Get release ID for the tag
+curl -s -H "Authorization: token <PAT>" \
+  "https://api.github.com/repos/dsoto1998/mt-song-tool/releases/tags/vX.X.X" \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['id'])"
+
+# 2. Extract .pkg from zip (build script doesn't leave a standalone copy)
+unzip -p "Versions/MT Song Tool vX.X.X.zip" \
+  "MT Song Tool vX.X.X/MT Song Tool X.X.X.pkg" > "/tmp/MT Song Tool X.X.X.pkg"
+
+# 3. Upload .pkg asset
+curl -H "Authorization: token <PAT>" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @"/tmp/MT Song Tool X.X.X.pkg" \
+  "https://uploads.github.com/repos/dsoto1998/mt-song-tool/releases/<RELEASE_ID>/assets?name=MT%20Song%20Tool%20X.X.X.pkg"
+```
+
+The `.zip` and release notes description are added manually via the GitHub web UI. Release notes have no Features section — Changelog only.
 
 ---
 
@@ -235,7 +277,7 @@ After stem scan finishes (`audioAnalyzer.isScanning` → `false`): if `songKey` 
 - `splitSegment(atSession:)`, `deleteRegion(lo:hi:)`, `moveRegion(lo:hi:to:)` — mutating `StemState` operations.
 - Per-stem metering: lock-free `MeterAtom` (single-word Float) for audio-thread → main-thread dB values.
 - `LocatorOverride` — `{ name: String?, beat: Double? }`. Keyed by `alsId` in `locatorOverrides: [String: LocatorOverride]`. `EditView` uses this when computing loop bracket beat (overrides the parsed beat if set).
-- `TimeSigEvent` — `{ beat, numerator, denominator }`. User-edited time sig lane stored in `timeSigOverrides: [TimeSigEvent]`.
+- `TimeSigEvent` — `{ beat, numerator, denominator }`. User-edited time sig lane stored in `timeSigOverrides: [TimeSigEvent]`. Edit tab picker (`TimeSigPickerPopover` in `EditView.swift`) is restricted to the 19 approved sigs from `SongDataOptions.timeSignatures` — same list as the QA tab.
 - `editableTempoEvents: [TempoEvent]` — user-edited tempo map; diverges from parsed result after edits. `EditView.rebuildBeatSchedule()` uses this when non-empty, falls back to `parsedResult.tempoEvents`.
 - `seedTempoEvents(_:)` — deduplicates same-beat pairs, keeping the **last** event at each beat (Ableton step change = two events at same beat; the second is the target BPM).
 - Beat-0 anchor event cannot be deleted: `deleteTempoEvent(at:)` and `deleteTimeSig(at:)` both guard `index > 0`.

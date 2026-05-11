@@ -870,9 +870,14 @@ def _downgrade_to_live11(path):
         'FluxModulationTarget',
         'SampleOffsetModulationTarget',
     )
-    all_ids = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
-    max_id = max(all_ids) if all_ids else 0
-    next_id = max_id + 100  # leave a gap for safety
+    # Use a fixed low starting ID (300) inside the safe zone that EDS leaves empty (33-483).
+    # EDS's AutomationTargets start at 484; BB11 AudioTracks start at 104.
+    # Using max_id+N would land in EDS's AT range (23000-30366) → different-type Pointee
+    # collision on import → null virtual dispatch crash.
+    _all_ids_set27 = set(int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content))
+    next_id = 300
+    while next_id in _all_ids_set27:
+        next_id += 1
 
     remap = {}
     target_re = re.compile(r'<(' + '|'.join(_target_tags) + r')\s+Id="(\d+)"')
@@ -884,6 +889,8 @@ def _downgrade_to_live11(path):
         if old < 30000 and old not in remap:
             remap[old] = next_id
             next_id += 1
+            while next_id in _all_ids_set27:
+                next_id += 1
         return f'<{tag} Id="{remap.get(old, old)}"'
 
     # Apply to MasterTrack block.
@@ -907,10 +914,11 @@ def _downgrade_to_live11(path):
             return m.group(0)
         content = re.sub(r'<PointeeId\s+Value="(\d+)"\s*/>', _update_pointee, content)
 
-        # Bump <NextPointeeId> safely above the new max.
+        # Set <NextPointeeId> to true max+1 so Live 11's allocator stays consistent.
+        _npi_ids_27 = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
         content = re.sub(
             r'(<NextPointeeId\s+Value=")\d+(")',
-            f'\\g<1>{next_id + 100}\\g<2>',
+            f'\\g<1>{max(_npi_ids_27) + 1}\\g<2>',
             content,
             count=1,
         )
@@ -1083,10 +1091,13 @@ def _downgrade_to_live11(path):
     _TRACK_SAFE_THRESHOLD = 200
     _track_tags = ('AudioTrack', 'MidiTrack', 'GroupTrack')
 
-    # Recompute max after all prior steps have run.
-    _all_ids_now = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
-    _cur_max = max(_all_ids_now) if _all_ids_now else 0
-    _next_safe = _cur_max + 200  # generous gap
+    # Start at 104: matches BB11 native start, above Live 11 internals (1-103),
+    # and below EDS's first AutomationTarget at 484. Using max_id+N put tracks at
+    # 23881+ which collided with EDS's AT range → different-type Pointee crash on import.
+    _all_ids_s30 = set(int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content))
+    _next_safe = 104
+    while _next_safe in _all_ids_s30:
+        _next_safe += 1
 
     _track_id_remap = {}
     _track_open_re = re.compile(
@@ -1097,6 +1108,8 @@ def _downgrade_to_live11(path):
         if _old < _TRACK_SAFE_THRESHOLD and _old not in _track_id_remap:
             _track_id_remap[_old] = _next_safe
             _next_safe += 1
+            while _next_safe in _all_ids_s30:
+                _next_safe += 1
 
     if _track_id_remap:
         def _remap_track_open_id(m):
@@ -1106,10 +1119,11 @@ def _downgrade_to_live11(path):
 
         content = _track_open_re.sub(_remap_track_open_id, content)
 
-        # Bump NextPointeeId above the new max so Live 11's allocator stays safe.
+        # Set NextPointeeId to true max+1 so Live 11's allocator stays consistent.
+        _npi_ids_30 = [int(m.group(1)) for m in re.finditer(r'\bId="(\d+)"', content)]
         content = re.sub(
             r'(<NextPointeeId\s+Value=")\d+(")',
-            f'\\g<1>{_next_safe + 100}\\g<2>',
+            f'\\g<1>{max(_npi_ids_30) + 1}\\g<2>',
             content,
             count=1,
         )
