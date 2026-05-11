@@ -174,8 +174,10 @@ struct AlignmentService {
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(refLen))
             guard refRms > minRMS else { windowStart += probeStep; continue }
 
-            // Bus window centred at the position that matches OG, shifted by coarseHintSec.
-            let busCenter     = (windowStart - ogOffset) + coarseHintSec
+            // Bus window centred at OG's current SESSION time (not OG file position).
+            // Drop ogOffset compensation so the check reflects OG's live timeline position —
+            // moving OG in the Edit tab changes the reported offset.
+            let busCenter     = windowStart + coarseHintSec
             let busWindowStart = max(0, busCenter - maxOffsetSec)
 
             var busBuf = [Float](repeating: 0, count: stemLen)
@@ -268,8 +270,8 @@ struct AlignmentService {
             vDSP_rmsqv(refBuf, 1, &refRms, vDSP_Length(fullRefLen))
             guard refRms > minRMS else { windowStart += 10.0; continue }
 
-            // Wide bus window: covers ±coarseMaxOffsetSec around the expected match position.
-            let busWindowStart = max(0, (windowStart - ogOffset) - coarseMaxOffsetSec)
+            // Wide bus window: ±coarseMaxOffsetSec around OG's current session time.
+            let busWindowStart = max(0, windowStart - coarseMaxOffsetSec)
 
             var busBuf = [Float](repeating: 0, count: fullStemLen)
             var activeStemCount = 0

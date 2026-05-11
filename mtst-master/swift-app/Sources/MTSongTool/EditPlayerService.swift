@@ -647,6 +647,7 @@ class EditPlayerService: ObservableObject {
 
     func deleteRegion(_ url: URL, lo: Double, hi: Double) {
         stemStates[url]?.deleteRegion(lo: lo, hi: hi)
+        invalidateAlignmentIfOG(url)
     }
 
     func removeStem(_ url: URL) {
@@ -657,6 +658,7 @@ class EditPlayerService: ObservableObject {
 
     func moveRegion(_ url: URL, lo: Double, hi: Double, to newStart: Double) {
         stemStates[url]?.moveRegion(lo: lo, hi: hi, to: newStart)
+        invalidateAlignmentIfOG(url)
     }
 
     // MARK: - Trim
@@ -673,6 +675,7 @@ class EditPlayerService: ObservableObject {
         state.segments[idx].sourceStart = newSourceStart
         state.segments[idx].sessionStart = newSessionStart
         stemStates[url] = state
+        invalidateAlignmentIfOG(url)
     }
 
     /// Trims the right (end) edge of a specific segment — moves sourceEnd by delta.
@@ -685,6 +688,7 @@ class EditPlayerService: ObservableObject {
         guard newSourceEnd > seg.sourceStart + 0.01 else { return }
         state.segments[idx].sourceEnd = newSourceEnd
         stemStates[url] = state
+        invalidateAlignmentIfOG(url)
     }
 
     /// Trims the left edge of every segment whose ID is in `ids` — for multi-clip simultaneous trim.
@@ -702,7 +706,7 @@ class EditPlayerService: ObservableObject {
                 state.segments[idx].sessionStart = newSessionStart
                 changed = true
             }
-            if changed { stemStates[url] = state }
+            if changed { stemStates[url] = state; invalidateAlignmentIfOG(url) }
         }
     }
 
@@ -719,7 +723,7 @@ class EditPlayerService: ObservableObject {
                 state.segments[idx].sourceEnd = newSourceEnd
                 changed = true
             }
-            if changed { stemStates[url] = state }
+            if changed { stemStates[url] = state; invalidateAlignmentIfOG(url) }
         }
     }
 
@@ -736,6 +740,16 @@ class EditPlayerService: ObservableObject {
         // Grow totalDuration if this stem now ends past it — canvas extends automatically.
         let maxEnd = state.segments.map { $0.sessionEnd }.max() ?? 0
         if maxEnd > totalDuration { totalDuration = maxEnd }
+        invalidateAlignmentIfOG(url)
+    }
+
+    /// Clears the cached alignment result when ORIGINAL SONG's segments mutate.
+    /// Forces the user to re-check after dragging/trimming/deleting OG content.
+    private func invalidateAlignmentIfOG(_ url: URL) {
+        guard busAlignmentResult != nil else { return }
+        if url.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG" {
+            busAlignmentResult = nil
+        }
     }
 
     var hasAnyEdits: Bool {
