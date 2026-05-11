@@ -1098,11 +1098,12 @@ class EditPlayerService: ObservableObject {
         return hasOG && !collectiveURLs.isEmpty
     }
 
-    /// Cross-correlates the summed stem bus against ORIGINAL SONG.
-    /// Single global result — applies uniformly to all collective stems on Correct.
+    /// Cross-correlates the summed collective stem bus against ORIGINAL SONG.
+    /// Single global result — all collective stems share the same offset.
     func runAlignmentCheck() {
         guard !isCheckingAlignment, hasAlignmentReference else { return }
 
+        let collective = collectiveURLs
         guard let refURL = stemURLs.first(where: {
             $0.deletingPathExtension().lastPathComponent.uppercased() == "ORIGINAL SONG"
             && stemStates[$0]?.isExcluded != true
@@ -1110,16 +1111,7 @@ class EditPlayerService: ObservableObject {
 
         let snapshot = stemStates
         let refState = snapshot[refURL] ?? StemState()
-
-        // Use ALL non-OG stems for alignment measurement — including CLICK TRACK and GUIDE.
-        // Collective stems alone can be very sparse (lots of intro silence), so the bus
-        // envelope shape diverges from OG's envelope and correlation locks onto a wrong
-        // lag. CLICK + GUIDE have continuous content from session 0 and anchor the bus.
-        // Correction (applyAllAlignmentCorrections) still only shifts collective stems.
-        let alignmentBus = stemURLs.filter { url in
-            url != refURL && stemStates[url]?.isExcluded != true
-        }
-        let alignmentStates = Dictionary(uniqueKeysWithValues: alignmentBus.compactMap { url -> (URL, StemState)? in
+        let collectiveStates = Dictionary(uniqueKeysWithValues: collective.compactMap { url -> (URL, StemState)? in
             guard let s = snapshot[url] else { return nil }
             return (url, s)
         })
@@ -1130,8 +1122,8 @@ class EditPlayerService: ObservableObject {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let result = await AlignmentService.checkBus(
-                stemURLs: alignmentBus,
-                stemStates: alignmentStates,
+                stemURLs: collective,
+                stemStates: collectiveStates,
                 referenceURL: refURL,
                 referenceState: refState
             )

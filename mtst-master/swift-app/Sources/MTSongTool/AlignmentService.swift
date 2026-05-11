@@ -62,12 +62,7 @@ struct AlignmentService {
 
     // Coarse-pass parameters (100× downsample → 441 Hz)
     private static let coarseDownsample: Int       = 100
-    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s around the very-coarse hint
-
-    // Very-coarse Pass 0 parameters (2000× downsample → ~22 Hz)
-    private static let veryCoarseDownsample: Int    = 2000
-    private static let veryCoarseMaxLagSec: Double  = 300.0  // ±300s — covers any practical drag
-    private static let veryCoarseConfidence: Float  = 0.5    // normalized cosine similarity threshold
+    private static let coarseMaxOffsetSec: Double  = 10.0  // ±10s around the -ogOffset hint
 
     // MARK: - Public API
 
@@ -114,15 +109,13 @@ struct AlignmentService {
 
         Log("ogOffset=\(ogOffset)s, probeMax=\(probeMax)s, stems=\(openStems.count)", "Align")
 
-        // Pass 0: very-coarse global cross-correlation (±300s at 22 Hz) with normalized
-        // cosine similarity. Anchors the subsequent passes so the ±10s coarse pass can never
-        // lock onto a spurious peak elsewhere in the song. Falls back to 0 if Pass 0 fails.
-        let pass0Result = veryCoarsePass(
-            openStems: openStems, refFile: refFile, refState: refState,
-            probeMax: probeMax
-        )
-        let veryCoarseHintSec = pass0Result ?? 0
-        Log("Pass 0 hint = \(pass0Result.map { String(format: "%.3f", $0) } ?? "nil")s", "Align")
+        // Pass 0: direct hint from OG's current session position. If user dragged OG to
+        // session N, the bus is N seconds early relative to OG's content (assuming stems
+        // were originally aligned at session 0). Pass 1 then refines within ±10s to catch
+        // any sub-second file-content offset on top of the drag. This avoids the envelope
+        // mismatch problem when collective stems have lots of intro silence.
+        let veryCoarseHintSec = -ogOffset
+        Log("Pass 0 hint = \(String(format: "%.3f", veryCoarseHintSec))s (from -ogOffset)", "Align")
 
         // Pass 1: coarse probe (±10s at 441 Hz) centred on the Pass 0 hint.
         // Returns ABSOLUTE offset (hint + measured lag).
@@ -352,87 +345,9 @@ struct AlignmentService {
         return nil
     }
 
-    // MARK: - Very-coarse pass (Pass 0)
-
-    /// Global cross-correlation at ~22 Hz (2000× downsample) over ±300 s, using normalized
-    /// cosine similarity at every integer lag. Anchors the subsequent passes so they cannot
-    /// lock onto a spurious peak elsewhere in the song.
-    /// Returns offset in seconds (positive = bus late), or nil if the best match is unreliable.
-    private static func veryCoarsePass(
-        openStems: [(file: AVAudioFile, state: StemState)],
-        refFile: AVAudioFile,
-        refState: StemState,
-        probeMax: Double
-    ) -> Double? {
-        let sr           = sampleRate
-        let ds           = veryCoarseDownsample
-        let coarseRate   = sr / Double(ds)
-        let renderDurSec = min(probeMax, probeMaxSeconds)
-        let renderLen    = Int(renderDurSec * sr)
-        let coarseLen    = renderLen / ds
-        guard coarseLen > 10 else { return nil }
-
-        // Render OG over [0, renderDurSec] in session time, then take the amplitude
-        // envelope at ~22 Hz. Signed mean would average to ~0 at 2000× decimation.
-        guard let ogFull = renderMono(state: refState, fromSeconds: 0,
-                                      length: renderLen, file: refFile) else { return nil }
-        let ogCoarse = envelopeDownsample(ogFull, factor: ds, outputLength: coarseLen)
-
-        // Sum every collective stem's envelope into the bus envelope.
-        var busCoarse = [Float](repeating: 0, count: coarseLen)
-        for (stemFile, stemState) in openStems {
-            guard let stemFull = renderMono(state: stemState, fromSeconds: 0,
-                                            length: renderLen, file: stemFile) else { continue }
-            let stemCoarse = envelopeDownsample(stemFull, factor: ds, outputLength: coarseLen)
-            vDSP_vadd(busCoarse, 1, stemCoarse, 1, &busCoarse, 1, vDSP_Length(coarseLen))
-        }
-
-        let maxLagCoarse = min(Int(veryCoarseMaxLagSec * coarseRate), coarseLen - 1)
-
-        var bestLag   = 0
-        var bestScore: Float = -.infinity
-
-        ogCoarse.withUnsafeBufferPointer { ogPtr in
-            busCoarse.withUnsafeBufferPointer { busPtr in
-                for lag in (-maxLagCoarse)...maxLagCoarse {
-                    let busStart = max(0, lag)
-                    let ogStart  = max(0, -lag)
-                    let length   = min(coarseLen - busStart, coarseLen - ogStart)
-                    guard length > 10 else { continue }
-
-                    var dot: Float = 0
-                    vDSP_dotpr(busPtr.baseAddress! + busStart, 1,
-                               ogPtr.baseAddress!  + ogStart,  1,
-                               &dot, vDSP_Length(length))
-
-                    var ogSS: Float = 0
-                    vDSP_svesq(ogPtr.baseAddress! + ogStart, 1, &ogSS, vDSP_Length(length))
-                    var busSS: Float = 0
-                    vDSP_svesq(busPtr.baseAddress! + busStart, 1, &busSS, vDSP_Length(length))
-
-                    let denom = sqrtf(ogSS) * sqrtf(busSS)
-                    guard denom > 1e-9 else { continue }
-                    let score = dot / denom
-                    if score > bestScore {
-                        bestScore = score
-                        bestLag   = lag
-                    }
-                }
-            }
-        }
-
-        Log("Pass 0 bestLag=\(bestLag) (coarse samples), bestScore=\(String(format: "%.3f", bestScore)), coarseLen=\(coarseLen)", "Align")
-        guard bestScore > veryCoarseConfidence else {
-            Log("Pass 0 confidence \(String(format: "%.3f", bestScore)) < \(veryCoarseConfidence) → nil", "Align")
-            return nil
-        }
-        return Double(bestLag) * Double(ds) / sr
-    }
-
     // MARK: - Helpers
 
-    /// Block-average downsample (signed mean). OK for small factors (≤100); for large
-    /// factors the signed mean ≈ DC ≈ 0 — use `envelopeDownsample` instead.
+    /// Block-average downsample (signed mean) for the coarse pass.
     private static func downsampleBlock(_ buf: [Float], factor: Int, outputLength: Int) -> [Float] {
         var out = [Float](repeating: 0, count: outputLength)
         let available = buf.count / factor
@@ -442,26 +357,6 @@ struct AlignmentService {
                 for i in 0..<n {
                     var val: Float = 0
                     vDSP_meanv(bufPtr.baseAddress! + i * factor, 1, &val, vDSP_Length(factor))
-                    outPtr[i] = val
-                }
-            }
-        }
-        return out
-    }
-
-    /// Envelope downsample: each output sample = mean(|x|) over `factor` input samples.
-    /// Required for large decimation ratios where the signed mean averages to ~0 (audio
-    /// oscillates around zero). Captures amplitude envelope, which is what cross-correlation
-    /// at a very coarse rate actually relies on.
-    private static func envelopeDownsample(_ buf: [Float], factor: Int, outputLength: Int) -> [Float] {
-        var out = [Float](repeating: 0, count: outputLength)
-        let available = buf.count / factor
-        let n = min(outputLength, available)
-        buf.withUnsafeBufferPointer { bufPtr in
-            out.withUnsafeMutableBufferPointer { outPtr in
-                for i in 0..<n {
-                    var val: Float = 0
-                    vDSP_meamgv(bufPtr.baseAddress! + i * factor, 1, &val, vDSP_Length(factor))
                     outPtr[i] = val
                 }
             }
