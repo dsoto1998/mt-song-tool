@@ -1,6 +1,6 @@
 <p align="center">
-<img width="900" alt="Screenshot 2026-05-11 at 2 18 11 PM" src="https://github.com/user-attachments/assets/5eef431a-b26f-4aad-9052-cfd0747c884a" />
-<img width="900" alt="Screenshot 2026-05-11 at 2 17 47 PM" src="https://github.com/user-attachments/assets/6d3650af-01e0-43f7-af25-c6e933fac000" />
+<img width="800" alt="Screenshot 2026-05-11 at 2 17 47 PM" src="https://github.com/user-attachments/assets/6d3650af-01e0-43f7-af25-c6e933fac000" />
+<img width="800" alt="Screenshot 2026-05-11 at 2 18 11 PM" src="https://github.com/user-attachments/assets/5eef431a-b26f-4aad-9052-cfd0747c884a" />
 </p>
 
 **MT Song Tool**
