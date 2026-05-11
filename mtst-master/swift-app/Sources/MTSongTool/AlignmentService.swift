@@ -276,7 +276,11 @@ struct AlignmentService {
         var peakIdx: vDSP_Length = 0
         vDSP_maxvi(result, 1, &peakVal, &peakIdx, vDSP_Length(N))
 
-        let lagCoarse = Int(peakIdx) <= halfN ? Int(peakIdx) : Int(peakIdx) - N
+        // vDSP_fft_zrip INVERSE places lag in the OPPOSITE direction from the standard
+        // ifft convention — verified empirically (math derivation predicted negative lag,
+        // but maxvi finds peak at positive index of equal magnitude). Negate to map back.
+        let rawLag    = Int(peakIdx) <= halfN ? Int(peakIdx) : Int(peakIdx) - N
+        let lagCoarse = -rawLag
         let lagSec    = Double(lagCoarse) / coarseRate
 
         // Confidence: peak vs std-dev of the full result.
