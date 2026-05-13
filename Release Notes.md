@@ -12,6 +12,7 @@
 - **Race condition on stem load** — The async waveform peaks task no longer overwrites `isExcluded`, gain, or segment edits that were set before it finished. The task now merges into the existing stem state instead of replacing it.
 - **Duplicate CLICK TRACK fix** — The real `CLICK TRACK.wav` now stays hidden after the synthetic click track regenerates. Previously the real one could reappear in the timeline at its full length, visually extending past the loop bracket.
 - **Synthetic CLICK TRACK in export** — The generated click track is now included in Export Stems, truncated to the loop bracket end like all other stems.
+- **Edit tab freeze fix** — Fixed a feedback loop where generating a click track (or any canvas-width change) could cause the Edit tab to freeze. `NSScrollView.didLiveScrollNotification` re-fires when content width changes, which was bumping `canvasRightPadding` repeatedly and triggering an infinite chain of beat-schedule rebuilds. `handleLiveScroll` now ignores notifications where the scroll position didn't actually move, and rate-limits canvas growth to 4/sec.
 
 ### v1.7.0 — May 2026
 

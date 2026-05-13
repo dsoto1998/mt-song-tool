@@ -2318,6 +2318,8 @@ struct WaveformScrollHost: NSViewRepresentable {
         var waveformContainer: CALayer?    // container for per-stem waveform + outline layers
         var lastContentVersion: Int = -1
         var keyMonitor: Any?
+        var lastLiveScrollX: CGFloat = -1   // suppresses synthetic didLiveScroll notifications from layout changes
+        var lastEdgeBumpAt: TimeInterval = 0  // debounce onApproachingRightEdge to avoid feedback loop with canvasRightPadding rebuilds
 
         init(_ parent: WaveformScrollHost) { self.parent = parent }
 
@@ -2366,10 +2368,20 @@ struct WaveformScrollHost: NSViewRepresentable {
         @objc func handleLiveScroll(_ notification: Notification) {
             guard let sv = notification.object as? NSScrollView,
                   let docView = sv.documentView else { return }
+            let scrollX = sv.documentVisibleRect.minX
+            // Ignore notifications fired by layout changes (scroll position didn't actually move).
+            // Without this guard, growing canvasRightPadding triggers a didLiveScroll which re-enters
+            // this handler, bumps canvasRightPadding again, and we feedback-loop forever.
+            guard abs(scrollX - lastLiveScrollX) > 0.5 else { return }
+            lastLiveScrollX = scrollX
             let rightEdge = sv.documentVisibleRect.maxX
             let contentWidth = docView.frame.width
             let viewportWidth = sv.bounds.width
             guard contentWidth - rightEdge < viewportWidth else { return }
+            // Additional safety: rate-limit the bump to once per 250 ms.
+            let now = CACurrentMediaTime()
+            guard now - lastEdgeBumpAt > 0.25 else { return }
+            lastEdgeBumpAt = now
             DispatchQueue.main.async { [weak self] in
                 self?.parent.onApproachingRightEdge()
             }
