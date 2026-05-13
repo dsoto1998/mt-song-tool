@@ -297,6 +297,7 @@ class ParserService: ObservableObject {
         tempoEvents: [TempoEvent],
         timeSigEvents: [TimeSigOverride],
         locatorOverrides: [String: LocatorOverride],
+        newLocators: [NewLocator] = [],
         outputPath: String? = nil
     ) async throws -> String {
         var cmd: [String: Any] = [
@@ -312,6 +313,9 @@ class ParserService: ObservableObject {
                 return d
             }
         ]
+        if !newLocators.isEmpty {
+            cmd["new_locators"] = newLocators.map { ["beat": $0.beat, "name": $0.name] }
+        }
         if let out = outputPath { cmd["output_path"] = out }
         guard let cmdData = try? JSONSerialization.data(withJSONObject: cmd),
               let cmdStr  = String(data: cmdData, encoding: .utf8) else {

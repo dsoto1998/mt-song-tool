@@ -1,27 +1,31 @@
-# MT Song Tool — v1.6.3
-
-## Features
-
-- **Session parsing** — Drag-and-drop or click-to-browse `.als` loading; extracts locators with accurate timestamps across tempo automation changes, time signatures, BPM, and loop bracket
-- **Locator validation** — Labels checked against the MultiTracks approved sections list; invalid labels highlighted red; auto-fix normalization and inline rename picker; corrections written back to the `.als` file
-- **Time Signatures panel** — Extracted from the Ableton automation envelope with fallback to static numerator/denominator
-- **Song Data panel** — Auto-populates Time Signature, BPM, and Preview Start/End from the session; Song Key auto-detected from the ORIGINAL SONG stem; all fields copyable
-- **Session validation** — Loop bracket vs audio clip alignment, barline checks with mid-song time signature support, tempo ramp detection; copy blocked on issues
-- **Stem Check panel** — Batch-validates `.wav` stems for silence, name conformance (~200 approved names), and audio format (44.1 kHz / 16-bit); smart name suggestions with confidence percentages; Fix Names and Fix Format (FFmpeg) buttons
-- **Stem audio preview** — Inline per-stem playback with waveform seek view; click to seek, drag to scrub
-- **Locator section preview** — Play ORIGINAL SONG from any locator's start time directly from the Locators panel
-- **AudioShake tab** — AI-powered stem separation via the AudioShake API; drop any mixed audio file, select from 15 stem models (vocals, lead/backing, instrumental, drums, bass, guitar variants, piano, keys, strings, wind, other), choose an output folder, and download separated stems with inline playback
-- **Edit tab** — Multi-stem timeline with transport, pinch-to-zoom, region select/delete/move, cut/split, per-stem gain, mute/solo, and FFmpeg bake-out. Interactive tempo lane and time signature lane. Locator drag-to-reposition with live loop bracket. Stem deletion. Gain-locked reference stems (CLICK TRACK, GUIDE, ORIGINAL SONG) with per-stem peak-hold meters. Master meter with all-time peak hold. Export Stems to 44.1 kHz / 16-bit PCM. Build Session generates a complete `.als` from scratch. Suggest Locators from a lyric sheet or Genius/AZLyrics URL via Whisper alignment.
-- **Metronome** — Tempo-synced click track with mute toggle, subdivision modes (quarter/eighth), and real-time volume control
-- **Live 12 detection** — Loading a Live 12 session prompts conversion to Live 11 before QA; old Ableton (v10 and earlier) sessions show an alert with an "Open in Ableton 11" option
-- **Quick Check mode** — Removes the requirement to have both an `.als` and stems before proceeding
-- **MT Complete mode** — Suppresses the NEXT SONG missing-locator warning for single-song sessions
-- **Help > Release Notes** — In-app release notes viewer accessible from the Help menu
-- **Login screen** — First/Last name saved via UserDefaults; Settings gear with theme toggle (Light/Dark/System) and Log Out
-- Native macOS app (macOS 13+) with San Francisco font, transparent title bar, and traffic lights
-- Portable — no Python, FFmpeg, or other dependencies needed on target Mac; `.pkg` installer in a versioned `.zip`
+# MT Song Tool — v1.7.0
 
 ## Changelog
+
+### v1.7.0 — May 2026
+
+#### Edit Tab
+
+- **User-added locators** — Right-click anywhere in the locator lane and choose "Add Locator" to open the section name picker. Confirmed locators appear as flags in the lane immediately. Drag to reposition (snaps to bar downbeats). Hover a user-added flag and click × to remove it. All changes persist on ⌘S like any other session edit.
+- **Locators redesigned as flags** — Each locator is now a thin vertical line with a compact label pill, leaving the lane visually empty between markers. The previous design used wide bars spanning the full region to the next locator, which obscured the timeline and made right-clicking feel ambiguous.
+- **⌘Z undo for locators** — Adding, deleting, renaming, and repositioning locators (both user-added and parsed) are all undoable via ⌘Z.
+- **⌘Z undo for tempo events** — Adding, deleting, and editing BPM or beat position in the tempo lane are now undoable.
+- **⌘Z undo for time sig events** — Adding, deleting, editing numerator/denominator, and repositioning time signature events are now undoable.
+- **COUNT OFF always present on Build Session** — Building a new .als from the Build Session panel now always includes a COUNT OFF locator at beat 0, even if none was manually added.
+- **Stems stay visible after Build Session** — After building and saving an .als, stem waveforms no longer disappear from the timeline. Previously, building triggered a full file reload that cleared the stem scan state.
+- **Locator lane refreshes immediately** — Adding, deleting, or moving a locator now redraws the lane instantly without requiring a zoom or scroll action to trigger the update.
+- **Ghost chip stuck fix** — The pending new-locator ghost chip no longer gets stuck when the waveform is scrolled or zoomed while the name picker is open. Clicking the ghost chip cancels it.
+- **Locator picker position fix** — The name picker popover now opens at the correct on-screen position when the waveform is scrolled. Previously it always appeared anchored to bar 1 regardless of where the locator was placed.
+
+### v1.6.4 — May 2026
+
+#### Edit Tab
+
+- **Click Track — 6/8 in Build Session mode** — Generating a click track in Build Session mode now correctly uses the selected time signature. Previously the generator always produced a 4/4 pattern regardless of the Time Signature picker value.
+- **Dropped WAV name validation** — WAV files dragged into the Edit tab are now immediately checked against the approved stem name list. The name indicator turns red if the filename is not approved, just like scanned stems. A rename picker is shown to correct it before export.
+- **Lane labels** — The left sidebar now shows "LOCATORS", "TEMPO", and "TIME SIG" labels aligned to their respective lanes, with dividers between them.
+- **Drop stems without an .als** — Individual WAV files (or a folder of WAVs) can now be dropped into the Edit tab in Build Session mode even when no session is loaded. Drop one file or select many and drop them all at once; each appears as a stem lane immediately.
+
 
 ### v1.6.3 — May 2026
 

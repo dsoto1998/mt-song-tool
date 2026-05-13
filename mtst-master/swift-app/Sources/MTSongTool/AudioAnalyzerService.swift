@@ -516,7 +516,7 @@ class AudioAnalyzerService: ObservableObject {
     // MARK: Stem name validation
 
     /// Returns an issue string if the stem name is invalid, nil if it's acceptable.
-    private static func validateStemName(_ name: String, approvedStems: Set<String>) -> String? {
+    static func validateStemName(_ name: String, approvedStems: Set<String>) -> String? {
         // No leading/trailing spaces, and no internal runs of multiple spaces
         if name != name.trimmingCharacters(in: .whitespaces) || name.contains("  ") {
             return "Extra Space"
@@ -905,6 +905,7 @@ class AudioAnalyzerService: ObservableObject {
         outputFolder: URL,
         loopEndSeconds: Double,
         stemStates: [URL: StemState],
+        pendingRenames: [URL: String] = [:],
         autoFadeCuts: Bool,
         completion: @escaping (String?) -> Void
     ) {
@@ -946,7 +947,14 @@ class AudioAnalyzerService: ObservableObject {
                 DispatchQueue.main.async { self.exportProgress = (i + 1, exportableResults.count) }
 
                 let source = sourceFolder.appendingPathComponent(result.filename)
-                let dest   = outputFolder.appendingPathComponent(result.filename)
+                // Apply pending rename if present — file stays at original path on disk.
+                let outputFilename: String
+                if let pending = pendingRenames[source] {
+                    outputFilename = pending + ".wav"
+                } else {
+                    outputFilename = result.filename
+                }
+                let dest   = outputFolder.appendingPathComponent(outputFilename)
                 let state  = stemStates[source] ?? StemState()
 
                 let hasSegmentEdits = state.segments.count > 1 ||

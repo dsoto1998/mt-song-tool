@@ -10,6 +10,7 @@ struct ContentView: View {
     @StateObject private var editPlayer = EditPlayerService()
     @StateObject private var audioShakePlayer = StemPlayerService()
     @StateObject private var metronome = MetronomeService()
+    @StateObject private var clickService = ClickTrackService()
     @ObservedObject private var userSettings = UserSettings.shared
     @State private var copiedMarkers = false
     @State private var copiedSigs = false
@@ -104,6 +105,7 @@ struct ContentView: View {
                     EditView(
                         editPlayer: editPlayer,
                         metronome: metronome,
+                        clickService: clickService,
                         stemURLs: audioAnalyzer.stemURLs,
                         analyzer: audioAnalyzer,
                         parsedResult: parser.result,
@@ -112,7 +114,7 @@ struct ContentView: View {
                         alsFullPath: parser.alsPath,
                         mtCompleteMode: userSettings.mtCompleteMode,
                         onFolderDrop: { url in handleFolderDrop(url) },
-                        onBuildComplete: { path in loadNewFile(path: path) }
+                        onBuildComplete: { path in reparseAfterSave(path: path) }
                     )
                     .padding(.horizontal, 20)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

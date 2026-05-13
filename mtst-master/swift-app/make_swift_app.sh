@@ -6,16 +6,18 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.6.3"
+VERSION="1.7.0"
 APP_NAME="MT Song Tool"
 BUNDLE_ID="com.multitracks.MTSongTool"
 DAWTOOL_ROOT="$(cd .. && pwd)"
 
 # ── Flag parsing ─────────────────────────────────────────────────────────────
 SKIP_PARSER=false
+NO_RELAUNCH=false
 for arg in "$@"; do
     case "$arg" in
         --skip-parser) SKIP_PARSER=true ;;
+        --no-relaunch) NO_RELAUNCH=true ;;
     esac
 done
 
@@ -193,6 +195,28 @@ cp -R "$APP_BUNDLE" "/Applications/"
 xattr -cr "/Applications/$APP_NAME.app"
 echo "✅  Installed: /Applications/$APP_NAME.app"
 echo ""
+
+# ── Step 3b: Quit + relaunch running instance (dev convenience) ──────────────
+if [ "$NO_RELAUNCH" = true ]; then
+    echo "==> Skipping relaunch (--no-relaunch)"
+else
+    if pgrep -f "/Applications/$APP_NAME.app" >/dev/null 2>&1; then
+        echo "==> Quitting running $APP_NAME…"
+        osascript -e "tell application \"$APP_NAME\" to quit" 2>/dev/null || true
+        # Wait up to 5s for graceful quit
+        for _ in 1 2 3 4 5; do
+            pgrep -f "/Applications/$APP_NAME.app" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        # Force kill if still running
+        pkill -f "/Applications/$APP_NAME.app" 2>/dev/null || true
+        echo "==> Relaunching $APP_NAME…"
+        open -a "$APP_NAME"
+    else
+        echo "==> $APP_NAME not running — skipping relaunch."
+    fi
+    echo ""
+fi
 
 # ── Step 4: Build the .pkg installer ─────────────────────────────────────────
 echo "==> Step 4/4: Building .pkg installer…"

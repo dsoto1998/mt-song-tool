@@ -56,7 +56,7 @@
  [],
  False,
  False,
- 1778182937,
+ 1778683656,
  [('run',
    '/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/venv/lib/python3.14/site-packages/PyInstaller/bootloader/Darwin-64bit/run',
    'EXECUTABLE')],

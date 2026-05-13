@@ -374,7 +374,7 @@ def _patch_time_sig_events_in_content(content, time_sig_events):
     return content
 
 
-def _save_als_edits(path, tempo_events, time_sig_events, locator_overrides, output_path=None):
+def _save_als_edits(path, tempo_events, time_sig_events, locator_overrides, new_locators=None, output_path=None):
     """Patch tempo map, time signatures, and locator positions/names.
 
     When output_path is None: backs up the original to OLD_<basename>.als and
@@ -385,6 +385,7 @@ def _save_als_edits(path, tempo_events, time_sig_events, locator_overrides, outp
     tempo_events: list of {"beat": float, "bpm": float} — beats >= 0, sorted
     time_sig_events: list of {"beat": float, "numerator": int, "denominator": int}
     locator_overrides: list of {"als_id": str, "beat": float|null, "name": str|null}
+    new_locators: list of {"beat": float, "name": str} — new locators to insert
 
     Returns {"ok": True, "new_path": "..."} or {"error": "..."}.
     """
@@ -437,6 +438,33 @@ def _save_als_edits(path, tempo_events, time_sig_events, locator_overrides, outp
                 content,
                 flags=re.DOTALL,
             )
+
+        # 4. Insert new locators
+        if new_locators:
+            existing_ids = [int(m) for m in re.findall(r'<Locator\s+Id="(\d+)"', content)]
+            next_id = (max(existing_ids) + 1) if existing_ids else 1
+            indent = '\t\t\t'
+            new_xml = ''
+            for i, loc in enumerate(sorted(new_locators, key=lambda x: x['beat'])):
+                escaped = str(loc['name']).replace('&', '&amp;').replace('"', '&quot;')
+                new_xml += (
+                    f'\n{indent}<Locator Id="{next_id + i}">'
+                    f'\n{indent}\t<LomId Value="0" />'
+                    f'\n{indent}\t<Time Value="{repr(float(loc["beat"]))}" />'
+                    f'\n{indent}\t<Name Value="{escaped}" />'
+                    f'\n{indent}\t<Annotation Value="" />'
+                    f'\n{indent}\t<IsSongStart Value="false" />'
+                    f'\n{indent}</Locator>'
+                )
+            # Handle self-closing <Locators /> vs populated block
+            if re.search(r'<Locators\s*/>', content):
+                content = re.sub(
+                    r'<Locators\s*/>',
+                    f'<Locators>{new_xml}\n{indent[:-1]}</Locators>',
+                    content, count=1
+                )
+            else:
+                content = re.sub(r'(</Locators>)', new_xml + r'\n\1', content, count=1)
 
         # Write patched content
         if output_path:
@@ -1142,6 +1170,234 @@ def _downgrade_to_live11(path):
         return {"error": f"Could not write output file: {e}"}
 
     return {"ok": True, "new_path": out_path}
+
+
+def _find_click_samples_dir():
+    """Locate the directory containing CLASSIC-4TH'S.aif and CLASSIC-8TH'S.aif.
+
+    Search order:
+    1. sys._MEIPASS/_internal  (PyInstaller onedir runtime)
+    2. Adjacent to this script (dev mode)
+    3. App bundle Resources/click-samples  (relative to binary)
+    """
+    import os as _os
+    import sys as _sys
+
+    candidates = []
+
+    # PyInstaller: _MEIPASS points to _internal dir
+    if hasattr(_sys, '_MEIPASS'):
+        candidates.append(_os.path.join(_sys._MEIPASS, 'click-samples'))
+
+    # Adjacent to script / binary
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    candidates.append(_os.path.join(script_dir, 'click-samples'))
+
+    # App bundle: binary lives at Contents/Resources/parse_als_dir/parse_als
+    # Resources are at Contents/Resources/
+    candidates.append(_os.path.join(script_dir, '..', '..', 'Resources', 'click-samples'))
+
+    for d in candidates:
+        d = _os.path.normpath(d)
+        if _os.path.isfile(_os.path.join(d, "CLASSIC-4TH'S.aif")):
+            return d
+
+    raise FileNotFoundError(
+        "click-samples directory not found. Checked: " + ", ".join(candidates)
+    )
+
+
+def _generate_click_track(output_path, bpm, time_sig, duration_seconds,
+                          tempo_events=None, time_sig_events=None):
+    """Generate a stereo PCM-16 click-track WAV from a tempo/time-sig map.
+
+    tempo_events    – list of {beat, bpm} dicts (step changes; same-beat pair → single step)
+    time_sig_events – list of {beat, numerator, denominator} dicts
+    duration_seconds – total length of the output file
+
+    Click pattern:
+      Compound meters (6/8, 9/8, 12/8): eighth-note grid; first of every 3 eighths = accent,
+      others = sub.
+      All other meters: quarter beats = accent, upbeat eighths = sub.
+
+    Gains: accent = 1.0, sub = 99/127. Uses L channel of CLASSIC-8TH'S.aif for both.
+    Returns {"path": output_path} or {"error": "..."}.
+    """
+    import os as _os
+    import math as _math
+    import numpy as _np
+    import soundfile as _sf
+
+    try:
+        samples_dir = _find_click_samples_dir()
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    SR = 44100
+    duration_seconds = float(duration_seconds)
+    if duration_seconds <= 0:
+        return {"error": "duration_seconds must be > 0"}
+
+    # ── Load click samples ────────────────────────────────────────────────────
+    # Accent: CLASSIC-4TH'S.aif (C4 in ALS template) — quarter-note click sound.
+    # Sub:    CLASSIC-8TH'S.aif (C#4 in ALS template) — eighth-note click sound.
+    # Gains normalized so accent ~0.665 (-3.5 dBFS) and sub ~0.512 (-5.8 dBFS),
+    # matching the reference CLICK TRACK.wav peaks.
+    def _load_mono_stereo(path):
+        data, sr = _sf.read(path, dtype='float32', always_2d=True)
+        # Pick the louder channel (L and R differ significantly in some AIF files)
+        ch = 0 if _np.max(_np.abs(data[:, 0])) >= _np.max(_np.abs(data[:, 1])) else 1
+        mono = data[:, ch:ch+1]
+        return _np.hstack([mono, mono]), sr
+
+    try:
+        acc_raw, acc_sr = _load_mono_stereo(_os.path.join(samples_dir, "CLASSIC-4TH'S.aif"))
+        sub_raw, sub_sr = _load_mono_stereo(_os.path.join(samples_dir, "CLASSIC-8TH'S.aif"))
+    except Exception as e:
+        return {"error": f"Failed to load click samples: {e}"}
+
+    if acc_sr != SR or sub_sr != SR:
+        return {"error": f"Click samples must be 44100 Hz (got acc={acc_sr}, sub={sub_sr})"}
+
+    # Normalize each sample so its peak matches the reference output levels.
+    TARGET_ACCENT = 0.665   # reference accent peak (-3.5 dBFS)
+    TARGET_SUB    = 0.512   # reference sub peak    (-5.8 dBFS)
+
+    acc_peak = float(_np.max(_np.abs(acc_raw))) or 1.0
+    sub_peak = float(_np.max(_np.abs(sub_raw))) or 1.0
+
+    accent_data = acc_raw
+    sub_data    = sub_raw
+    accent_gain = TARGET_ACCENT / acc_peak   # ~1.53 for 4TH'S (peak 0.434)
+    sub_gain    = TARGET_SUB    / sub_peak   # ~0.777 for 8TH'S (peak 0.659)
+
+    # ── Build tempo map: list of (beat_position, bpm) ────────────────────────
+    if tempo_events:
+        raw_evs = sorted(tempo_events, key=lambda e: e['beat'])
+        # Deduplicate same-beat pairs (Ableton step-change = two events at same beat)
+        deduped = {}
+        for ev in raw_evs:
+            deduped[round(ev['beat'], 6)] = float(ev['bpm'])
+        tempo_map = sorted(deduped.items())  # [(beat, bpm), ...]
+    else:
+        tempo_map = []
+
+    # ── Build time-sig map: list of (beat_position, numerator, denominator) ──
+    if time_sig_events:
+        ts_raw = sorted(time_sig_events, key=lambda e: e['beat'])
+        ts_map = [(float(e['beat']), int(e['numerator']), int(e['denominator']))
+                  for e in ts_raw]
+    else:
+        # Parse static time_sig string (e.g. "4/4", "6/8")
+        parts = str(time_sig).split('/')
+        num = int(parts[0]) if len(parts) == 2 else 4
+        den = int(parts[1]) if len(parts) == 2 else 4
+        ts_map = [(0.0, num, den)]
+
+    def _ts_at_beat(beat):
+        """Return (numerator, denominator) active at `beat`."""
+        result = ts_map[0][1], ts_map[0][2]
+        for b, n, d in ts_map:
+            if b <= beat + 0.0001:
+                result = n, d
+            else:
+                break
+        return result
+
+    def _bpm_at_beat(beat):
+        """Return BPM active just before `beat`."""
+        result = float(bpm)
+        for b, v in tempo_map:
+            if b <= beat + 0.0001:
+                result = v
+            else:
+                break
+        return result
+
+    # ── Walk through beats and collect click events ───────────────────────────
+    # click_events: list of (sample_frame, is_accent)
+    click_events = []
+    total_frames = int(duration_seconds * SR)
+
+    beat = 0.0       # current position in quarter-note beats
+    time_sec = 0.0   # session time in seconds at `beat`
+
+    COMPOUND_DENOMS = {8, 16}  # compound: eighth/16th denominators when numerator % 3 == 0
+
+    while time_sec < duration_seconds - 0.001:
+        current_bpm  = _bpm_at_beat(beat)
+        q_dur_sec    = 60.0 / current_bpm   # seconds per quarter-note beat
+        num, den     = _ts_at_beat(beat)
+
+        # Compound meter: num divisible by 3 with 8th/16th denominator
+        is_compound = (den in COMPOUND_DENOMS) and (num % 3 == 0)
+
+        if is_compound:
+            # Each denominator unit is an eighth note = 0.5 quarter beats
+            # Each denominator unit = (4/den) quarter beats
+            eighth_dur_sec = q_dur_sec * 4.0 / den   # e.g. den=8 → 0.5*q_dur
+
+            for eighth_idx in range(num):
+                t = time_sec + eighth_idx * eighth_dur_sec
+                if t >= duration_seconds:
+                    break
+                frame = int(t * SR)
+                if frame >= total_frames:
+                    break
+                click_events.append((frame, eighth_idx % 3 == 0))
+
+            bar_dur_sec   = num * eighth_dur_sec
+            bar_dur_beats = num * (4.0 / den)   # denominator units in quarter-note beats
+            beat     += bar_dur_beats
+            time_sec += bar_dur_sec
+        else:
+            # Simple meter: one click per denominator unit; beat 0 = accent, rest = sub
+            # Also place sub-clicks at the midpoint of each unit (eighth-note grid)
+            unit_beats = 4.0 / den            # quarter-note beats per denominator unit
+            unit_sec   = unit_beats * q_dur_sec
+
+            for i in range(num):
+                t_main = time_sec + i * unit_sec
+                if t_main >= duration_seconds:
+                    break
+                frame = int(t_main * SR)
+                if frame < total_frames:
+                    click_events.append((frame, True))  # all quarter beats = accent
+
+                # Sub-click at midpoint of each unit
+                t_sub = t_main + unit_sec * 0.5
+                if t_sub < duration_seconds:
+                    frame_s = int(t_sub * SR)
+                    if frame_s < total_frames:
+                        click_events.append((frame_s, False))
+
+            bar_dur_beats = num * unit_beats
+            bar_dur_sec   = num * unit_sec
+            beat     += bar_dur_beats
+            time_sec += bar_dur_sec
+
+    # ── Mix click events into output buffer ───────────────────────────────────
+    out = _np.zeros((total_frames, 2), dtype=_np.float32)
+
+    for frame, is_accent in click_events:
+        sample_data = accent_data if is_accent else sub_data
+        gain        = accent_gain if is_accent else sub_gain
+        end = min(frame + len(sample_data), total_frames)
+        length = end - frame
+        if length <= 0:
+            continue
+        out[frame:end] += sample_data[:length] * gain
+
+    # Hard-clip
+    _np.clip(out, -1.0, 1.0, out=out)
+
+    # ── Write WAV ─────────────────────────────────────────────────────────────
+    try:
+        _sf.write(output_path, out, SR, subtype='PCM_16')
+    except Exception as e:
+        return {"error": f"Failed to write click track WAV: {e}"}
+
+    return {"path": output_path}
 
 
 def _detect_key(wav_path):
@@ -1851,7 +2107,10 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
         send1_at  = _nid(); send1_mt = _nid()
         spk_id    = _nid()
         pan_at    = _nid(); pan_mt = _nid()
+        spl_l_at  = _nid(); spl_l_mt = _nid()
+        spl_r_at  = _nid(); spl_r_mt = _nid()
         vol_at    = _nid(); vol_mt = _nid()
+        xfade_at  = _nid()
         pointee_id = _nid()
         clip_at   = _nid()
         frz_on    = _nid(); frz_pt = _nid()
@@ -1935,14 +2194,26 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 						<AutomationTarget Id="{pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Pan>
+					<SplitStereoPanL>
+						<LomId Value="0" /><Manual Value="-1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{spl_l_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{spl_l_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanL>
+					<SplitStereoPanR>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{spl_r_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{spl_r_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanR>
 					<Volume>
 						<LomId Value="0" /><Manual Value="{repr(amp)}" />
 						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
 						<AutomationTarget Id="{vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Volume>
-					<ViewStateSesstionTrackWidth Value="74" />
-					<CrossFadeState Value="0" /><SendsListWrapper LomId="0" />
+					<ViewStateSesstionTrackWidth Value="93" />
+					<CrossFadeState><LomId Value="0" /><Manual Value="1" /><AutomationTarget Id="{xfade_at}"><LockEnvelope Value="0" /></AutomationTarget></CrossFadeState><SendsListWrapper LomId="0" />
 				</Mixer>
 				<MainSequencer>
 					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
@@ -1957,7 +2228,17 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 					<LastPresetRef><Value /></LastPresetRef>
 					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
 					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
-					<MonitoringEnum Value="1" />
+					<ClipSlotList>
+						<ClipSlot Id="0"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="1"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="2"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="3"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="4"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="5"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="6"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+						<ClipSlot Id="7"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /><NeedRefreeze Value="true" /></ClipSlot>
+					</ClipSlotList>
+					<MonitoringEnum Value="2" />
 					<Sample>
 						<ArrangerAutomation>
 							<Events>
@@ -2057,14 +2338,27 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 					<Recorder><IsArmed Value="false" /><TakeCounter Value="1" /></Recorder>
 				</MainSequencer>
 {freeze_seq(frz_on, frz_pt)}
+				<DeviceChain>
+					<Devices />
+					<SignalModulations />
+				</DeviceChain>
 			</DeviceChain>
 		</AudioTrack>'''
 
     # ── return track builder ──────────────────────────────────────────────────
     def return_track(track_id, label):
         on_id = _nid(); spk_id = _nid()
-        pan_at = _nid(); pan_mt = _nid(); vol_at = _nid(); vol_mt = _nid()
+        pan_at = _nid(); pan_mt = _nid()
+        spl_l_at = _nid(); spl_l_mt = _nid()
+        spl_r_at = _nid(); spl_r_mt = _nid()
+        vol_at = _nid(); vol_mt = _nid()
+        xfade_at = _nid()
         pointee_id = _nid()
+        send0_at = _nid(); send0_mt = _nid()
+        send1_at = _nid(); send1_mt = _nid()
+        frz_on = _nid(); frz_pt = _nid()
+        frz_vol_mt = _nid(); frz_trans_mt = _nid(); frz_grain_mt = _nid()
+        frz_flux_mt = _nid(); frz_soff_mt = _nid()
         return f'''		<ReturnTrack Id="{track_id}">
 			<LomId Value="0" /><LomIdView Value="0" />
 			<IsContentSelectedInDocument Value="false" /><PreferredContentViewMode Value="0" />
@@ -2093,7 +2387,30 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 				<ClipEnvelopeChooserViewState>
 					<SelectedDevice Value="1" /><SelectedEnvelope Value="0" /><PreferModulationVisible Value="false" />
 				</ClipEnvelopeChooserViewState>
-{routing_block("Ext. In", "1", "Ext. Out", "1/2")}
+				<AudioInputRouting>
+						<Target Value="AudioIn/External/S0" />
+						<UpperDisplayString Value="Ext. In" />
+						<LowerDisplayString Value="1/2" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</AudioInputRouting>
+					<MidiInputRouting>
+						<Target Value="MidiIn/External.All/-1" />
+						<UpperDisplayString Value="Ext: All Ins" />
+						<LowerDisplayString Value="" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</MidiInputRouting>
+					<AudioOutputRouting>
+						<Target Value="AudioOut/Master" />
+						<UpperDisplayString Value="Master" />
+						<LowerDisplayString Value="" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</AudioOutputRouting>
+					<MidiOutputRouting>
+						<Target Value="MidiOut/None" />
+						<UpperDisplayString Value="None" />
+						<LowerDisplayString Value="" />
+						<MpeSettings><ZoneType Value="0" /><FirstNoteChannel Value="1" /><LastNoteChannel Value="15" /></MpeSettings>
+					</MidiOutputRouting>
 				<Mixer>
 					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
 					<On>
@@ -2120,15 +2437,77 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 						<AutomationTarget Id="{pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Pan>
+					<SplitStereoPanL>
+						<LomId Value="0" /><Manual Value="-1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{spl_l_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{spl_l_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanL>
+					<SplitStereoPanR>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="{spl_r_at}"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="{spl_r_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanR>
 					<Volume>
 						<LomId Value="0" /><Manual Value="1" />
 						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
 						<AutomationTarget Id="{vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Volume>
-					<ViewStateSesstionTrackWidth Value="74" />
-					<CrossFadeState Value="0" /><SendsListWrapper LomId="0" />
+					<ViewStateSesstionTrackWidth Value="93" />
+					<CrossFadeState><LomId Value="0" /><Manual Value="1" /><AutomationTarget Id="{xfade_at}"><LockEnvelope Value="0" /></AutomationTarget></CrossFadeState>
+					<Sends>
+						<TrackSendHolder Id="0">
+							<Send>
+								<LomId Value="0" /><Manual Value="0.0003162277571" />
+								<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1" /></MidiControllerRange>
+								<AutomationTarget Id="{send0_at}"><LockEnvelope Value="0" /></AutomationTarget>
+								<ModulationTarget Id="{send0_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+							</Send>
+							<Active Value="false" />
+						</TrackSendHolder>
+						<TrackSendHolder Id="1">
+							<Send>
+								<LomId Value="0" /><Manual Value="0.0003162277571" />
+								<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1" /></MidiControllerRange>
+								<AutomationTarget Id="{send1_at}"><LockEnvelope Value="0" /></AutomationTarget>
+								<ModulationTarget Id="{send1_mt}"><LockEnvelope Value="0" /></ModulationTarget>
+							</Send>
+							<Active Value="false" />
+						</TrackSendHolder>
+					</Sends>
+					<SendsListWrapper LomId="0" />
 				</Mixer>
+				<DeviceChain>
+					<Devices />
+					<SignalModulations />
+				</DeviceChain>
+				<FreezeSequencer>
+					<LomId Value="0" /><LomIdView Value="0" /><IsExpanded Value="true" />
+					<On>
+						<LomId Value="0" /><Manual Value="true" />
+						<AutomationTarget Id="{frz_on}"><LockEnvelope Value="0" /></AutomationTarget>
+						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
+					</On>
+					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
+					<Pointee Id="{frz_pt}" />
+					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
+					<LastPresetRef><Value /></LastPresetRef>
+					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
+					<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
+					<ClipSlotList />
+					<MonitoringEnum Value="1" />
+					<Sample><ArrangerAutomation><Events /><AutomationTransformViewState><IsTransformPending Value="false" /><TimeAndValueTransforms /></AutomationTransformViewState></ArrangerAutomation></Sample>
+					<VolumeModulationTarget Id="{frz_vol_mt}"><LockEnvelope Value="0" /></VolumeModulationTarget>
+					<TranspositionModulationTarget Id="{frz_trans_mt}"><LockEnvelope Value="0" /></TranspositionModulationTarget>
+					<GrainSizeModulationTarget Id="{frz_grain_mt}"><LockEnvelope Value="0" /></GrainSizeModulationTarget>
+					<FluxModulationTarget Id="{frz_flux_mt}"><LockEnvelope Value="0" /></FluxModulationTarget>
+					<SampleOffsetModulationTarget Id="{frz_soff_mt}"><LockEnvelope Value="0" /></SampleOffsetModulationTarget>
+					<PitchViewScrollPosition Value="-1073741824" />
+					<SampleOffsetModulationScrollPosition Value="-1073741824" />
+					<Recorder><IsArmed Value="false" /><TakeCounter Value="1" /></Recorder>
+				</FreezeSequencer>
 			</DeviceChain>
 		</ReturnTrack>'''
 
@@ -2140,6 +2519,10 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
     tracks_xml = '\n'.join(track_blocks)
 
     # ── locators XML ──────────────────────────────────────────────────────────
+    # Always include COUNT OFF at beat 0
+    all_locators = list(locators)
+    if not any(loc['name'].upper() == 'COUNT OFF' for loc in all_locators):
+        all_locators.insert(0, {'beat': 0.0, 'name': 'COUNT OFF'})
     loc_items = '\n'.join(
         f'''			<Locator Id="{i}">
 				<LomId Value="0" />
@@ -2148,7 +2531,7 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 				<Annotation Value="" />
 				<IsSongStart Value="false" />
 			</Locator>'''
-        for i, loc in enumerate(sorted(locators, key=lambda x: x['beat']))
+        for i, loc in enumerate(sorted(all_locators, key=lambda x: x['beat']))
     )
 
     # ── 8 minimal scenes ──────────────────────────────────────────────────────
@@ -2168,7 +2551,7 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 
     # ── master track minimal PreHear ──────────────────────────────────────────
     prehear_on = _nid(); prehear_spk = _nid(); prehear_pan_at = _nid(); prehear_pan_mt = _nid()
-    prehear_vol_at = _nid(); prehear_vol_mt = _nid(); prehear_pt = _nid()
+    prehear_vol_at = _nid(); prehear_vol_mt = _nid(); prehear_xfade_at = _nid(); prehear_pt = _nid()
 
     # ── final NextPointeeId ───────────────────────────────────────────────────
     next_id = _idc[0] + 100
@@ -2218,7 +2601,7 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 					</AutomationEnvelope>
 				</Envelopes>
 			</AutomationEnvelopes>
-			<TrackGroupId Value="-1" /><TrackUnfolded Value="false" />
+			<TrackGroupId Value="-1" /><TrackUnfolded Value="true" />
 			<DevicesListWrapper LomId="0" /><ClipSlotsListWrapper LomId="0" />
 			<ViewData Value="{{}}" />
 			<TakeLanes><TakeLanes /><AreTakeLanesFolded Value="true" /></TakeLanes>
@@ -2260,7 +2643,7 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
 					</On>
 					<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
-					<Pointee Id="2" />
+					<Pointee Id="18" />
 					<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
 					<LastPresetRef><Value /></LastPresetRef>
 					<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
@@ -2268,22 +2651,36 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 					<Sends />
 					<Speaker>
 						<LomId Value="0" /><Manual Value="true" />
-						<AutomationTarget Id="3"><LockEnvelope Value="0" /></AutomationTarget>
+						<AutomationTarget Id="2"><LockEnvelope Value="0" /></AutomationTarget>
 						<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
 					</Speaker>
 					<SoloSink Value="false" /><PanMode Value="0" />
 					<Pan>
 						<LomId Value="0" /><Manual Value="0" />
 						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
-						<AutomationTarget Id="4"><LockEnvelope Value="0" /></AutomationTarget>
-						<ModulationTarget Id="5"><LockEnvelope Value="0" /></ModulationTarget>
+						<AutomationTarget Id="3"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="4"><LockEnvelope Value="0" /></ModulationTarget>
 					</Pan>
+					<SplitStereoPanL>
+						<LomId Value="0" /><Manual Value="-1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="16175"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="16176"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanL>
+					<SplitStereoPanR>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="16177"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="16178"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanR>
 					<Volume>
 						<LomId Value="0" /><Manual Value="1" />
-						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
-						<AutomationTarget Id="6"><LockEnvelope Value="0" /></AutomationTarget>
-						<ModulationTarget Id="7"><LockEnvelope Value="0" /></ModulationTarget>
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526238" /></MidiControllerRange>
+						<AutomationTarget Id="5"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="6"><LockEnvelope Value="0" /></ModulationTarget>
 					</Volume>
+					<ViewStateSesstionTrackWidth Value="93" />
+					<CrossFadeState><LomId Value="0" /><Manual Value="1" /><AutomationTarget Id="7"><LockEnvelope Value="0" /></AutomationTarget></CrossFadeState>
 					<SendsListWrapper LomId="0" />
 					<Tempo>
 						<LomId Value="0" />
@@ -2309,7 +2706,7 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 						<AutomationTarget Id="13"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="14"><LockEnvelope Value="0" /></ModulationTarget>
 					</CrossFade>
-					<TempoAutomationViewBottom Value="60" />
+					<TempoAutomationViewBottom Value="20" />
 					<TempoAutomationViewTop Value="200" />
 				</Mixer>
 				<FreezeSequencer>
@@ -2321,19 +2718,28 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 							<MidiCCOnOffThresholds><Min Value="64" /><Max Value="127" /></MidiCCOnOffThresholds>
 						</On>
 						<ModulationSourceCount Value="0" /><ParametersListWrapper LomId="0" />
-						<Pointee Id="16" />
+						<Pointee Id="19" />
 						<LastSelectedTimeableIndex Value="0" /><LastSelectedClipEnvelopeIndex Value="0" />
 						<LastPresetRef><Value /></LastPresetRef>
-						<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="true" />
+						<LockedScripts /><IsFolded Value="false" /><ShouldShowPresetName Value="false" />
 						<UserName Value="" /><Annotation Value="" /><SourceContext><Value /></SourceContext>
-						<ClipSlotList>
-							<ClipSlot Id="0"><LomId Value="0" /><ClipSlot><Value /></ClipSlot><HasStop Value="true" /></ClipSlot>
-						</ClipSlotList>
+						<ClipSlotList />
 						<MonitoringEnum Value="1" />
-						<Sample><ArrangerAutomation><Events /></ArrangerAutomation></Sample>
+						<Sample><ArrangerAutomation><Events /><AutomationTransformViewState><IsTransformPending Value="false" /><TimeAndValueTransforms /></AutomationTransformViewState></ArrangerAutomation></Sample>
+						<VolumeModulationTarget Id="16"><LockEnvelope Value="0" /></VolumeModulationTarget>
+						<TranspositionModulationTarget Id="17"><LockEnvelope Value="0" /></TranspositionModulationTarget>
+						<GrainSizeModulationTarget Id="18"><LockEnvelope Value="0" /></GrainSizeModulationTarget>
+						<FluxModulationTarget Id="20"><LockEnvelope Value="0" /></FluxModulationTarget>
+						<SampleOffsetModulationTarget Id="16183"><LockEnvelope Value="0" /></SampleOffsetModulationTarget>
+						<PitchViewScrollPosition Value="-1073741824" />
+						<SampleOffsetModulationScrollPosition Value="-1073741824" />
+						<Recorder><IsArmed Value="false" /><TakeCounter Value="1" /></Recorder>
 					</AudioSequencer>
 				</FreezeSequencer>
-				<DevicesListWrapper LomId="0" />
+				<DeviceChain>
+					<Devices />
+					<SignalModulations />
+				</DeviceChain>
 			</DeviceChain>
 		</MasterTrack>
 		<PreHearTrack>
@@ -2406,12 +2812,26 @@ def _generate_als(output_path, clips, bpm, tempo_events, time_signatures, locato
 						<AutomationTarget Id="{prehear_pan_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{prehear_pan_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Pan>
+					<SplitStereoPanL>
+						<LomId Value="0" /><Manual Value="-1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="16179"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="16180"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanL>
+					<SplitStereoPanR>
+						<LomId Value="0" /><Manual Value="1" />
+						<MidiControllerRange><Min Value="-1" /><Max Value="1" /></MidiControllerRange>
+						<AutomationTarget Id="16181"><LockEnvelope Value="0" /></AutomationTarget>
+						<ModulationTarget Id="16182"><LockEnvelope Value="0" /></ModulationTarget>
+					</SplitStereoPanR>
 					<Volume>
 						<LomId Value="0" /><Manual Value="0.7071067691" />
-						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526231" /></MidiControllerRange>
+						<MidiControllerRange><Min Value="0.0003162277571" /><Max Value="1.99526238" /></MidiControllerRange>
 						<AutomationTarget Id="{prehear_vol_at}"><LockEnvelope Value="0" /></AutomationTarget>
 						<ModulationTarget Id="{prehear_vol_mt}"><LockEnvelope Value="0" /></ModulationTarget>
 					</Volume>
+					<ViewStateSesstionTrackWidth Value="74" />
+					<CrossFadeState><LomId Value="0" /><Manual Value="1" /><AutomationTarget Id="{prehear_xfade_at}"><LockEnvelope Value="0" /></AutomationTarget></CrossFadeState>
 					<SendsListWrapper LomId="0" />
 				</Mixer>
 			</DeviceChain>
@@ -2515,7 +2935,18 @@ def run_server():
                         cmd.get("tempo_events", []),
                         cmd.get("time_sig_events", []),
                         cmd.get("locator_overrides", []),
-                        cmd.get("output_path") or None,
+                        new_locators=cmd.get("new_locators") or None,
+                        output_path=cmd.get("output_path") or None,
+                    )
+                    print(json.dumps(result), flush=True)
+                elif action == "generate_click_track":
+                    result = _generate_click_track(
+                        output_path      = cmd["output_path"],
+                        bpm              = float(cmd.get("bpm", 120.0)),
+                        time_sig         = cmd.get("time_sig", "4/4"),
+                        duration_seconds = float(cmd.get("duration_seconds", 0.0)),
+                        tempo_events     = cmd.get("tempo_events") or [],
+                        time_sig_events  = cmd.get("time_sig_events") or [],
                     )
                     print(json.dumps(result), flush=True)
                 elif action == "generate_als":

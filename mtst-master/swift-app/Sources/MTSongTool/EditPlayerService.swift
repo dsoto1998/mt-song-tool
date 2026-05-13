@@ -86,6 +86,12 @@ struct LocatorOverride {
     var beat: Double?
 }
 
+struct NewLocator: Identifiable {
+    let id: String      // "mtst_new_1", "mtst_new_2", …
+    var beat: Double
+    var name: String
+}
+
 struct TimeSigOverride: Equatable {
     var beat: Double
     var numerator: Int
@@ -112,8 +118,38 @@ class EditPlayerService: ObservableObject {
     @Published var timeSigOverrides: [TimeSigOverride] = []
     @Published var isSessionDirty: Bool = false
     @Published var editableTempoEvents: [TempoEvent] = []
+    @Published var newLocators: [NewLocator] = []
+    private var newLocatorCounter = 0
+
+    func addNewLocator(beat: Double, name: String) {
+        saveUndoSnapshot()
+        newLocatorCounter += 1
+        newLocators.append(NewLocator(id: "mtst_new_\(newLocatorCounter)", beat: beat, name: name))
+        isSessionDirty = true
+    }
+
+    func updateNewLocator(id: String, name: String) {
+        guard let i = newLocators.firstIndex(where: { $0.id == id }) else { return }
+        saveUndoSnapshot()
+        newLocators[i].name = name
+        isSessionDirty = true
+    }
+
+    func deleteNewLocator(id: String) {
+        saveUndoSnapshot()
+        newLocators.removeAll { $0.id == id }
+        isSessionDirty = true
+    }
+
+    func moveNewLocator(id: String, beat: Double) {
+        guard let i = newLocators.firstIndex(where: { $0.id == id }) else { return }
+        saveUndoSnapshot()
+        newLocators[i].beat = beat
+        isSessionDirty = true
+    }
 
     func moveLocator(alsId: String, toBeat beat: Double) {
+        saveUndoSnapshot()
         var override = locatorOverrides[alsId] ?? LocatorOverride()
         override.beat = beat
         locatorOverrides[alsId] = override
@@ -121,6 +157,7 @@ class EditPlayerService: ObservableObject {
     }
 
     func renameLocator(alsId: String, to name: String) {
+        saveUndoSnapshot()
         var override = locatorOverrides[alsId] ?? LocatorOverride()
         override.name = name
         locatorOverrides[alsId] = override
@@ -176,6 +213,7 @@ class EditPlayerService: ObservableObject {
     /// Add a new tempo event. No-op if within 0.5 beats of an existing event.
     func addTempoEvent(atBeat beat: Double, bpm: Double) {
         guard !editableTempoEvents.contains(where: { abs($0.beat - beat) < 0.5 }) else { return }
+        saveUndoSnapshot()
         var evs = editableTempoEvents
         evs.append(TempoEvent(beat: beat, bpm: max(1, bpm), time: ""))
         evs.sort { $0.beat < $1.beat }
@@ -186,6 +224,7 @@ class EditPlayerService: ObservableObject {
     /// Delete tempo event by index. Refuses to delete the beat-0 anchor event (index 0).
     func deleteTempoEvent(at index: Int) {
         guard index > 0, index < editableTempoEvents.count else { return }
+        saveUndoSnapshot()
         editableTempoEvents.remove(at: index)
         isSessionDirty = true
     }
@@ -217,6 +256,7 @@ class EditPlayerService: ObservableObject {
     /// Add a new time sig event. No-op if within 0.5 beats of an existing event.
     func addTimeSig(atBeat beat: Double, numerator: Int, denominator: Int) {
         guard !timeSigOverrides.contains(where: { abs($0.beat - beat) < 0.5 }) else { return }
+        saveUndoSnapshot()
         timeSigOverrides.append(TimeSigOverride(beat: beat, numerator: numerator, denominator: denominator))
         timeSigOverrides.sort { $0.beat < $1.beat }
         isSessionDirty = true
@@ -225,6 +265,7 @@ class EditPlayerService: ObservableObject {
     /// Delete time sig event by index. Refuses to delete the beat-0 anchor (index 0).
     func deleteTimeSig(at index: Int) {
         guard index > 0, index < timeSigOverrides.count else { return }
+        saveUndoSnapshot()
         timeSigOverrides.remove(at: index)
         isSessionDirty = true
     }
@@ -232,6 +273,7 @@ class EditPlayerService: ObservableObject {
     /// Update the numerator/denominator of a time sig event.
     func updateTimeSig(at index: Int, numerator: Int, denominator: Int) {
         guard index >= 0, index < timeSigOverrides.count else { return }
+        saveUndoSnapshot()
         timeSigOverrides[index].numerator = numerator
         timeSigOverrides[index].denominator = denominator
         isSessionDirty = true
@@ -241,6 +283,7 @@ class EditPlayerService: ObservableObject {
     /// Clamps to stay between its neighbors (0.5-beat gap minimum).
     func moveTimeSig(at index: Int, toBeat beat: Double) {
         guard index > 0, index < timeSigOverrides.count else { return }
+        saveUndoSnapshot()
         let prevBeat = timeSigOverrides[index - 1].beat + 0.5
         let nextBeat = index < timeSigOverrides.count - 1 ? timeSigOverrides[index + 1].beat - 0.5 : Double.infinity
         timeSigOverrides[index].beat = max(prevBeat, min(nextBeat, beat))
@@ -251,6 +294,7 @@ class EditPlayerService: ObservableObject {
     /// Beat-0 event's beat is locked; only BPM can change.
     func updateTempoEvent(at index: Int, beat: Double, bpm: Double) {
         guard index >= 0, index < editableTempoEvents.count else { return }
+        saveUndoSnapshot()
         var evs = editableTempoEvents
         let old = evs[index]
         let finalBeat: Double
@@ -272,19 +316,33 @@ class EditPlayerService: ObservableObject {
     @Published var canRedo: Bool = false
     private var undoStack: [[URL: StemState]] = []
     private var redoStack: [[URL: StemState]] = []
-    // Parallel stacks keep timeSigOverrides in sync with stemStates snapshots.
     private var timeSigUndoStack: [[TimeSigOverride]] = []
     private var timeSigRedoStack: [[TimeSigOverride]] = []
+    private var tempoUndoStack: [[TempoEvent]] = []
+    private var tempoRedoStack: [[TempoEvent]] = []
+    private var newLocatorsUndoStack: [[NewLocator]] = []
+    private var newLocatorsRedoStack: [[NewLocator]] = []
+    private var locatorOverridesUndoStack: [[String: LocatorOverride]] = []
+    private var locatorOverridesRedoStack: [[String: LocatorOverride]] = []
     private let maxUndoSteps = 30
 
     /// Call before any mutating edit operation to save a restorable snapshot.
     func saveUndoSnapshot() {
         undoStack.append(stemStates)
         timeSigUndoStack.append(timeSigOverrides)
+        tempoUndoStack.append(editableTempoEvents)
+        newLocatorsUndoStack.append(newLocators)
+        locatorOverridesUndoStack.append(locatorOverrides)
         if undoStack.count > maxUndoSteps { undoStack.removeFirst() }
         if timeSigUndoStack.count > maxUndoSteps { timeSigUndoStack.removeFirst() }
+        if tempoUndoStack.count > maxUndoSteps { tempoUndoStack.removeFirst() }
+        if newLocatorsUndoStack.count > maxUndoSteps { newLocatorsUndoStack.removeFirst() }
+        if locatorOverridesUndoStack.count > maxUndoSteps { locatorOverridesUndoStack.removeFirst() }
         redoStack = []
         timeSigRedoStack = []
+        tempoRedoStack = []
+        newLocatorsRedoStack = []
+        locatorOverridesRedoStack = []
         canUndo = true
         canRedo = false
     }
@@ -297,6 +355,15 @@ class EditPlayerService: ObservableObject {
         let tsSnapshot = timeSigUndoStack.popLast() ?? timeSigOverrides
         timeSigRedoStack.append(timeSigOverrides)
         timeSigOverrides = tsSnapshot
+        let teSnapshot = tempoUndoStack.popLast() ?? editableTempoEvents
+        tempoRedoStack.append(editableTempoEvents)
+        editableTempoEvents = teSnapshot
+        let nlSnapshot = newLocatorsUndoStack.popLast() ?? newLocators
+        newLocatorsRedoStack.append(newLocators)
+        newLocators = nlSnapshot
+        let loSnapshot = locatorOverridesUndoStack.popLast() ?? locatorOverrides
+        locatorOverridesRedoStack.append(locatorOverrides)
+        locatorOverrides = loSnapshot
         canUndo = !undoStack.isEmpty
         canRedo = true
     }
@@ -309,6 +376,15 @@ class EditPlayerService: ObservableObject {
         let tsSnapshot = timeSigRedoStack.popLast() ?? timeSigOverrides
         timeSigUndoStack.append(timeSigOverrides)
         timeSigOverrides = tsSnapshot
+        let teSnapshot = tempoRedoStack.popLast() ?? editableTempoEvents
+        tempoUndoStack.append(editableTempoEvents)
+        editableTempoEvents = teSnapshot
+        let nlSnapshot = newLocatorsRedoStack.popLast() ?? newLocators
+        newLocatorsUndoStack.append(newLocators)
+        newLocators = nlSnapshot
+        let loSnapshot = locatorOverridesRedoStack.popLast() ?? locatorOverrides
+        locatorOverridesUndoStack.append(locatorOverrides)
+        locatorOverrides = loSnapshot
         canUndo = true
         canRedo = !redoStack.isEmpty
     }
@@ -328,6 +404,9 @@ class EditPlayerService: ObservableObject {
 
     // Ordered stem list (for display)
     private(set) var stemURLs: [URL] = []
+
+    // URLs injected by the app (click track preview) — not part of the real stem folder
+    @Published private(set) var syntheticStemURLs: Set<URL> = []
 
     // Time tracking — readable by MetronomeService to sync beat scheduling to same anchor
     private(set) var startHostTime: UInt64 = 0
@@ -352,6 +431,8 @@ class EditPlayerService: ObservableObject {
         stop()
         teardownNodes()
 
+        syntheticStemURLs = []
+        newLocators = []
         stemURLs = urls
         stemStates = [:]
         meterLevels = [:]
@@ -411,6 +492,77 @@ class EditPlayerService: ObservableObject {
         tapInstalled = [:]
         meterAtomics = [:]
         stemURLs = []
+    }
+
+    // MARK: - Synthetic Stems
+
+    /// Add a single synthetic stem (e.g. generated click track) to the live engine.
+    /// The stem appears in the timeline alongside real stems. Does NOT set isSessionDirty.
+    func addSyntheticStem(url: URL) {
+        guard !stemURLs.contains(url) else { return }
+
+        // Ensure stemBusMixer is in the graph (may not be if loadStems was never called)
+        if !stemBusAttached {
+            engine.attach(stemBusMixer)
+            engine.connect(stemBusMixer, to: engine.mainMixerNode, format: nil)
+            stemBusAttached = true
+        }
+
+        let playerNode = AVAudioPlayerNode()
+        let mixerNode  = AVAudioMixerNode()
+
+        engine.attach(playerNode)
+        engine.attach(mixerNode)
+        engine.connect(playerNode, to: mixerNode, format: nil)
+        let isLocked = Self.lockedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+        engine.connect(mixerNode, to: isLocked ? engine.mainMixerNode : stemBusMixer, format: nil)
+
+        playerNodes[url] = playerNode
+        stemMixers[url]  = mixerNode
+
+        let atom = MeterAtom()
+        meterAtomics[url] = atom
+        stemURLs.append(url)
+        syntheticStemURLs.insert(url)
+
+        var state = StemState()
+        stemStates[url] = state
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let peaks = await Self.extractPeaks(from: url)
+            let dur   = await Self.fileDuration(url)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                state.peaks = peaks
+                state.duration = dur
+                state.initSegments(duration: dur)
+                self.stemStates[url] = state
+                if dur > self.totalDuration { self.totalDuration = dur }
+            }
+        }
+
+        installStemTap(url)
+    }
+
+    /// Remove a synthetic stem from the engine. Safe to call with a URL that isn't synthetic.
+    func removeSyntheticStem(url: URL) {
+        guard syntheticStemURLs.contains(url) else { return }
+
+        if isPlaying { playerNodes[url]?.stop() }
+        if tapInstalled[url] == true {
+            let isLocked = Self.lockedStemNames.contains(url.deletingPathExtension().lastPathComponent.uppercased())
+            if isLocked, let player = playerNodes[url] { player.removeTap(onBus: 0) }
+            else if let mixer = stemMixers[url] { mixer.removeTap(onBus: 0) }
+            tapInstalled[url] = nil
+        }
+        if let player = playerNodes[url] { engine.detach(player) }
+        if let mixer  = stemMixers[url]  { engine.detach(mixer) }
+        playerNodes.removeValue(forKey: url)
+        stemMixers.removeValue(forKey: url)
+        meterAtomics.removeValue(forKey: url)
+        stemStates.removeValue(forKey: url)
+        stemURLs.removeAll { $0 == url }
+        syntheticStemURLs.remove(url)
     }
 
     // MARK: - Transport

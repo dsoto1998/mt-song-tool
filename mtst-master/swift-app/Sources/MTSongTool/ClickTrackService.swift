@@ -30,7 +30,8 @@ final class ClickTrackService: ObservableObject {
         bpm: Double,
         timeSig: String,
         durationSeconds: Double,
-        tempoEvents: [TempoEvent]
+        tempoEvents: [TempoEvent],
+        timeSigEvents: [TimeSigOverride] = []
     ) {
         phase = .generating
         stopPreview()
@@ -50,6 +51,11 @@ final class ClickTrackService: ObservableObject {
         ]
         if !tempoEvents.isEmpty {
             cmd["tempo_events"] = tempoEvents.map { ["beat": $0.beat, "bpm": $0.bpm] }
+        }
+        if !timeSigEvents.isEmpty {
+            cmd["time_sig_events"] = timeSigEvents.map {
+                ["beat": $0.beat, "numerator": $0.numerator, "denominator": $0.denominator]
+            }
         }
         guard let data   = try? JSONSerialization.data(withJSONObject: cmd),
               let cmdStr = String(data: data, encoding: .utf8) else {

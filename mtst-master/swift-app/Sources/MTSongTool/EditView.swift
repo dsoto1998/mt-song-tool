@@ -17,6 +17,7 @@ struct ExportCheck {
 struct EditView: View {
     @ObservedObject var editPlayer: EditPlayerService
     @ObservedObject var metronome: MetronomeService
+    @ObservedObject var clickService: ClickTrackService
     let stemURLs: [URL]
     @ObservedObject var analyzer: AudioAnalyzerService
     let parsedResult: ParsedResult?
@@ -31,7 +32,10 @@ struct EditView: View {
 
     @StateObject private var buildStore = BuildSessionStore()
     @StateObject private var alsGen = ALSGeneratorService()
+    /// Pending stem renames — applied at export, not written to disk until then.
+    @State private var pendingRenames: [URL: String] = [:]
     @State private var buildPanelExpanded: Bool = false
+    @State private var clickRegenTask: Task<Void, Never>? = nil
 
     // Timeline state
     @State private var zoomScale: CGFloat = 0.25       // horizontal zoom multiplier
@@ -46,6 +50,7 @@ struct EditView: View {
     @State private var viewportWidth: CGFloat = 0
     @State private var canvasRightPadding: Double = 0   // extra seconds grown when user scrolls near right edge
     @State private var isFolderDropTargeted: Bool = false
+    @State private var isDroppingOnStemList: Bool = false
     @State private var spaceBarMonitor: Any?
 
     // Export state
@@ -71,6 +76,8 @@ struct EditView: View {
         let allMarkers = parsedResult?.markers ?? []
         let endBeat: Double
 
+        // Check parsed markers AND user-added new locators for NEXT SONG
+        let newNS = editPlayer.newLocators.first(where: { $0.name.uppercased() == "NEXT SONG" })
         if let ns = allMarkers.first(where: { $0.text.uppercased() == "NEXT SONG" }) {
             // Derive loop end from NEXT SONG position minus one bar (medley sessions)
             let nsBeat: Double
@@ -87,6 +94,18 @@ struct EditView: View {
             let timeSigs = parsedResult?.timeSignatures ?? []
             let ts = timeSigs.filter { ($0.beat ?? 0) <= nsBeat }.last ?? timeSigs.first
             let parts = ts?.sig.split(separator: "/") ?? []
+            let num = Double(parts.first.map(String.init) ?? "4") ?? 4
+            let den = Double(parts.last.map(String.init)  ?? "4") ?? 4
+            let beatsPerBar = num * (4.0 / den)
+            let candidate = nsBeat - beatsPerBar
+            guard candidate > 0 else { return nil }
+            endBeat = candidate
+        } else if let ns = newNS {
+            // User-added NEXT SONG locator (Build Session / no parsed NEXT SONG)
+            let nsBeat = ns.beat
+            let ts = editPlayer.timeSigOverrides.filter { $0.beat <= nsBeat }.last
+            let sig = ts?.sig ?? buildStore.timeSig
+            let parts = sig.split(separator: "/")
             let num = Double(parts.first.map(String.init) ?? "4") ?? 4
             let den = Double(parts.last.map(String.init)  ?? "4") ?? 4
             let beatsPerBar = num * (4.0 / den)
@@ -158,7 +177,10 @@ struct EditView: View {
     /// Excludes stems marked isExcluded (deleted via Delete key, restorable via undo).
     private var sortedStemURLs: [URL] {
         let priority: [String: Int] = ["CLICK TRACK": 0, "GUIDE": 1, "ORIGINAL SONG": 2]
-        return stemURLs
+        // Merge real stems with any synthetic stems (e.g. generated click track)
+        let synthetic = editPlayer.syntheticStemURLs.filter { !stemURLs.contains($0) }
+        let all = stemURLs + Array(synthetic)
+        return all
             .filter { editPlayer.stemStates[$0]?.isExcluded != true }
             .sorted { a, b in
                 let aKey = a.deletingPathExtension().lastPathComponent.uppercased()
@@ -235,7 +257,7 @@ struct EditView: View {
                     Divider().foregroundColor(Color.border)
                 }
 
-            if stemURLs.isEmpty {
+            if sortedStemURLs.isEmpty {
                 emptyState
                     .layoutPriority(1)
             } else if editPlayer.totalDuration == 0 {
@@ -284,8 +306,10 @@ struct EditView: View {
             // Share edit engine with metronome for sample-accurate click sync
             metronome.attachToEngine(editPlayer.engine)
 
-            if editPlayer.stemURLs.isEmpty || editPlayer.stemURLs != stemURLs {
+            let nonSyntheticLoaded = editPlayer.stemURLs.filter { !editPlayer.syntheticStemURLs.contains($0) }
+            if editPlayer.stemURLs.isEmpty || nonSyntheticLoaded != stemURLs {
                 editPlayer.loadStems(stemURLs)
+                excludeRealClickTrackIfPresent()
             }
             // Seed editable tempo events from parse result (deduplicates Ableton's 2-per-step pairs)
             if let result = parsedResult, editPlayer.editableTempoEvents.isEmpty {
@@ -300,6 +324,10 @@ struct EditView: View {
             if parsedResult != nil {
                 populateBuildSession()
                 buildPanelExpanded = true
+            }
+            // Auto-generate click track if not already generated (e.g. .als loaded before tab opened).
+            if clickService.phase == .idle {
+                performClickRegen()
             }
         }
         .onChange(of: parsedResult?.file) { _ in
@@ -353,7 +381,9 @@ struct EditView: View {
             zoomScaleAtGestureStart = 0.25
             canvasRightPadding = 0
             selectedClipIDs = []
+            pendingRenames = [:]
             editPlayer.loadStems(newURLs)
+            excludeRealClickTrackIfPresent()
             if let result = parsedResult {
                 editPlayer.seedTempoEvents(result.tempoEvents)
                 editPlayer.initTimeSigs(from: result.timeSignatures)
@@ -385,14 +415,34 @@ struct EditView: View {
         }
         .onChange(of: buildStore.bpm) { _ in
             if parsedResult == nil { rebuildBeatSchedule() }
+            scheduleClickRegenDebounced()
         }
         .onChange(of: buildStore.timeSig) { _ in
             if parsedResult == nil { rebuildBeatSchedule() }
+            scheduleClickRegenDebounced()
+        }
+        .onChange(of: buildStore.loopEndBeat) { _ in
+            scheduleClickRegenDebounced()
         }
         .onChange(of: alsGen.phase) { phase in
             if case .done(let path) = phase {
                 onBuildComplete(path)
                 alsGen.reset()
+            }
+        }
+        // ── Click track auto-generation ───────────────────────────────────────
+        .onChange(of: parsedResult?.file) { _ in
+            performClickRegen()
+        }
+        .onChange(of: editPlayer.editableTempoEvents) { _ in
+            scheduleClickRegenDebounced()
+        }
+        .onChange(of: editPlayer.timeSigOverrides) { _ in
+            scheduleClickRegenDebounced()
+        }
+        .onChange(of: clickService.phase) { phase in
+            if case .ready = phase, let url = clickService.previewURL {
+                editPlayer.addSyntheticStem(url: url)
             }
         }
         .alert("Export Error", isPresented: $showExportError) {
@@ -425,9 +475,11 @@ struct EditView: View {
                 alsPath: path,
                 tempoEvents: editPlayer.editableTempoEvents,
                 timeSigEvents: editPlayer.timeSigOverrides,
-                locatorOverrides: editPlayer.locatorOverrides
+                locatorOverrides: editPlayer.locatorOverrides,
+                newLocators: editPlayer.newLocators
             )
             editPlayer.locatorOverrides = [:]
+            editPlayer.newLocators = []
             editPlayer.isSessionDirty = false
             onSaveEdits(newPath)
         } catch {
@@ -456,9 +508,11 @@ struct EditView: View {
                 tempoEvents: editPlayer.editableTempoEvents,
                 timeSigEvents: editPlayer.timeSigOverrides,
                 locatorOverrides: editPlayer.locatorOverrides,
+                newLocators: editPlayer.newLocators,
                 outputPath: outputPath
             )
             editPlayer.locatorOverrides = [:]
+            editPlayer.newLocators = []
             editPlayer.isSessionDirty = false
             onSaveEdits(newPath)
         } catch {
@@ -558,6 +612,12 @@ struct EditView: View {
             .disabled(selectedURLs.isEmpty)
             .keyboardShortcut("k", modifiers: .command)
 
+            // Click track generation status
+            if parsedResult != nil {
+                Divider().frame(height: 18)
+                clickTrackToolbarItem
+            }
+
             Spacer()
 
             // Normalize Stems
@@ -654,8 +714,28 @@ struct EditView: View {
         }
     }
 
-    @ViewBuilder
-    private var alignmentCheckToolbarItem: some View {
+    @ViewBuilder private var clickTrackToolbarItem: some View {
+        if case .generating = clickService.phase {
+            HStack(spacing: 4) {
+                ProgressView().scaleEffect(0.7).tint(Color.fgMid)
+                Text("Click Track…")
+                    .font(.lato(size: 11))
+                    .foregroundColor(Color.fgMid)
+            }
+        } else if case .ready = clickService.phase {
+            Text("✓ Click Track")
+                .font(.lato(size: 11))
+                .foregroundColor(Color.fgMid)
+                .help("CLICK TRACK lane is pinned at the top of the timeline")
+        } else if case .failed = clickService.phase {
+            Button("Retry Click") { performClickRegen() }
+                .font(.lato(size: 11))
+                .foregroundColor(Color.red)
+                .buttonStyle(.plain)
+        }
+    }
+
+    @ViewBuilder private var alignmentCheckToolbarItem: some View {
         if editPlayer.isCheckingAlignment {
             HStack(spacing: 4) {
                 ProgressView().scaleEffect(0.7).tint(Color.accent)
@@ -737,8 +817,44 @@ struct EditView: View {
 
                 // Left column: track headers — anchored, never scrolls horizontally
                 VStack(spacing: 0) {
-                    Color.bgCard
-                        .frame(width: 220, height: WaveformScrollHost.rulerLaneHeight + WaveformScrollHost.locatorLaneHeight + WaveformScrollHost.tempoLaneHeight + WaveformScrollHost.timeSigLaneHeight)
+                    VStack(spacing: 0) {
+                        // Ruler row — blank (bar numbers self-evident)
+                        Color.bgCard
+                            .frame(height: WaveformScrollHost.rulerLaneHeight)
+                        // Locator lane label
+                        HStack(spacing: 0) {
+                            Spacer()
+                            Text("LOCATORS")
+                                .font(.lato(size: 9, weight: .medium))
+                                .foregroundColor(Color.fgDim)
+                                .padding(.trailing, 8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: WaveformScrollHost.locatorLaneHeight, maxHeight: WaveformScrollHost.locatorLaneHeight)
+                        .background(Color.bgCard)
+                        Divider().foregroundColor(Color.border)
+                        // Tempo lane label
+                        HStack(spacing: 0) {
+                            Spacer()
+                            Text("TEMPO")
+                                .font(.lato(size: 9, weight: .medium))
+                                .foregroundColor(Color.fgDim)
+                                .padding(.trailing, 8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: WaveformScrollHost.tempoLaneHeight, maxHeight: WaveformScrollHost.tempoLaneHeight)
+                        .background(Color.bgCard)
+                        Divider().foregroundColor(Color.border)
+                        // Time sig lane label
+                        HStack(spacing: 0) {
+                            Spacer()
+                            Text("TIME SIG")
+                                .font(.lato(size: 9, weight: .medium))
+                                .foregroundColor(Color.fgDim)
+                                .padding(.trailing, 8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: WaveformScrollHost.timeSigLaneHeight, maxHeight: WaveformScrollHost.timeSigLaneHeight)
+                        .background(Color.bgCard)
+                    }
+                    .frame(width: 220)
                     Divider().foregroundColor(Color.border)
                     ForEach(sortedStemURLs, id: \.self) { url in
                         let state = editPlayer.stemStates[url] ?? StemState()
@@ -783,17 +899,77 @@ struct EditView: View {
                             onResizeRow: { newHeight in
                                 rowHeights[url] = max(40, newHeight)
                             },
-                            analyzerResult: analyzer.results.first(where: { $0.filename == url.lastPathComponent }),
+                            displayName: pendingRenames[url],
+                            analyzerResult: {
+                                let effectiveName = pendingRenames[url] ?? url.deletingPathExtension().lastPathComponent
+                                let nameIssues: Set<String> = ["Check Stem Name", "Wrong Caps", "Extra Space", "Special Chars"]
+                                if var result = analyzer.results.first(where: { $0.filename == url.lastPathComponent }) {
+                                    // Re-validate name if a pending rename is set
+                                    if pendingRenames[url] != nil {
+                                        var cleanIssues = result.issues.filter { !nameIssues.contains($0) }
+                                        if let issue = AudioAnalyzerService.validateStemName(effectiveName, approvedStems: AudioAnalyzerService.approvedStems) {
+                                            cleanIssues.append(issue)
+                                        }
+                                        result = AudioFileResult(filename: result.filename, status: result.status,
+                                                                 issues: cleanIssues, waveformPeaks: result.waveformPeaks,
+                                                                 duration: result.duration, suggestedNames: result.suggestedNames)
+                                    }
+                                    return result
+                                } else if editPlayer.syntheticStemURLs.contains(url) && !url.lastPathComponent.hasSuffix("CLICK TRACK.wav") {
+                                    // Dropped WAV not in scan — validate name only
+                                    var issues: [String] = []
+                                    if let issue = AudioAnalyzerService.validateStemName(effectiveName, approvedStems: AudioAnalyzerService.approvedStems) {
+                                        issues.append(issue)
+                                    }
+                                    return AudioFileResult(filename: url.lastPathComponent, status: .ok, issues: issues)
+                                }
+                                return nil
+                            }(),
                             onRename: { newName in
-                                analyzer.renameStem(oldFilename: url.lastPathComponent, newStemName: newName)
+                                // Store rename pending — applied to disk at export time only.
+                                // Avoids file-system change → stemURL reload → click track loss.
+                                let currentName = url.deletingPathExtension().lastPathComponent
+                                if newName == currentName {
+                                    pendingRenames.removeValue(forKey: url)
+                                } else {
+                                    pendingRenames[url] = newName
+                                }
                             },
                             onRemoveStem: { triggerRemoveStem(url) }
                         )
 
                         Divider().foregroundColor(Color.border)
                     }
+                    if !sortedStemURLs.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 10))
+                                .foregroundColor(isDroppingOnStemList ? Color.accent : Color.fgDim)
+                            Text("Drop WAV")
+                                .font(.lato(size: 11))
+                                .foregroundColor(isDroppingOnStemList ? Color.accent : Color.fgDim)
+                        }
+                        .frame(width: 220, height: 28)
+                        .animation(.easeInOut(duration: 0.15), value: isDroppingOnStemList)
+                    }
                 }
                 .frame(width: 220)
+                .background(isDroppingOnStemList ? Color.accent.opacity(0.07) : Color.clear)
+                .animation(.easeInOut(duration: 0.15), value: isDroppingOnStemList)
+                .onDrop(of: [.fileURL], isTargeted: $isDroppingOnStemList) { providers in
+                    for provider in providers {
+                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                            guard let data = item as? Data,
+                                  let url = URL(dataRepresentation: data, relativeTo: nil),
+                                  url.pathExtension.lowercased() == "wav" else { return }
+                            DispatchQueue.main.async {
+                                editPlayer.addSyntheticStem(url: url)
+                                editPlayer.isSessionDirty = true
+                            }
+                        }
+                    }
+                    return true
+                }
 
                 Divider().foregroundColor(Color.border)
 
@@ -870,6 +1046,11 @@ struct EditView: View {
                             editPlayer.moveLocator(alsId: alsId, toBeat: newBeat)
                         },
                         locatorOverrides: editPlayer.locatorOverrides,
+                        newLocators: editPlayer.newLocators,
+                        onAddLocator: { beat, name in editPlayer.addNewLocator(beat: beat, name: name) },
+                        onUpdateNewLocator: { id, name in editPlayer.updateNewLocator(id: id, name: name) },
+                        onMoveNewLocator: { id, beat in editPlayer.moveNewLocator(id: id, beat: beat) },
+                        onDeleteNewLocator: { id in editPlayer.deleteNewLocator(id: id) },
                         mtCompleteMode: mtCompleteMode,
                         selectedClipIDs: selectedClipIDs,
                         onSelectClip: { id, additive in
@@ -963,19 +1144,26 @@ struct EditView: View {
 
     @discardableResult
     private func handleFolderDropProviders(_ providers: [NSItemProvider]) -> Bool {
-        guard let onFolderDrop, let provider = providers.first else { return false }
-        let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-            ? UTType.fileURL.identifier : "public.folder"
-        provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
-            DispatchQueue.main.async {
-                var url: URL?
-                if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                else if let u = item as? NSURL { url = u as URL }
-                else if let u = item as? URL { url = u }
-                guard let url else { return }
-                var isDir: ObjCBool = false
-                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                if isDir.boolValue { onFolderDrop(url) }
+        guard !providers.isEmpty else { return false }
+        for provider in providers {
+            let typeId = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                ? UTType.fileURL.identifier : "public.folder"
+            provider.loadItem(forTypeIdentifier: typeId, options: nil) { item, _ in
+                DispatchQueue.main.async {
+                    var url: URL?
+                    if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                    else if let u = item as? NSURL { url = u as URL }
+                    else if let u = item as? URL { url = u }
+                    guard let url else { return }
+                    var isDir: ObjCBool = false
+                    FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                    if isDir.boolValue {
+                        onFolderDrop?(url)
+                    } else if url.pathExtension.lowercased() == "wav" {
+                        editPlayer.addSyntheticStem(url: url)
+                        editPlayer.isSessionDirty = true
+                    }
+                }
             }
         }
         return true
@@ -993,7 +1181,7 @@ struct EditView: View {
                 .font(.lato(size: 13))
                 .foregroundColor(isFolderDropTargeted ? Color.accent : Color.fgMid)
             if !isFolderDropTargeted {
-                Text("Drop a session folder here, or run a Stem Check in the QA tab.")
+                Text("Drop a stems folder or individual WAV files here, or run a Stem Check in the QA tab.")
                     .font(.lato(size: 11))
                     .foregroundColor(Color.fgDim)
                     .multilineTextAlignment(.center)
@@ -1148,6 +1336,77 @@ struct EditView: View {
         return buildStore.outputFolder != nil && buildStore.loopEndBeat > 0
     }
 
+    // MARK: - Click Track Auto-Generation
+
+    /// Total duration the click track should cover (stops at ENDING locator if present).
+    private var clickTrackDurationSeconds: Double {
+        // 1. ENDING locator → end at that downbeat + tail
+        if let result = parsedResult,
+           let ending = result.markers.first(where: { $0.text.uppercased() == "ENDING" }),
+           let endingSecs = markerTimeToSeconds(ending.time) {
+            let schedule = metronome.beatSchedule
+            let db = schedule.filter { $0.isDownbeat && $0.timeSeconds <= endingSecs + 0.01 }
+            let lastDownbeatSecs = db.last?.timeSeconds ?? endingSecs
+            let nextDB = schedule.first(where: { $0.isDownbeat && $0.timeSeconds > lastDownbeatSecs })
+            let barDur = nextDB.map { $0.timeSeconds - lastDownbeatSecs } ?? 2.0
+            let tail = min(barDur * 0.5, 0.5)
+            return lastDownbeatSecs + tail
+        }
+        // 2. Loop bracket end
+        if let lb = loopBracket { return lb.endSeconds }
+        // 3. Stem duration
+        if editPlayer.totalDuration > 0 { return editPlayer.totalDuration }
+        // 4. Build session loop end
+        if let bpmVal = Double(buildStore.bpm), bpmVal > 0, buildStore.loopEndBeat > 0 {
+            return buildStore.loopEndBeat * 60.0 / bpmVal
+        }
+        return 0
+    }
+
+    /// Exclude any real CLICK TRACK.wav from the session — synthetic one takes precedence.
+    private func excludeRealClickTrackIfPresent() {
+        for url in stemURLs where url.deletingPathExtension().lastPathComponent.uppercased() == "CLICK TRACK" {
+            editPlayer.stemStates[url]?.isExcluded = true
+        }
+    }
+
+    /// Regenerate click track immediately.
+    private func performClickRegen() {
+        let dur = clickTrackDurationSeconds
+        guard dur > 0 else { return }
+
+        // Remove old synthetic click if any
+        if let oldURL = clickService.previewURL {
+            editPlayer.removeSyntheticStem(url: oldURL)
+        }
+
+        let tempoEvs = editPlayer.editableTempoEvents.isEmpty
+            ? (parsedResult?.tempoEvents ?? [])
+            : editPlayer.editableTempoEvents
+        let timeSigEvs = editPlayer.timeSigOverrides
+
+        let bpmVal = tempoEvs.first?.bpm ?? Double(buildStore.bpm) ?? 120.0
+        let firstTS = timeSigEvs.first?.sig ?? parsedResult?.timeSignatures.first?.sig ?? buildStore.timeSig
+
+        clickService.generatePreview(
+            bpm: bpmVal,
+            timeSig: firstTS,
+            durationSeconds: dur,
+            tempoEvents: tempoEvs,
+            timeSigEvents: timeSigEvs
+        )
+    }
+
+    /// Debounced regeneration — waits 400 ms after the last call before regenerating.
+    private func scheduleClickRegenDebounced() {
+        clickRegenTask?.cancel()
+        clickRegenTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { performClickRegen() }
+        }
+    }
+
     private func populateBuildSession() {
         guard let result = parsedResult else { return }
         let schedule = metronome.beatSchedule
@@ -1179,13 +1438,18 @@ struct EditView: View {
                 } ?? 0
                 return (name: name, filePath: url.path, durationSeconds: dur, volumeDB: 0.0)
             }
+        // Ensure COUNT OFF at beat 0 is always present
+        var finalLocators = buildStore.locators
+        if !finalLocators.contains(where: { $0.name.uppercased() == "COUNT OFF" }) {
+            finalLocators.insert(ALSGeneratorService.BuildLocator(beat: 0.0, name: "COUNT OFF"), at: 0)
+        }
         alsGen.build(
             outputPath: outputPath,
             clips: clips,
             bpm: bpmVal,
             tempoEvents: buildStore.additionalTempoEvents,
             timeSignatures: [TimeSig(time: "0", sig: buildStore.timeSig, beat: 0.0)],
-            locators: buildStore.locators,
+            locators: finalLocators,
             loopEndBeat: buildStore.loopEndBeat
         )
     }
@@ -1332,6 +1596,7 @@ struct EditView: View {
             outputFolder: outputFolder,
             loopEndSeconds: lb.endSeconds,
             stemStates: editPlayer.stemStates,
+            pendingRenames: pendingRenames,
             autoFadeCuts: userSettings.autoFadeCuts
         ) { error in
             isExporting = false
@@ -1358,6 +1623,7 @@ struct EditTrackSidebar: View {
     let onGainChange: (Float) -> Void
     let onSelect: () -> Void
     let onResizeRow: (CGFloat) -> Void
+    var displayName: String? = nil   // pending rename override; nil = use URL filename
     var analyzerResult: AudioFileResult? = nil
     var onRename: ((String) -> Void)? = nil
     var onRemoveStem: (() -> Void)? = nil
@@ -1371,7 +1637,7 @@ struct EditTrackSidebar: View {
     @State private var pencilHover = false
     @State private var allTimePeak: Float = -96.0
 
-    var stemName: String { url.deletingPathExtension().lastPathComponent }
+    var stemName: String { displayName ?? url.deletingPathExtension().lastPathComponent }
 
     private var hasNamingIssue: Bool { !(analyzerResult?.issues.isEmpty ?? true) }
     private static let sortedApprovedStems: [String] = AudioAnalyzerService.approvedStems.sorted()
@@ -1958,6 +2224,11 @@ struct WaveformScrollHost: NSViewRepresentable {
     var onLocatorFix: ([(Marker, String)]) -> Void = { _ in }
     var onLocatorMove: (String, Double) -> Void = { _, _ in }  // (alsId, newBeat)
     var locatorOverrides: [String: LocatorOverride] = [:]
+    var newLocators: [NewLocator] = []
+    var onAddLocator: (Double, String) -> Void = { _, _ in }
+    var onUpdateNewLocator: (String, String) -> Void = { _, _ in }
+    var onMoveNewLocator: (String, Double) -> Void = { _, _ in }
+    var onDeleteNewLocator: (String) -> Void = { _ in }
     var mtCompleteMode: Bool = false
     var selectedClipIDs: Set<UUID> = []
     var onSelectClip: (UUID, Bool) -> Void = { _, _ in }
@@ -2123,6 +2394,8 @@ struct WaveformScrollHost: NSViewRepresentable {
         for (alsId, ov) in locatorOverrides.sorted(by: { $0.key < $1.key }) {
             h.combine(alsId); h.combine(ov.beat)
         }
+        h.combine(newLocators.count)
+        for loc in newLocators { h.combine(loc.id); h.combine(loc.beat.bitPattern); h.combine(loc.name) }
         h.combine(editableTempoEvents.count)
         for ev in editableTempoEvents { h.combine(ev.beat); h.combine(ev.bpm) }
         h.combine(timeSigs.count)
@@ -2420,10 +2693,15 @@ struct WaveformScrollHost: NSViewRepresentable {
                 }
 
                 // Vertical marker lines through track area — positions respect locatorOverrides
-                let markerPositions: [(x: CGFloat, label: String)] = markers.compactMap { m in
-                    guard let secs = effectiveSecondsForMarker(m) else { return nil }
-                    return (CGFloat(secs / totalDuration) * ds.width, m.text)
-                }.sorted { $0.x < $1.x }
+                let markerPositions: [(x: CGFloat, label: String)] = (
+                    markers.compactMap { m -> (x: CGFloat, label: String)? in
+                        guard let secs = effectiveSecondsForMarker(m) else { return nil }
+                        return (CGFloat(secs / totalDuration) * ds.width, m.text)
+                    } + newLocators.map { loc in
+                        let secs = secondsForBeat(loc.beat)
+                        return (CGFloat(secs / totalDuration) * ds.width, loc.name)
+                    }
+                ).sorted { $0.x < $1.x }
                 if let lineLayer = context.coordinator.locatorLineLayer {
                     let trackAreaH = ds.height - WaveformScrollHost.rulerLaneHeight
                     lineLayer.frame = CGRect(x: 0, y: WaveformScrollHost.rulerLaneHeight,
@@ -2768,8 +3046,13 @@ struct WaveformScrollHost: NSViewRepresentable {
                     mtCompleteMode: mtCompleteMode,
                     beatSchedule: beatSchedule,
                     locatorOverrides: locatorOverrides,
+                    newLocators: newLocators,
                     onFix: onLocatorFix,
-                    onLocatorMove: onLocatorMove
+                    onLocatorMove: onLocatorMove,
+                    onAddLocator: onAddLocator,
+                    onUpdateNewLocator: onUpdateNewLocator,
+                    onMoveNewLocator: onMoveNewLocator,
+                    onDeleteNewLocator: onDeleteNewLocator
                 )
                 .frame(height: WaveformScrollHost.locatorLaneHeight)
 
@@ -3183,11 +3466,23 @@ struct EditLocatorLane: View {
     let mtCompleteMode: Bool
     let beatSchedule: [BeatInfo]
     let locatorOverrides: [String: LocatorOverride]
+    let newLocators: [NewLocator]
     let onFix: ([(Marker, String)]) -> Void
     let onLocatorMove: (String, Double) -> Void
+    let onAddLocator: (Double, String) -> Void
+    let onUpdateNewLocator: (String, String) -> Void
+    let onMoveNewLocator: (String, Double) -> Void
+    let onDeleteNewLocator: (String) -> Void
 
     // Drag state — nil when no drag in progress
     @State private var dragState: (alsId: String, startSeconds: Double, currentBeat: Double, currentSeconds: Double)? = nil
+    // Pending new locator: beat snapped on right-click, drives ghost chip + picker
+    @State private var pendingBeat: Double? = nil
+    @State private var pendingPickerOpen = false
+    @State private var pendingPickerSelection = ""
+    @State private var pendingPickerDismissedViaEnter = false
+    // Last known mouse X in the lane — used by context menu to place new locator
+    @State private var hoverX: CGFloat = 0
 
     private func markerSeconds(_ time: String) -> Double? {
         let parts = time.split(separator: ":")
@@ -3210,6 +3505,12 @@ struct EditLocatorLane: View {
         }
         if let beat = marker.beat { return secondsForBeat(beat) }
         return markerSeconds(marker.time) ?? 0
+    }
+
+    private var pickerOptions: [String] {
+        mtCompleteMode
+            ? LocatorValidator.sortedSections
+            : LocatorValidator.sortedSections.filter { !LocatorValidator.shortCodes.contains($0) }
     }
 
     /// Convert Ableton beat position to session seconds using the beat schedule.
@@ -3236,23 +3537,48 @@ struct EditLocatorLane: View {
         GeometryReader { geo in
             locatorContent(width: geo.size.width)
         }
+        // Always-present observer — clears ghost chip when picker is dismissed by any means
+        // (including popover auto-dismiss during NSHostingView rootView replacement)
+        .onChange(of: pendingPickerOpen) { open in
+            guard !open else { return }
+            let name = pendingPickerSelection.trimmingCharacters(in: .whitespaces)
+            if let beat = pendingBeat, !name.isEmpty { onAddLocator(beat, name) }
+            pendingBeat = nil
+            pendingPickerSelection = ""
+        }
+    }
+
+    /// Merged sorted list of all locator chips (parsed + new) with their pixel x positions.
+    /// `stableID` is unique and does not change as chips reorder during drag.
+    private func positionedChips(width: CGFloat) -> [(stableID: String, marker: Marker, x: CGFloat, isNew: Bool)] {
+        let parsedEntries: [(stableID: String, marker: Marker, x: CGFloat, isNew: Bool)] = markers.compactMap { m in
+            guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+            let secs = effectiveSeconds(for: m)
+            let sid = m.alsId.isEmpty ? "p_\(m.id.uuidString)" : "p_\(m.alsId)"
+            return (sid, m, CGFloat(secs / totalDuration) * width, false)
+        }
+        let newEntries: [(stableID: String, marker: Marker, x: CGFloat, isNew: Bool)] = newLocators.map { loc in
+            let isDraggingThis = dragState?.alsId == loc.id
+            let secs = isDraggingThis ? (dragState?.currentSeconds ?? secondsForBeat(loc.beat)) : secondsForBeat(loc.beat)
+            return ("n_\(loc.id)", Marker(time: "", text: loc.name, alsId: loc.id, beat: loc.beat),
+                    CGFloat(secs / totalDuration) * width, true)
+        }
+        return (parsedEntries + newEntries).sorted { $0.x < $1.x }
     }
 
     @ViewBuilder
     private func locatorContent(width: CGFloat) -> some View {
         ZStack(alignment: .topLeading) {
-            Color.clear.frame(width: width, height: WaveformScrollHost.locatorLaneHeight)
+            Color.clear
+                .frame(width: width, height: WaveformScrollHost.locatorLaneHeight)
 
             if totalDuration > 0 && width > 0 {
-                let positioned: [(marker: Marker, x: CGFloat)] = markers.compactMap { m in
-                    guard !m.text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-                    let secs = effectiveSeconds(for: m)
-                    return (m, CGFloat(secs / totalDuration) * width)
-                }.sorted { $0.x < $1.x }
+                let positioned = positionedChips(width: width)
 
-                ForEach(Array(positioned.enumerated()), id: \.element.marker.id) { i, pair in
-                    let marker = pair.marker
-                    let x = pair.x
+                ForEach(Array(positioned.enumerated()), id: \.element.stableID) { i, entry in
+                    let marker = entry.marker
+                    let x = entry.x
+                    let isNew = entry.isNew
                     let nextX = i + 1 < positioned.count ? positioned[i + 1].x : width
                     let chipW = max(0, nextX - x)
                     let isDraggingThis = dragState?.alsId == marker.alsId
@@ -3263,10 +3589,15 @@ struct EditLocatorLane: View {
                         chipWidth: chipW,
                         mtCompleteMode: mtCompleteMode,
                         isDragging: isDraggingThis,
-                        onFix: { newName in onFix([(marker, newName)]) }
+                        onFix: { newName in
+                            if isNew { onUpdateNewLocator(marker.alsId, newName) }
+                            else { onFix([(marker, newName)]) }
+                        },
+                        onDelete: isNew ? { onDeleteNewLocator(marker.alsId) } : nil
                     )
                     .frame(width: max(chipW, 4), height: WaveformScrollHost.locatorLaneHeight)
-                    .offset(x: max(0, min(x, width - 1)), y: 0)
+                    .position(x: max(0, min(x, width - 1)) + max(chipW, 4) / 2,
+                              y: WaveformScrollHost.locatorLaneHeight / 2)
                     .if(isDraggable) { v in
                         v.gesture(
                             DragGesture(minimumDistance: 3)
@@ -3276,7 +3607,9 @@ struct EditLocatorLane: View {
                                     if let ds = dragState, ds.alsId == marker.alsId {
                                         baseSeconds = ds.startSeconds
                                     } else {
-                                        baseSeconds = effectiveSeconds(for: marker)
+                                        baseSeconds = isNew
+                                            ? (marker.beat.map { secondsForBeat($0) } ?? 0)
+                                            : effectiveSeconds(for: marker)
                                     }
                                     let rawSeconds = baseSeconds + Double(value.translation.width / pixelsPerSecond)
                                     let clamped = max(0, min(totalDuration, rawSeconds))
@@ -3286,12 +3619,40 @@ struct EditLocatorLane: View {
                                 }
                                 .onEnded { _ in
                                     if let ds = dragState, ds.alsId == marker.alsId {
-                                        onLocatorMove(ds.alsId, ds.currentBeat)
+                                        if isNew { onMoveNewLocator(ds.alsId, ds.currentBeat) }
+                                        else { onLocatorMove(ds.alsId, ds.currentBeat) }
                                     }
                                     dragState = nil
                                 }
                         )
                     }
+                }
+
+                // Ghost chip — shown while picker is open for a new locator
+                if let beat = pendingBeat {
+                    let secs = secondsForBeat(beat)
+                    let x = CGFloat(secs / totalDuration) * width
+                    Color.accent.opacity(0.3)
+                        .overlay(alignment: .leading) { Color.accent.frame(width: 2) }
+                        .overlay(alignment: .leading) {
+                            Text("▶ …")
+                                .font(.lato(size: 9, weight: .bold))
+                                .foregroundColor(.white.opacity(0.7))
+                                .padding(.leading, 4)
+                        }
+                        .frame(width: 80, height: WaveformScrollHost.locatorLaneHeight)
+                        .position(x: max(0, min(x, width - 80)) + 40,
+                                  y: WaveformScrollHost.locatorLaneHeight / 2)
+                        .popover(isPresented: $pendingPickerOpen, arrowEdge: .bottom) {
+                            PickerPopoverContent(
+                                options: pickerOptions,
+                                selection: $pendingPickerSelection,
+                                isPresented: $pendingPickerOpen,
+                                dismissedViaEnter: $pendingPickerDismissedViaEnter
+                            )
+                            .frame(width: 220, height: 280)
+                        }
+                        .onTapGesture { pendingBeat = nil; pendingPickerOpen = false }
                 }
 
                 // Drag guide line — vertical accent line at current drag position
@@ -3301,8 +3662,22 @@ struct EditLocatorLane: View {
                         .fill(Color.accent.opacity(0.8))
                         .frame(width: 1)
                         .frame(maxHeight: .infinity)
-                        .offset(x: dragX, y: 0)
+                        .position(x: dragX + 0.5, y: WaveformScrollHost.locatorLaneHeight / 2)
                 }
+            }
+        }
+        .contentShape(Rectangle())
+        .onContinuousHover { phase in
+            if case .active(let loc) = phase { hoverX = loc.x }
+        }
+        .contextMenu {
+            Button("Add Locator") {
+                guard totalDuration > 0, width > 0, pendingBeat == nil else { return }
+                let tapSecs = Double(hoverX / width) * totalDuration
+                let (_, beat) = snapToDownbeat(tapSecs)
+                pendingBeat = beat
+                pendingPickerSelection = ""
+                pendingPickerOpen = true
             }
         }
     }
@@ -3782,7 +4157,16 @@ struct TimeSigPickerPopover: View {
     let onConfirm: () -> Void
     let onCancel: () -> Void
 
-    private let denominators = [2, 4, 8, 16]
+    private var currentSig: String { "\(numerator)/\(denominator)" }
+
+    private func select(_ sig: String) {
+        let parts = sig.split(separator: "/")
+        guard parts.count == 2,
+              let n = Int(parts[0]),
+              let d = Int(parts[1]) else { return }
+        numerator = n
+        denominator = d
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -3795,37 +4179,7 @@ struct TimeSigPickerPopover: View {
                     .foregroundColor(Color.fgMid)
             }
 
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Numerator")
-                        .font(.lato(size: 9, weight: .regular))
-                        .foregroundColor(Color.fgMid)
-                    Stepper(value: $numerator, in: 1...16) {
-                        Text("\(numerator)")
-                            .font(.lato(size: 14, weight: .bold))
-                            .foregroundColor(Color.fgBright)
-                            .frame(minWidth: 28, alignment: .center)
-                    }
-                    .frame(width: 110)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Denominator")
-                        .font(.lato(size: 9, weight: .regular))
-                        .foregroundColor(Color.fgMid)
-                    HStack(spacing: 4) {
-                        ForEach(denominators, id: \.self) { d in
-                            Button("\(d)") { denominator = d }
-                                .font(.lato(size: 11, weight: denominator == d ? .bold : .regular))
-                                .foregroundColor(denominator == d ? .white : Color.fgMid)
-                                .frame(width: 30, height: 26)
-                                .background(denominator == d ? Color.accent : Color.border.opacity(0.4))
-                                .cornerRadius(4)
-                                .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
+            EditTimeSigDropdown(currentSig: currentSig, onSelect: select)
 
             Divider().foregroundColor(Color.border)
 
@@ -3835,10 +4189,6 @@ struct TimeSigPickerPopover: View {
                     .foregroundColor(Color.fgMid)
                     .buttonStyle(.plain)
                 Spacer()
-                Text("\(numerator)/\(denominator)")
-                    .font(.lato(size: 13, weight: .bold))
-                    .foregroundColor(Color.fgBright)
-                Spacer()
                 Button("Set") { onConfirm() }
                     .font(.lato(size: 11, weight: .semibold))
                     .foregroundColor(Color.accent)
@@ -3846,8 +4196,69 @@ struct TimeSigPickerPopover: View {
             }
         }
         .padding(12)
-        .frame(width: 280)
+        .frame(width: 200)
         .background(Color.bgCard)
+    }
+}
+
+// MARK: - Edit Tab Time Sig Dropdown (QA-style picker button)
+
+struct EditTimeSigDropdown: View {
+    let currentSig: String
+    let onSelect: (String) -> Void
+
+    @State private var showPopover = false
+    @State private var selection: String = ""
+    @State private var dismissedViaEnter = false
+    @State private var isHovered = false
+
+    var body: some View {
+        Button {
+            selection = currentSig
+            showPopover.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                Text(currentSig)
+                    .font(.lato(size: 12))
+                    .foregroundColor(.fgBright)
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.fgDim)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.inputBg)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(
+                                isHovered ? Color.accent.opacity(0.5) : Color.border,
+                                lineWidth: 1
+                            )
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .brightness(isHovered ? 0.07 : 0)
+        .animation(.easeOut(duration: 0.12), value: isHovered)
+        .onHover { h in
+            withAnimation(.easeOut(duration: 0.12)) { isHovered = h }
+            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            PickerPopoverContent(
+                options: SongDataOptions.timeSignatures,
+                selection: $selection,
+                isPresented: $showPopover,
+                dismissedViaEnter: $dismissedViaEnter
+            )
+        }
+        .onChange(of: selection) { newSig in
+            guard !newSig.isEmpty, newSig != currentSig else { return }
+            onSelect(newSig)
+        }
     }
 }
 
@@ -3859,6 +4270,7 @@ struct EditLocatorChip: View {
     let mtCompleteMode: Bool
     var isDragging: Bool = false
     let onFix: (String) -> Void
+    var onDelete: (() -> Void)? = nil
 
     @State private var pickerOpen = false
     @State private var pickerSelection = ""
@@ -3877,45 +4289,62 @@ struct EditLocatorChip: View {
     }
 
     var body: some View {
-        let bgColor: Color = isDragging ? Color.accent.opacity(0.35)
-            : isInvalid ? Color.red.opacity(0.28)
-            : Color(white: 0.12).opacity(0.88)
+        let lineColor: Color = isDragging ? Color.accent
+            : isInvalid ? Color.red.opacity(0.8) : Color.white.opacity(0.5)
+        let labelBg: Color = isDragging ? Color.accent.opacity(0.30)
+            : isInvalid ? Color.red.opacity(0.22)
+            : Color(white: 0.10).opacity(0.85)
         let textColor: Color = isInvalid ? Color.red : Color.white.opacity(0.85)
 
-        bgColor
+        Color.clear
             .overlay(alignment: .leading) {
-                // Left-edge accent line
-                (isDragging ? Color.accent : isInvalid ? Color.red.opacity(0.6) : Color.white.opacity(0.35))
-                    .frame(width: isDragging ? 2 : 1)
-            }
-            .overlay(alignment: .leading) {
-                if chipWidth >= 8 {
+                HStack(spacing: 0) {
+                    // Flag pole — thin vertical line
+                    lineColor
+                        .frame(width: isDragging ? 2 : 1.5)
+                        .frame(height: WaveformScrollHost.locatorLaneHeight)
+                    // Label pill — only as wide as its content
                     HStack(spacing: 2) {
-                        Text(chipWidth >= 28 ? "▶ \(marker.text)" : "▶")
+                        Text("▶ \(marker.text)")
                             .font(.lato(size: 9, weight: .bold))
                             .foregroundColor(textColor)
                             .lineLimit(1)
                             .truncationMode(.tail)
-                        if isHovering && chipWidth >= 44 {
-                            Button {
-                                pickerSelection = marker.text
-                                pickerOpen = true
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.system(size: 8, weight: .medium))
-                                    .foregroundColor(pencilHover ? .accent : textColor.opacity(0.7))
-                                    .frame(width: 14, height: 14)
-                                    .background(RoundedRectangle(cornerRadius: 3)
-                                        .fill(pencilHover ? Color.accent.opacity(0.25) : Color.clear))
+                        if isHovering {
+                            HStack(spacing: 2) {
+                                Button {
+                                    pickerSelection = marker.text
+                                    pickerOpen = true
+                                } label: {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: 8, weight: .medium))
+                                        .foregroundColor(pencilHover ? .accent : textColor.opacity(0.7))
+                                        .frame(width: 14, height: 14)
+                                        .background(RoundedRectangle(cornerRadius: 3)
+                                            .fill(pencilHover ? Color.accent.opacity(0.25) : Color.clear))
+                                }
+                                .buttonStyle(.plain)
+                                .contentShape(Rectangle())
+                                .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
+                                if let del = onDelete {
+                                    Button { del() } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 7, weight: .bold))
+                                            .foregroundColor(textColor.opacity(0.7))
+                                            .frame(width: 14, height: 14)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contentShape(Rectangle())
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .contentShape(Rectangle())
-                            .onHover { h in withAnimation(.easeOut(duration: 0.12)) { pencilHover = h } }
                             .transition(.opacity)
                         }
                     }
-                    .padding(.leading, 5)
-                    .padding(.trailing, 4)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .background(labelBg)
+                    .cornerRadius(2)
+                    .fixedSize()
                 }
             }
             .popover(isPresented: $pickerOpen, arrowEdge: .bottom) {

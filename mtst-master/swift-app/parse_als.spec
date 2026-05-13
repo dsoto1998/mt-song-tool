@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/click-samples', 'click-samples')]
 binaries = []
 hiddenimports = ['dawtool', 'dawtool.daw', 'dawtool.daw.ableton', 'pyexpat', 'xml.parsers.expat', 'lxml', 'lxml.etree', 'hexdump', 'librosa', 'numba']
 tmp_ret = collect_all('lxml')

@@ -1,6 +1,6 @@
 # MT Song Tool (MTST) — Claude Code Context
 
-**Current version:** v1.6.3
+**Current version:** v1.7.0
 **Platform:** macOS 13+, Swift/SwiftUI, Swift Package Manager
 **Project root:** `/Volumes/MTEng0/claude-apps/mt-song-tool/`
 
@@ -19,7 +19,7 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 7. **Quick Check Mode** — toggle that removes the requirement to have both an `.als` and stems before proceeding.
 8. **MT Complete Mode** — toggle that suppresses the NEXT SONG missing-locator warning (for single-song sessions). Also reveals Song Duration and Display Duration copy fields.
 9. **Jam Night Mode** — toggle (hidden by default; shown via Settings) that relaxes copy blocking for tempo ramps and loop/clip alignment issues; only ORIGINAL SONG required instead of full stem set. Shows Tempo panel in QA tab.
-10. **Edit tab** — multi-stem timeline editor: region select/delete/move, per-stem gain/mute/solo, metronome, click track generation, ALS generation (Build Session), locator suggestion via Whisper, AudioShake integration, auto-align stems (Check Alignment + Correct via full-file FFT cross-correlation of summed collective stem bus vs ORIGINAL SONG).
+10. **Edit tab** — multi-stem timeline editor: region select/delete/move, per-stem gain/mute/solo, metronome, click track generation, ALS generation (Build Session), locator suggestion via Whisper, AudioShake integration, auto-align stems (Check Alignment + Correct via full-file FFT cross-correlation of summed collective stem bus vs ORIGINAL SONG). Single WAV files can be dragged from Finder and dropped anywhere in the Edit tab to add them alongside existing stems.
 11. **AudioShake tab** — stem separation via AudioShake API. Upload a WAV file, select separation models, download results as named stems.
 12. **Upload tab / Queue** — `UploadView.swift`, `QueueView.swift`, `BackOfficeService.swift`, `NolanRyanService.swift` are preserved in the codebase but **disconnected from the current UI**. The tab switcher only shows QA / Edit / AudioShake.
 
@@ -27,18 +27,15 @@ Internal macOS QA tool for MultiTracks.com staff. Given an Ableton Live `.als` s
 
 ## Planned Features (TODO)
 
-### Dynamic CLICK TRACK + GUIDE Builder
+### Dynamic CLICK TRACK — SHIPPED (2026-05-12)
+CLICK TRACK lane always visible in Edit tab. Auto-generates from session tempo/time-sig map. Ends at ENDING locator downbeat. Regenerates on BPM/time-sig edits (debounced 400ms). Exportable with stems. Does NOT inject into .als. GUIDE track deferred.
+
+See memory file `project_click_track_generator.md` for full implementation details.
+
+### GUIDE Track Builder
 **Memory file:** `project_dynamic_click_guide_builder.md`
 
-Planned MTST feature — build CLICK TRACK (MidiTrack) and GUIDE (AudioTrack) tracks dynamically inside the app and inject them directly into the `.als` file. Replaces the EDS (Engineering Default Set) template import workflow.
-
-**Why needed:** Live 11 crashes (`LSong::CheckForClipOrSceneSelection` via `__NSFireTimer`, null vdispatch) when loading a second document after a Live 12 → 11 downgraded session. Root cause is likely an Ableton-internal timer bug; unfixable from XML side. Full diagnosis in memory file `bug_live12_downgrade_crash.md`.
-
-**Scope:**
-- **Edit tab feature — not tied to downgrade flow.** Works on any session (native Live 11, downgraded, newly built).
-- User picks CLICK TRACK / GUIDE / both from Edit tab UI; MTST injects tracks into current `.als`
-- New `_inject_click_guide_tracks` parser action in `parse_als.py`; track IDs in safe range (104+)
-- Related existing code: `ClickTrackService.swift`, `ALSGeneratorService.swift`, `EditView.swift`, `_generate_click_track` + `_generate_als` parser actions
+GUIDE (AudioTrack) injection into `.als` — deferred. CLICK TRACK portion already shipped above.
 
 ---
 
@@ -220,6 +217,9 @@ After stem scan finishes (`audioAnalyzer.isScanning` → `false`): if `songKey` 
 1. Recursively finds `.als` files (skips `backups/` folder).
 2. One `.als` → `loadNewFile` + `loadStemsFromFolder`. Multiple `.als` → shows `AlsPickerSheet`. None → stems only.
 3. `loadStemsFromFolder` finds first subfolder containing `.wav` files and calls `audioAnalyzer.analyze(folder:)`.
+
+### Single-stem drop (Edit tab)
+`handleFolderDropProviders(_:)` in `EditView` handles drops on the whole Edit tab. When a `.wav` file is dropped and `editPlayer.stemURLs` is non-empty, it calls `editPlayer.addSyntheticStem(url:)` + sets `isSessionDirty = true` instead of loading a new session. Directory drops still trigger `onFolderDrop` as before. A "Drop WAV" hint row on the left column provides an additional drop target with hover highlight.
 
 ### MT Complete auto-enable
 `populateSongData(from:)` — called once per file load — auto-enables `mtCompleteMode` when the locator set contains all three short codes V1, VS, and V4.

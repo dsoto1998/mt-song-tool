@@ -41,6 +41,7 @@ echo "==> Building parse_als (onedir for fast startup)…"
     --hidden-import librosa \
     --collect-all numba \
     --hidden-import numba \
+    --add-data "$DAWTOOL_ROOT/click-samples:click-samples" \
     --paths "$DAWTOOL_ROOT" \
     parse_als.py 2>&1
 
