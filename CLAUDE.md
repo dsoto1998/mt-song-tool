@@ -1,6 +1,6 @@
 # MT Song Tool (MTST) — Claude Code Context
 
-**Current version:** v1.7.0
+**Current version:** v1.7.1
 **Platform:** macOS 13+, Swift/SwiftUI, Swift Package Manager
 **Project root:** `/Volumes/MTEng0/claude-apps/mt-song-tool/`
 
@@ -442,4 +442,6 @@ Button styles: `CompactSecondaryButtonStyle`, `SecondaryButtonStyle`, `FixedHeig
 - **Multiple `.als` in folder drop** — `AlsPickerSheet` is shown; user selects one or clicks "Load Stems Only". Stems are loaded after the sheet closes regardless of choice.
 - **`clearAll()` resets modes** — also resets `jamNightMode` in addition to `quickCheckMode` and `mtCompleteMode`.
 - **AlignmentService vDSP FFT pitfalls** — (1) `vDSP_fft_zrip` with `FFT_INVERSE` returns lag axis flipped vs textbook ifft — **negate the decoded lag** (`lagCoarse = -rawLag`). (2) Packed split-complex format stores DC in `realp[0]` and Nyquist in `imagp[0]` as REAL values; `vDSP_zvmul` treats element 0 as a complex pair and produces wrong results — **save DC*DC and Nyq*Nyq before the multiply, restore after**. Both verified empirically; without them the reported offset sign flips or magnitude is wrong. Don't regress.
+- **Async peaks task must merge, not replace** — `EditPlayerService.loadStems` and `addSyntheticStem` extract waveform peaks on a `Task.detached`. The completion handler must read `self.stemStates[url]` and merge (preserving `isExcluded`, `gain`, user-edited segments) rather than writing a fresh `StemState`. Replacing was the bug that allowed real `CLICK TRACK.wav` to re-appear in the timeline after `excludeRealClickTrackIfPresent()` had hidden it — causing stems to visually extend past the loop bracket.
+- **Synthetic stems exported separately** — `exportStems` iterates `analyzer.results` (real stems from `lastScannedFolder`) by default. Synthetic stems (generated CLICK TRACK in `/tmp/`) must be passed via the `syntheticStems:` parameter; `openSavePanel` builds this list from `editPlayer.syntheticStemURLs`. Each synthetic stem runs through the same `-af apad -t durStr` FFmpeg truncation as real stems.
 - **Alignment correction allows negative sessionStart** — `applyAllAlignmentCorrections` calls `shiftAllSegments(url, delta, clampToZero: false)`. After a positive bus-late correction, stems can sit before bar 1 (pre-roll). Both playback and FFmpeg export handle negative `sessionStart` via `preRoll = max(0, -sessionStart)`.

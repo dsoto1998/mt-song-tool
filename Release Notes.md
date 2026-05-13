@@ -1,6 +1,17 @@
-# MT Song Tool — v1.7.0
+# MT Song Tool — v1.7.1
 
 ## Changelog
+
+### v1.7.1 — May 2026
+
+#### Edit Tab
+
+- **Stale session data fix** — Clearing a session or loading a new file now fully resets the Edit tab. Previously, tempo events, locator overrides, alignment results, and stem selections from the prior session persisted in the Edit tab after Clear All or a new file load.
+- **Stereo export** — All stem exports now force 2-channel stereo output. Mono stems are upmixed to dual-mono on export. Applies to Export Stems, Apply Edits, and Fix Format.
+- **Stem export length fix** — Exported stems no longer extend past the loop bracket end.
+- **Race condition on stem load** — The async waveform peaks task no longer overwrites `isExcluded`, gain, or segment edits that were set before it finished. The task now merges into the existing stem state instead of replacing it.
+- **Duplicate CLICK TRACK fix** — The real `CLICK TRACK.wav` now stays hidden after the synthetic click track regenerates. Previously the real one could reappear in the timeline at its full length, visually extending past the loop bracket.
+- **Synthetic CLICK TRACK in export** — The generated click track is now included in Export Stems, truncated to the loop bracket end like all other stems.
 
 ### v1.7.0 — May 2026
 

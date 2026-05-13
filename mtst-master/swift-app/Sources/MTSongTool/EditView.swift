@@ -312,11 +312,11 @@ struct EditView: View {
                 excludeRealClickTrackIfPresent()
             }
             // Seed editable tempo events from parse result (deduplicates Ableton's 2-per-step pairs)
-            if let result = parsedResult, editPlayer.editableTempoEvents.isEmpty {
+            if let result = parsedResult {
                 editPlayer.seedTempoEvents(result.tempoEvents)
             }
             // Seed time sig overrides from parse result
-            if let result = parsedResult, editPlayer.timeSigOverrides.isEmpty {
+            if let result = parsedResult {
                 editPlayer.initTimeSigs(from: result.timeSignatures)
             }
             // Build metronome beat schedule from parsed session
@@ -332,11 +332,23 @@ struct EditView: View {
         }
         .onChange(of: parsedResult?.file) { _ in
             if let result = parsedResult {
+                editPlayer.seedTempoEvents(result.tempoEvents)
                 editPlayer.initTimeSigs(from: result.timeSignatures)
                 rebuildBeatSchedule()
                 populateBuildSession()
                 buildPanelExpanded = true
             }
+        }
+        .onChange(of: editPlayer.sessionToken) { _ in
+            selectedURLs = []
+            stemSelections = [:]
+            selectedClipIDs = []
+            rowHeights = [:]
+            hasFitZoom = false
+            canvasRightPadding = 0
+            zoomScale = 0.25
+            zoomScaleAtGestureStart = 0.25
+            pendingRenames = [:]
         }
         .onChange(of: editPlayer.timeSigOverrides) { _ in
             rebuildBeatSchedule()
@@ -443,6 +455,7 @@ struct EditView: View {
         .onChange(of: clickService.phase) { phase in
             if case .ready = phase, let url = clickService.previewURL {
                 editPlayer.addSyntheticStem(url: url)
+                excludeRealClickTrackIfPresent()
             }
         }
         .alert("Export Error", isPresented: $showExportError) {
@@ -1592,12 +1605,22 @@ struct EditView: View {
         editPlayer.stop()
         metronome.stop()
 
+        // Build synthetic stems list (e.g. generated click track) for export
+        var syntheticForExport: [(sourceURL: URL, outputFilename: String)] = []
+        for url in editPlayer.syntheticStemURLs {
+            guard editPlayer.stemStates[url]?.isExcluded != true else { continue }
+            let baseName = url.deletingPathExtension().lastPathComponent
+            let outputName = pendingRenames[url].map { $0 + ".wav" } ?? (baseName + ".wav")
+            syntheticForExport.append((sourceURL: url, outputFilename: outputName))
+        }
+
         analyzer.exportStems(
             outputFolder: outputFolder,
             loopEndSeconds: lb.endSeconds,
             stemStates: editPlayer.stemStates,
             pendingRenames: pendingRenames,
-            autoFadeCuts: userSettings.autoFadeCuts
+            autoFadeCuts: userSettings.autoFadeCuts,
+            syntheticStems: syntheticForExport
         ) { error in
             isExporting = false
             if let error {

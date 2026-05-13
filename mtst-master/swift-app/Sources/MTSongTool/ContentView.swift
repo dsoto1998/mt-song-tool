@@ -757,6 +757,7 @@ struct ContentView: View {
 
     // MARK: Load a new file — clears all state then parses
     private func loadNewFile(path: String) {
+        editPlayer.fullReset()
         parser.result = nil
         parser.errorMessage = nil
         resetSongData()
@@ -1399,6 +1400,7 @@ struct ContentView: View {
     // MARK: Clear All — resets every panel back to empty state
     private func clearAll() {
         stemPlayer.stop()
+        editPlayer.fullReset()
         parser.result = nil
         parser.errorMessage = nil
         resetSongData()

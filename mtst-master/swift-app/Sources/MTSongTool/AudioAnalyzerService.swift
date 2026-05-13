@@ -620,6 +620,7 @@ class AudioAnalyzerService: ObservableObject {
             "-hide_banner", "-loglevel", "error", "-y",
             "-i", source.path,
             "-ar", "44100",
+            "-ac", "2",
             "-c:a", "pcm_s16le",
             destination.path
         ]
@@ -811,7 +812,7 @@ class AudioAnalyzerService: ObservableObject {
                                           "-filter_complex", filterComplex,
                                           "-map", "[out]"]
                     if hasGain { args += ["-af", "volume=\(state.gain)"] }
-                    args += ["-c:a", "pcm_s16le", "-ar", "44100", dest.path]
+                    args += ["-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100", dest.path]
                     let (success, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
                     if !success { errors.append(result.filename + ": " + errMsg) }
                 } else if !hasOffset && !hasTrim && !hasCuts && !hasGain {
@@ -862,6 +863,7 @@ class AudioAnalyzerService: ObservableObject {
                             if autoFadeCuts && segmentIndex > 0 { segFilters.append("afade=t=in:st=0:d=0.01") }
                             if state.gain != 1.0 { segFilters.append("volume=\(state.gain)") }
                             if !segFilters.isEmpty { segArgs += ["-af", segFilters.joined(separator: ",")] }
+                            segArgs += ["-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100"]
                             segArgs.append(segDest.path)
                             _ = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: segArgs)
                             segmentURLs.append(segDest)
@@ -872,7 +874,7 @@ class AudioAnalyzerService: ObservableObject {
                             try? FileManager.default.moveItem(at: segmentURLs[0], to: dest)
                         }
                     } else {
-                        args.append(dest.path)
+                        args += ["-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100", dest.path]
                         let (success, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
                         if !success { errors.append(result.filename + ": " + errMsg) }
                     }
@@ -907,6 +909,7 @@ class AudioAnalyzerService: ObservableObject {
         stemStates: [URL: StemState],
         pendingRenames: [URL: String] = [:],
         autoFadeCuts: Bool,
+        syntheticStems: [(sourceURL: URL, outputFilename: String)] = [],
         completion: @escaping (String?) -> Void
     ) {
         guard let sourceFolder = lastScannedFolder else {
@@ -1001,7 +1004,7 @@ class AudioAnalyzerService: ObservableObject {
                         "-filter_complex", filterParts.joined(separator: ";"),
                         "-map", "[out]",
                         "-t", durStr,
-                        "-c:a", "pcm_s16le", "-ar", "44100",
+                        "-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100",
                         dest.path
                     ]
                     let (ok, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
@@ -1024,11 +1027,26 @@ class AudioAnalyzerService: ObservableObject {
                     filters.append("apad=whole_dur=\(durStr)")
 
                     args += ["-af", filters.joined(separator: ",")]
-                    args += ["-t", durStr, "-c:a", "pcm_s16le", "-ar", "44100", dest.path]
+                    args += ["-t", durStr, "-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100", dest.path]
 
                     let (ok, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
                     if !ok { errors.append(result.filename + ": " + errMsg) }
                 }
+            }
+
+            // Export synthetic stems (e.g. generated click track)
+            for entry in syntheticStems {
+                let dest = outputFolder.appendingPathComponent(entry.outputFilename)
+                let args: [String] = [
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", entry.sourceURL.path,
+                    "-af", "apad=whole_dur=\(durStr)",
+                    "-t", durStr,
+                    "-ac", "2", "-c:a", "pcm_s16le", "-ar", "44100",
+                    dest.path
+                ]
+                let (ok, errMsg) = Self.runFFmpeg(ffmpegPath: ffmpeg, arguments: args)
+                if !ok { errors.append(entry.outputFilename + ": " + errMsg) }
             }
 
             DispatchQueue.main.async {

@@ -119,6 +119,8 @@ class EditPlayerService: ObservableObject {
     @Published var isSessionDirty: Bool = false
     @Published var editableTempoEvents: [TempoEvent] = []
     @Published var newLocators: [NewLocator] = []
+    /// Bumped by fullReset() — EditView observes this to reset its own @State.
+    @Published private(set) var sessionToken = UUID()
     private var newLocatorCounter = 0
 
     func addNewLocator(beat: Double, name: String) {
@@ -193,6 +195,19 @@ class EditPlayerService: ObservableObject {
         locatorOverrides = [:]
         timeSigOverrides = []
         isSessionDirty = false
+    }
+
+    /// Full reset for Clear All / new file load. Tears down engine, clears all session state,
+    /// and bumps sessionToken so EditView resets its own @State.
+    func fullReset() {
+        stop()
+        loadStems([])
+        editableTempoEvents = []
+        locatorOverrides = [:]
+        timeSigOverrides = []
+        busAlignmentResult = nil
+        isSessionDirty = false
+        sessionToken = UUID()
     }
 
     /// Load tempo events from parse result — deduplicate same-beat pairs to 1-per-step.
@@ -460,22 +475,21 @@ class EditPlayerService: ObservableObject {
             playerNodes[url] = playerNode
             stemMixers[url] = mixerNode
 
-            var state = StemState()
-            // Extract peaks asynchronously
+            stemStates[url] = StemState()
+            // Extract peaks asynchronously — merge into existing record to preserve isExcluded etc.
             Task.detached(priority: .userInitiated) { [weak self] in
                 let peaks = await Self.extractPeaks(from: url)
                 let dur = await Self.fileDuration(url)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    state.peaks = peaks
-                    state.duration = dur
-                    state.initSegments(duration: dur)
-                    self.stemStates[url] = state
+                    var existing = self.stemStates[url] ?? StemState()
+                    existing.peaks = peaks
+                    existing.duration = dur
+                    if existing.segments.isEmpty { existing.initSegments(duration: dur) }
+                    self.stemStates[url] = existing
                     if dur > self.totalDuration { self.totalDuration = dur }
                 }
             }
-
-            stemStates[url] = state
         }
 
         startEngine()
@@ -525,18 +539,18 @@ class EditPlayerService: ObservableObject {
         stemURLs.append(url)
         syntheticStemURLs.insert(url)
 
-        var state = StemState()
-        stemStates[url] = state
+        stemStates[url] = StemState()
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let peaks = await Self.extractPeaks(from: url)
             let dur   = await Self.fileDuration(url)
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                state.peaks = peaks
-                state.duration = dur
-                state.initSegments(duration: dur)
-                self.stemStates[url] = state
+                var existing = self.stemStates[url] ?? StemState()
+                existing.peaks = peaks
+                existing.duration = dur
+                if existing.segments.isEmpty { existing.initSegments(duration: dur) }
+                self.stemStates[url] = existing
                 if dur > self.totalDuration { self.totalDuration = dur }
             }
         }
