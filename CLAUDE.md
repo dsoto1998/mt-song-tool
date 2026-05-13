@@ -107,7 +107,21 @@ bash "/Volumes/MTEng0/claude-apps/mt-song-tool/mtst-master/swift-app/make_swift_
 
 ### GitHub Releases (manual)
 
-After each build, upload assets to the GitHub release at `https://github.com/dsoto1998/mt-song-tool/releases` (private repo). `gh` CLI is not installed — use curl directly:
+After each build, upload assets to the GitHub release at `https://github.com/dsoto1998/mt-song-tool/releases` (private repo). `gh` CLI is installed and authenticated as `dsoto1998` — preferred over curl:
+
+```bash
+# View / create / edit release
+gh release view vX.X.X --repo dsoto1998/mt-song-tool
+gh release upload vX.X.X "path/to/MT Song Tool X.X.X.pkg" --repo dsoto1998/mt-song-tool
+gh release delete-asset vX.X.X "MT.Song.Tool.X.X.X.pkg" --repo dsoto1998/mt-song-tool --yes
+gh release edit vX.X.X --repo dsoto1998/mt-song-tool --notes "$(cat notes.md)"
+
+# Extract .pkg from versioned zip (build script doesn't leave a standalone copy)
+unzip -p "Versions/MT Song Tool vX.X.X.zip" \
+  "MT Song Tool vX.X.X/MT Song Tool X.X.X.pkg" > "/tmp/MT Song Tool X.X.X.pkg"
+```
+
+Legacy curl approach (only if `gh` is unavailable):
 
 ```bash
 # 1. Get release ID for the tag
